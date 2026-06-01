@@ -51,6 +51,15 @@ pub struct UserEnv {
     /// use only intersections on the visible curve. Default ON (matches the
     /// AutoCAD `EDGEMODE 1` convention most CAD users expect today).
     pub EdgMod: bool,
+    /// Default fillet radius (AutoCAD `FILLETRAD`). Set inline by passing
+    /// `fillet <r>` — the new value persists across sessions.
+    pub FltRad: f64,
+    /// Default chamfer distance along the FIRST picked line
+    /// (AutoCAD `CHAMFERA`).
+    pub ChmDs1: f64,
+    /// Default chamfer distance along the SECOND picked line
+    /// (AutoCAD `CHAMFERB`).
+    pub ChmDs2: f64,
 
     // ---- display ----
     /// Dragging display during MOVE/COPY. 0=off, 1=on, 2=auto.
@@ -99,6 +108,9 @@ impl Default for UserEnv {
             CmDlgM: true,
             FlDlgM: true,
             EdgMod: true,
+            FltRad: 0.0,
+            ChmDs1: 0.0,
+            ChmDs2: 0.0,
             DrDspM: 2,
             MnuBar: false,
             TltEnb: true,
@@ -163,6 +175,10 @@ impl UserEnv {
         push_bool(&mut s, "CmDlgM", self.CmDlgM);
         push_bool(&mut s, "FlDlgM", self.FlDlgM);
         push_bool(&mut s, "EdgMod", self.EdgMod);
+        let push_f64 = |s: &mut String, k: &str, v: f64| s.push_str(&format!("{} = {}\n", k, v));
+        push_f64(&mut s, "FltRad", self.FltRad);
+        push_f64(&mut s, "ChmDs1", self.ChmDs1);
+        push_f64(&mut s, "ChmDs2", self.ChmDs2);
         push_u8(&mut s, "DrDspM", self.DrDspM);
         push_bool(&mut s, "MnuBar", self.MnuBar);
         push_bool(&mut s, "TltEnb", self.TltEnb);
@@ -207,6 +223,9 @@ impl UserEnv {
             "CmDlgM" => if let Some(v) = parse_bool(val) { self.CmDlgM = v; }
             "FlDlgM" => if let Some(v) = parse_bool(val) { self.FlDlgM = v; }
             "EdgMod" => if let Some(v) = parse_bool(val) { self.EdgMod = v; }
+            "FltRad" => if let Ok(v) = val.parse() { self.FltRad = v; }
+            "ChmDs1" => if let Ok(v) = val.parse() { self.ChmDs1 = v; }
+            "ChmDs2" => if let Ok(v) = val.parse() { self.ChmDs2 = v; }
             "DrDspM" => if let Ok(v) = val.parse() { self.DrDspM = v; }
             "MnuBar" => if let Some(v) = parse_bool(val) { self.MnuBar = v; }
             "TltEnb" => if let Some(v) = parse_bool(val) { self.TltEnb = v; }

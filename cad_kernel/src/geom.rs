@@ -1561,3 +1561,628 @@ impl EllipseArc {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Fillet / Chamfer — Slices M.3 + M.4.
+//
+// v1 supports LINE + LINE only. Other combinations return Err; line-arc and
+// arc-arc are deferred to v2 per the user's scoping decision.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub struct FilletOut {
+    /// L1 trimmed back to the tangent point on its kept side.
+    pub g1_new: Geom,
+    /// L2 trimmed back to the tangent point on its kept side.
+    pub g2_new: Geom,
+    /// The fillet arc itself. `None` for radius 0 — the two lines just meet
+    /// at the corner intersection.
+    pub arc: Option<Geom>,
+}
+
+/// Fillet two lines with `radius`. `p1` / `p2` are the user's click points
+/// on each line — they determine which SIDE of each line is kept (the side
+/// nearest the click). Radius 0 produces a sharp corner.
+pub fn fillet_lines(
+    l1: &Line, p1: Vec2,
+    l2: &Line, p2: Vec2,
+    radius: f64,
+) -> Result<FilletOut, &'static str> {
+    if radius < 0.0 { return Err("fillet: radius must be ≥ 0"); }
+    let d1v = l1.b - l1.a;
+    let d2v = l2.b - l2.a;
+    let len1 = d1v.len();
+    let len2 = d2v.len();
+    if len1 < EPS || len2 < EPS { return Err("fillet: zero-length line"); }
+
+    // Infinite-line intersection.
+    let cross = d1v.x * d2v.y - d1v.y * d2v.x;
+    if cross.abs() < EPS { return Err("fillet: lines are parallel"); }
+    let dx = l2.a.x - l1.a.x;
+    let dy = l2.a.y - l1.a.y;
+    let t1 = (dx * d2v.y - dy * d2v.x) / cross;
+    let i_pt = l1.a + d1v * t1;
+
+    // Unit directions from I toward each pick.
+    let u1 = d1v / len1;
+    let u2 = d2v / len2;
+    let dir1 = if (p1 - i_pt).dot(u1) >= 0.0 { u1 } else { -u1 };
+    let dir2 = if (p2 - i_pt).dot(u2) >= 0.0 { u2 } else { -u2 };
+
+    // Corner angle at I (between the two kept-side outgoing rays).
+    let cos_th = dir1.dot(dir2).clamp(-1.0, 1.0);
+    let theta = cos_th.acos();
+    if theta < 1e-6 || (std::f64::consts::PI - theta) < 1e-6 {
+        return Err("fillet: lines are collinear at the corner");
+    }
+
+    // Endpoint of each line to KEEP — the one on the same side of I as the
+    // click. We compare projections onto dirN; whichever endpoint projects
+    // further along dirN from I is the kept endpoint.
+    let endpoint_of_l1 = if (l1.a - i_pt).dot(dir1) > (l1.b - i_pt).dot(dir1) { l1.a } else { l1.b };
+    let endpoint_of_l2 = if (l2.a - i_pt).dot(dir2) > (l2.b - i_pt).dot(dir2) { l2.a } else { l2.b };
+
+    if radius < EPS {
+        // Sharp corner: both lines run from their kept endpoint to I.
+        return Ok(FilletOut {
+            g1_new: Geom::Line(Line { a: endpoint_of_l1, b: i_pt }),
+            g2_new: Geom::Line(Line { a: i_pt, b: endpoint_of_l2 }),
+            arc: None,
+        });
+    }
+
+    // Tangent-point distance along each kept-side ray: t = r / tan(θ/2).
+    let tan_half = (theta / 2.0).tan();
+    let t = radius / tan_half;
+    // The kept segment must be long enough to reach the tangent point.
+    let kept_len1 = (endpoint_of_l1 - i_pt).len();
+    let kept_len2 = (endpoint_of_l2 - i_pt).len();
+    if kept_len1 < t || kept_len2 < t {
+        return Err("fillet: radius too large for these lines");
+    }
+
+    let tp1 = i_pt + dir1 * t;
+    let tp2 = i_pt + dir2 * t;
+
+    // Arc center: bisector direction from I, distance r/sin(θ/2).
+    let bis_raw = dir1 + dir2;
+    let bis = bis_raw / bis_raw.len();
+    let center = i_pt + bis * (radius / (theta / 2.0).sin());
+
+    // Pick start_angle / sweep so that the midpoint of the arc lies on the
+    // bisector between I and `center` (i.e. on the corner side, not the far
+    // side). Both CCW candidates have the same magnitude (π - θ); only the
+    // start endpoint differs.
+    let arc_angle = std::f64::consts::PI - theta;
+    let v1 = tp1 - center;
+    let v2 = tp2 - center;
+    let mid_dir_expected = (i_pt - center) / (i_pt - center).len();
+    // Rotate v1 CCW by arc_angle/2 and see if it lines up with expected mid.
+    let s = arc_angle * 0.5;
+    let mid_v_ccw_from_1 = Vec2::new(
+        v1.x * s.cos() - v1.y * s.sin(),
+        v1.x * s.sin() + v1.y * s.cos(),
+    );
+    let dot_from_1 = (mid_v_ccw_from_1 / mid_v_ccw_from_1.len()).dot(mid_dir_expected);
+    let start_angle = if dot_from_1 > 0.0 {
+        v1.angle().rem_euclid(std::f64::consts::TAU)
+    } else {
+        v2.angle().rem_euclid(std::f64::consts::TAU)
+    };
+    let arc = Geom::Arc(Arc {
+        center,
+        radius,
+        start_angle,
+        sweep_angle: arc_angle,
+    });
+
+    Ok(FilletOut {
+        g1_new: Geom::Line(Line { a: endpoint_of_l1, b: tp1 }),
+        g2_new: Geom::Line(Line { a: tp2, b: endpoint_of_l2 }),
+        arc: Some(arc),
+    })
+}
+
+#[derive(Clone, Debug)]
+pub struct ChamferOut {
+    pub g1_new: Geom,
+    pub g2_new: Geom,
+    /// The chamfer line itself, connecting the two tangent points.
+    pub bridge: Geom,
+}
+
+/// Chamfer two lines with distances `d1` along L1 and `d2` along L2 from the
+/// intersection. Same click-side convention as fillet.
+pub fn chamfer_lines(
+    l1: &Line, p1: Vec2,
+    l2: &Line, p2: Vec2,
+    d1: f64, d2: f64,
+) -> Result<ChamferOut, &'static str> {
+    if d1 < 0.0 || d2 < 0.0 { return Err("chamfer: distances must be ≥ 0"); }
+    let d1v = l1.b - l1.a;
+    let d2v = l2.b - l2.a;
+    let len1 = d1v.len();
+    let len2 = d2v.len();
+    if len1 < EPS || len2 < EPS { return Err("chamfer: zero-length line"); }
+
+    let cross = d1v.x * d2v.y - d1v.y * d2v.x;
+    if cross.abs() < EPS { return Err("chamfer: lines are parallel"); }
+    let dx = l2.a.x - l1.a.x;
+    let dy = l2.a.y - l1.a.y;
+    let t1 = (dx * d2v.y - dy * d2v.x) / cross;
+    let i_pt = l1.a + d1v * t1;
+
+    let u1 = d1v / len1;
+    let u2 = d2v / len2;
+    let dir1 = if (p1 - i_pt).dot(u1) >= 0.0 { u1 } else { -u1 };
+    let dir2 = if (p2 - i_pt).dot(u2) >= 0.0 { u2 } else { -u2 };
+
+    let endpoint_of_l1 = if (l1.a - i_pt).dot(dir1) > (l1.b - i_pt).dot(dir1) { l1.a } else { l1.b };
+    let endpoint_of_l2 = if (l2.a - i_pt).dot(dir2) > (l2.b - i_pt).dot(dir2) { l2.a } else { l2.b };
+
+    let kept_len1 = (endpoint_of_l1 - i_pt).len();
+    let kept_len2 = (endpoint_of_l2 - i_pt).len();
+    if kept_len1 < d1 || kept_len2 < d2 {
+        return Err("chamfer: distance exceeds available line length");
+    }
+
+    let tp1 = i_pt + dir1 * d1;
+    let tp2 = i_pt + dir2 * d2;
+    Ok(ChamferOut {
+        g1_new: Geom::Line(Line { a: endpoint_of_l1, b: tp1 }),
+        g2_new: Geom::Line(Line { a: tp2, b: endpoint_of_l2 }),
+        bridge: Geom::Line(Line { a: tp1, b: tp2 }),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Join — Slice M.5.
+//
+// Three merge classes, applied in order:
+//   1. Collinear Lines  → one Line covering the union extent.
+//   2. Concentric Arcs of equal radius with touching sweeps → one Arc.
+//   3. Any chain of touching segments (Lines + Arcs, end-to-end) → Polyline.
+//      Open chain → open polyline; closed chain → closed polyline.
+// Unjoinable inputs come back unchanged in `unmodified`.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub struct JoinOut {
+    /// The merged Geoms produced this run. Each replaces one or more inputs.
+    pub merged: Vec<Geom>,
+    /// Indices INTO the input slice that participated in some merge.
+    /// Callers remove these from the doc before appending `merged`.
+    pub consumed_indices: Vec<usize>,
+}
+
+/// Try to merge the given geoms (referenced by `indices` into the doc) into
+/// one or more bigger geoms. Each input index is paired with its `Geom`.
+pub fn join_geoms(geoms: &[(usize, Geom)]) -> JoinOut {
+    let mut merged       = Vec::new();
+    let mut consumed     = Vec::new();
+    let mut available: Vec<(usize, Geom)> = geoms.iter().cloned().collect();
+
+    // -- pass 1: collinear lines ------------------------------------------------
+    loop {
+        let group = find_collinear_line_group(&available);
+        if group.len() < 2 { break; }
+        let line_geoms: Vec<Line> = group.iter()
+            .filter_map(|&i| match &available[i].1 { Geom::Line(l) => Some(*l), _ => None })
+            .collect();
+        if let Some(merged_line) = merge_collinear_lines(&line_geoms) {
+            for &local_i in &group { consumed.push(available[local_i].0); }
+            // remove from `available` in descending index order
+            let mut sorted = group.clone();
+            sorted.sort_unstable_by(|a, b| b.cmp(a));
+            for li in sorted { available.remove(li); }
+            merged.push(Geom::Line(merged_line));
+        } else { break; }
+    }
+
+    // -- pass 2: concentric arcs (same center, same radius, touching sweeps) ----
+    loop {
+        let group = find_concentric_arc_group(&available);
+        if group.len() < 2 { break; }
+        let arcs: Vec<Arc> = group.iter()
+            .filter_map(|&i| match &available[i].1 { Geom::Arc(a) => Some(*a), _ => None })
+            .collect();
+        if let Some(merged_arc) = merge_concentric_arcs(&arcs) {
+            for &local_i in &group { consumed.push(available[local_i].0); }
+            let mut sorted = group.clone();
+            sorted.sort_unstable_by(|a, b| b.cmp(a));
+            for li in sorted { available.remove(li); }
+            merged.push(Geom::Arc(merged_arc));
+        } else { break; }
+    }
+
+    // -- pass 3: chain of touching Lines + Arcs → Polyline ---------------------
+    loop {
+        let chain = find_touching_chain(&available);
+        if chain.len() < 2 { break; }
+        if let Some(pl) = chain_to_polyline(&chain.iter().map(|&i| available[i].1.clone()).collect::<Vec<_>>()) {
+            for &local_i in &chain { consumed.push(available[local_i].0); }
+            let mut sorted = chain.clone();
+            sorted.sort_unstable_by(|a, b| b.cmp(a));
+            for li in sorted { available.remove(li); }
+            merged.push(Geom::Polyline(pl));
+        } else { break; }
+    }
+
+    JoinOut { merged, consumed_indices: consumed }
+}
+
+const JOIN_EPS: f64 = 1e-6;
+
+fn find_collinear_line_group(items: &[(usize, Geom)]) -> Vec<usize> {
+    // Returns local indices of the first run of >= 2 collinear Lines we find.
+    for i in 0..items.len() {
+        let li = if let Geom::Line(l) = &items[i].1 { *l } else { continue };
+        let dir_i = li.b - li.a;
+        let len_i = dir_i.len();
+        if len_i < JOIN_EPS { continue; }
+        let u_i = dir_i / len_i;
+        let mut group = vec![i];
+        for j in (i + 1)..items.len() {
+            let lj = if let Geom::Line(l) = &items[j].1 { *l } else { continue };
+            let dir_j = lj.b - lj.a;
+            let len_j = dir_j.len();
+            if len_j < JOIN_EPS { continue; }
+            // Same infinite line: parallel + lj.a lies on li's infinite line.
+            let cross = u_i.x * dir_j.y - u_i.y * dir_j.x;
+            if cross.abs() > JOIN_EPS * len_j { continue; }
+            // Perp distance from lj.a to li's infinite line.
+            let perp = u_i.perp();
+            if (lj.a - li.a).dot(perp).abs() > JOIN_EPS { continue; }
+            group.push(j);
+        }
+        if group.len() >= 2 { return group; }
+    }
+    Vec::new()
+}
+
+fn merge_collinear_lines(lines: &[Line]) -> Option<Line> {
+    if lines.is_empty() { return None; }
+    let l0 = lines[0];
+    let u = (l0.b - l0.a).normalized();
+    // Project every endpoint onto u; take min/max.
+    let project = |p: Vec2| (p - l0.a).dot(u);
+    let mut t_min = f64::INFINITY;
+    let mut t_max = f64::NEG_INFINITY;
+    for l in lines {
+        for p in [l.a, l.b] {
+            let t = project(p);
+            if t < t_min { t_min = t; }
+            if t > t_max { t_max = t; }
+        }
+    }
+    Some(Line { a: l0.a + u * t_min, b: l0.a + u * t_max })
+}
+
+fn find_concentric_arc_group(items: &[(usize, Geom)]) -> Vec<usize> {
+    for i in 0..items.len() {
+        let ai = if let Geom::Arc(a) = &items[i].1 { *a } else { continue };
+        let mut group = vec![i];
+        for j in (i + 1)..items.len() {
+            let aj = if let Geom::Arc(a) = &items[j].1 { *a } else { continue };
+            if (aj.center - ai.center).len() > JOIN_EPS { continue; }
+            if (aj.radius - ai.radius).abs() > JOIN_EPS { continue; }
+            group.push(j);
+        }
+        // Only return the group if at least two of them have sweeps that
+        // CONNECT (one's end is another's start, within EPS).
+        if group.len() >= 2 && arcs_form_a_chain(&group.iter()
+            .filter_map(|&k| if let Geom::Arc(a) = &items[k].1 { Some(*a) } else { None })
+            .collect::<Vec<_>>())
+        {
+            return group;
+        }
+    }
+    Vec::new()
+}
+
+fn arcs_form_a_chain(arcs: &[Arc]) -> bool {
+    // True iff the union of sweep intervals (mod 2π) forms a single
+    // contiguous range (or full circle).
+    if arcs.len() < 2 { return false; }
+    let mut spans: Vec<(f64, f64)> = arcs.iter()
+        .map(|a| {
+            let s = a.start_angle.rem_euclid(std::f64::consts::TAU);
+            (s, s + a.sweep_angle)
+        })
+        .collect();
+    spans.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    let mut hi = spans[0].1;
+    for i in 1..spans.len() {
+        if spans[i].0 > hi + JOIN_EPS { return false; }
+        if spans[i].1 > hi { hi = spans[i].1; }
+    }
+    true
+}
+
+fn merge_concentric_arcs(arcs: &[Arc]) -> Option<Arc> {
+    if arcs.is_empty() { return None; }
+    let mut spans: Vec<(f64, f64)> = arcs.iter()
+        .map(|a| {
+            let s = a.start_angle.rem_euclid(std::f64::consts::TAU);
+            (s, s + a.sweep_angle)
+        })
+        .collect();
+    spans.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    let start = spans[0].0;
+    let end   = spans.iter().map(|s| s.1).fold(f64::NEG_INFINITY, f64::max);
+    let sweep = (end - start).min(std::f64::consts::TAU);
+    Some(Arc {
+        center: arcs[0].center,
+        radius: arcs[0].radius,
+        start_angle: start,
+        sweep_angle: sweep,
+    })
+}
+
+fn endpoints_of(g: &Geom) -> Option<(Vec2, Vec2)> {
+    match g {
+        Geom::Line(l)       => Some((l.a, l.b)),
+        Geom::Arc(a)        => Some(a.endpoints()),
+        Geom::EllipseArc(e) => Some(e.endpoints()),
+        Geom::Polyline(p) if !p.closed && !p.vertices.is_empty() =>
+            Some((p.vertices.first()?.pos, p.vertices.last()?.pos)),
+        _ => None,
+    }
+}
+
+fn find_touching_chain(items: &[(usize, Geom)]) -> Vec<usize> {
+    // BFS from each item; connect via shared endpoints (within EPS).
+    if items.is_empty() { return Vec::new(); }
+    for start in 0..items.len() {
+        if endpoints_of(&items[start].1).is_none() { continue; }
+        let mut seen = vec![false; items.len()];
+        seen[start] = true;
+        let mut queue = vec![start];
+        let mut group = vec![start];
+        while let Some(cur) = queue.pop() {
+            let Some((ca, cb)) = endpoints_of(&items[cur].1) else { continue };
+            for j in 0..items.len() {
+                if seen[j] { continue; }
+                let Some((ja, jb)) = endpoints_of(&items[j].1) else { continue };
+                let touches = ca.dist(ja) < JOIN_EPS || ca.dist(jb) < JOIN_EPS
+                           || cb.dist(ja) < JOIN_EPS || cb.dist(jb) < JOIN_EPS;
+                if touches {
+                    seen[j] = true;
+                    queue.push(j);
+                    group.push(j);
+                }
+            }
+        }
+        if group.len() >= 2 { return group; }
+    }
+    Vec::new()
+}
+
+fn chain_to_polyline(geoms: &[Geom]) -> Option<Polyline> {
+    // Walk the chain endpoint-to-endpoint, emitting one PolyVertex per
+    // vertex along the way. Arcs contribute a `bulge` to the vertex BEFORE
+    // them (DXF convention: bulge belongs to the segment FROM that vertex).
+    if geoms.len() < 2 { return None; }
+    // Build an unordered set, then traverse.
+    let mut remaining: Vec<Geom> = geoms.to_vec();
+    // Pick a starting endpoint: any vertex that's only touched ONCE among
+    // the unordered set is an open-chain end. If every vertex is touched
+    // twice, the chain is closed.
+    let mut endpoint_count: Vec<(Vec2, usize)> = Vec::new();
+    let bump = |list: &mut Vec<(Vec2, usize)>, p: Vec2| {
+        for (q, c) in list.iter_mut() {
+            if q.dist(p) < JOIN_EPS { *c += 1; return; }
+        }
+        list.push((p, 1));
+    };
+    for g in &remaining {
+        let Some((a, b)) = endpoints_of(g) else { return None; };
+        bump(&mut endpoint_count, a);
+        bump(&mut endpoint_count, b);
+    }
+    let chain_closed = endpoint_count.iter().all(|&(_, c)| c == 2);
+    let start_pt: Vec2 = if chain_closed {
+        endpoint_count[0].0
+    } else {
+        endpoint_count.iter().find(|&&(_, c)| c == 1).map(|&(p, _)| p)?
+    };
+
+    let mut current = start_pt;
+    let mut verts: Vec<PolyVertex> = vec![PolyVertex { pos: current, bulge: 0.0 }];
+    while !remaining.is_empty() {
+        // Find a segment that touches `current`.
+        let mut found: Option<usize> = None;
+        let mut reverse = false;
+        for (i, g) in remaining.iter().enumerate() {
+            let Some((a, b)) = endpoints_of(g) else { continue };
+            if a.dist(current) < JOIN_EPS { found = Some(i); reverse = false; break; }
+            if b.dist(current) < JOIN_EPS { found = Some(i); reverse = true;  break; }
+        }
+        let i = found?;
+        let seg = remaining.remove(i);
+        let oriented = if reverse { seg.reversed() } else { seg };
+        let (_, next) = endpoints_of(&oriented)?;
+        // Compute bulge for the segment OUT of `current`. DXF bulge =
+        // tan(included_angle / 4) with sign by CCW (positive) / CW (negative).
+        let bulge_for_last = match &oriented {
+            Geom::Line(_) => 0.0,
+            Geom::Arc(a) => {
+                // included angle from start_angle to end of sweep is sweep_angle.
+                // CCW arcs in our struct → positive bulge.
+                (a.sweep_angle / 4.0).tan()
+            }
+            _ => 0.0,
+        };
+        if let Some(last) = verts.last_mut() { last.bulge = bulge_for_last; }
+        if remaining.is_empty() && chain_closed {
+            // Don't push the closing vertex — `closed: true` carries it.
+            break;
+        }
+        verts.push(PolyVertex { pos: next, bulge: 0.0 });
+        current = next;
+    }
+
+    Some(Polyline { vertices: verts, closed: chain_closed })
+}
+
+#[cfg(test)]
+mod fillet_chamfer_join_tests {
+    use super::*;
+    use crate::math::approx_eq;
+
+    fn ln(ax: f64, ay: f64, bx: f64, by: f64) -> Line {
+        Line { a: Vec2::new(ax, ay), b: Vec2::new(bx, by) }
+    }
+
+    // --- fillet -----------------------------------------------------------
+
+    #[test]
+    fn fillet_right_angle_radius_1() {
+        let l1 = ln(0.0, 0.0, 5.0, 0.0);  // along +X
+        let l2 = ln(0.0, 0.0, 0.0, 5.0);  // along +Y
+        let p1 = Vec2::new(3.0, 0.0);
+        let p2 = Vec2::new(0.0, 3.0);
+        let out = fillet_lines(&l1, p1, &l2, p2, 1.0).unwrap();
+        if let Geom::Line(l) = out.g1_new {
+            assert!(approx_eq(l.a.x, 5.0));
+            assert!(approx_eq(l.b.x, 1.0));
+            assert!(approx_eq(l.b.y, 0.0));
+        } else { panic!("g1_new not a Line") }
+        if let Geom::Line(l) = out.g2_new {
+            assert!(approx_eq(l.b.y, 5.0));
+            assert!(approx_eq(l.a.x, 0.0));
+            assert!(approx_eq(l.a.y, 1.0));
+        } else { panic!("g2_new not a Line") }
+        let arc = out.arc.expect("expected an arc for r>0");
+        if let Geom::Arc(a) = arc {
+            assert!(approx_eq(a.radius, 1.0));
+            assert!(approx_eq(a.center.x, 1.0));
+            assert!(approx_eq(a.center.y, 1.0));
+            assert!(approx_eq(a.sweep_angle, std::f64::consts::FRAC_PI_2));
+        } else { panic!("arc not an Arc") }
+    }
+
+    #[test]
+    fn fillet_radius_zero_makes_sharp_corner() {
+        let l1 = ln(0.0, 0.0, 5.0, 0.0);
+        let l2 = ln(2.0, -3.0, 2.0, 4.0);    // intersects l1 at (2, 0)
+        let p1 = Vec2::new(4.5, 0.0);
+        let p2 = Vec2::new(2.0, 3.0);
+        let out = fillet_lines(&l1, p1, &l2, p2, 0.0).unwrap();
+        assert!(out.arc.is_none());
+        if let Geom::Line(l) = out.g1_new {
+            assert!(approx_eq(l.b.x, 2.0));
+            assert!(approx_eq(l.b.y, 0.0));
+        } else { panic!() }
+    }
+
+    #[test]
+    fn fillet_parallel_lines_errs() {
+        let l1 = ln(0.0, 0.0, 5.0, 0.0);
+        let l2 = ln(0.0, 1.0, 5.0, 1.0);
+        let p1 = Vec2::new(2.0, 0.0);
+        let p2 = Vec2::new(2.0, 1.0);
+        assert!(fillet_lines(&l1, p1, &l2, p2, 1.0).is_err());
+    }
+
+    #[test]
+    fn fillet_radius_too_large_errs() {
+        let l1 = ln(0.0, 0.0, 1.0, 0.0);  // 1-long
+        let l2 = ln(0.0, 0.0, 0.0, 1.0);
+        let p1 = Vec2::new(0.5, 0.0);
+        let p2 = Vec2::new(0.0, 0.5);
+        // radius 10 needs tangent point at (10, 0) — way past line end.
+        assert!(fillet_lines(&l1, p1, &l2, p2, 10.0).is_err());
+    }
+
+    // --- chamfer ----------------------------------------------------------
+
+    #[test]
+    fn chamfer_right_angle_d1_d2() {
+        let l1 = ln(0.0, 0.0, 5.0, 0.0);
+        let l2 = ln(0.0, 0.0, 0.0, 5.0);
+        let p1 = Vec2::new(3.0, 0.0);
+        let p2 = Vec2::new(0.0, 3.0);
+        let out = chamfer_lines(&l1, p1, &l2, p2, 1.0, 2.0).unwrap();
+        if let Geom::Line(l) = out.g1_new {
+            assert!(approx_eq(l.b.x, 1.0));
+            assert!(approx_eq(l.b.y, 0.0));
+        } else { panic!() }
+        if let Geom::Line(l) = out.g2_new {
+            assert!(approx_eq(l.a.x, 0.0));
+            assert!(approx_eq(l.a.y, 2.0));
+        } else { panic!() }
+        if let Geom::Line(l) = out.bridge {
+            assert!(approx_eq(l.a.x, 1.0)); assert!(approx_eq(l.a.y, 0.0));
+            assert!(approx_eq(l.b.x, 0.0)); assert!(approx_eq(l.b.y, 2.0));
+        } else { panic!() }
+    }
+
+    // --- join: collinear lines -------------------------------------------
+
+    #[test]
+    fn join_two_touching_collinear_lines() {
+        let items = vec![
+            (3usize, Geom::Line(ln(0.0, 0.0, 2.0, 0.0))),
+            (7usize, Geom::Line(ln(2.0, 0.0, 5.0, 0.0))),
+        ];
+        let out = join_geoms(&items);
+        assert_eq!(out.consumed_indices.len(), 2);
+        assert_eq!(out.merged.len(), 1);
+        if let Geom::Line(l) = &out.merged[0] {
+            assert!(approx_eq(l.a.x, 0.0));
+            assert!(approx_eq(l.b.x, 5.0));
+        } else { panic!() }
+    }
+
+    #[test]
+    fn join_overlapping_collinear_lines() {
+        let items = vec![
+            (0usize, Geom::Line(ln(0.0, 0.0, 3.0, 0.0))),
+            (1usize, Geom::Line(ln(2.0, 0.0, 5.0, 0.0))),
+        ];
+        let out = join_geoms(&items);
+        assert_eq!(out.merged.len(), 1);
+        if let Geom::Line(l) = &out.merged[0] {
+            assert!(approx_eq(l.a.x, 0.0));
+            assert!(approx_eq(l.b.x, 5.0));
+        } else { panic!() }
+    }
+
+    // --- join: concentric arcs -------------------------------------------
+
+    #[test]
+    fn join_two_touching_arcs_same_center_radius() {
+        let a1 = Arc { center: Vec2::ZERO, radius: 1.0,
+                       start_angle: 0.0, sweep_angle: std::f64::consts::FRAC_PI_2 };
+        let a2 = Arc { center: Vec2::ZERO, radius: 1.0,
+                       start_angle: std::f64::consts::FRAC_PI_2,
+                       sweep_angle: std::f64::consts::FRAC_PI_2 };
+        let items = vec![(0usize, Geom::Arc(a1)), (1usize, Geom::Arc(a2))];
+        let out = join_geoms(&items);
+        assert_eq!(out.merged.len(), 1);
+        if let Geom::Arc(a) = &out.merged[0] {
+            assert!(approx_eq(a.sweep_angle, std::f64::consts::PI));
+            assert!(approx_eq(a.radius, 1.0));
+        } else { panic!() }
+    }
+
+    // --- join: chain → polyline ------------------------------------------
+
+    #[test]
+    fn join_line_arc_line_chain_to_polyline() {
+        let items = vec![
+            (0, Geom::Line(ln(0.0, 0.0, 1.0, 0.0))),
+            (1, Geom::Arc(Arc {
+                center: Vec2::new(1.0, 1.0), radius: 1.0,
+                start_angle: -std::f64::consts::FRAC_PI_2,
+                sweep_angle: std::f64::consts::FRAC_PI_2,
+            })),
+            (2, Geom::Line(ln(2.0, 1.0, 2.0, 3.0))),
+        ];
+        let out = join_geoms(&items);
+        // The collinear / arc-group passes shouldn't fire (only 1 line
+        // direction; 1 arc). Chain pass should produce a polyline.
+        assert!(out.merged.iter().any(|g| matches!(g, Geom::Polyline(_))));
+    }
+}

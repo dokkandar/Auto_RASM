@@ -259,6 +259,10 @@ pub struct CadApp {
     align_state:    AlignState,
     stretch_state:  StretchState,
 
+    // ---- Slices M.3 / M.4: fillet / chamfer ----
+    fillet_state:   FilletState,
+    chamfer_state:  ChamferState,
+
     // ---- Slice M.1 / M.2: trim / extend (two-basket) ----
     trim_state:   TrimState,
     extend_state: ExtendState,
@@ -323,6 +327,10 @@ pub enum QueuedOp {
     Rotate,
     Scale,
     Mirror,
+    /// Join — applied on Enter when the selection session ends. Drives the
+    /// kernel's three-pass merge (collinear lines, concentric arcs, chain
+    /// → polyline).
+    Join,
 }
 
 /// State machine for the interactive copy tool — same shape as MoveState.
@@ -377,6 +385,24 @@ pub enum OffsetState   { Off, WaitingForSide(f64) }
 pub enum LengthenState { Off, WaitingForSide(f64) }
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum BreakState    { Off, WaitingForPoint }
+
+/// Fillet — Slice M.3. Two-click flow: pick first object → pick second.
+/// `radius` is captured at session start so re-running `fillet` with a
+/// different value mid-flow doesn't change behaviour (sticky session).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum FilletState {
+    Off,
+    WaitingForFirst(f64),
+    WaitingForSecond(f64, usize, Vec2),   // radius, idx of first, click point
+}
+
+/// Chamfer — Slice M.4. Same shape as FilletState, with two distances.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ChamferState {
+    Off,
+    WaitingForFirst(f64, f64),
+    WaitingForSecond(f64, f64, usize, Vec2),
+}
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum AlignState {
     Off,
@@ -492,6 +518,8 @@ impl Default for CadApp {
             break_state:    BreakState::Off,
             align_state:    AlignState::Off,
             stretch_state:  StretchState::Off,
+            fillet_state:   FilletState::Off,
+            chamfer_state:  ChamferState::Off,
             trim_state:     TrimState::Off,
             extend_state:   ExtendState::Off,
             pre_op_selection: Vec::new(),
@@ -929,6 +957,48 @@ impl CadApp {
                         self.selection.len()));
                 }
             }
+            Ok(Command::Fillet(r_opt)) => {
+                // Inline `r <val>` updates the UserEnv default; `fillet`
+                // alone picks the current default. See memo
+                // `project_rust_cad_property_foundation` for env persistence.
+                if let Some(r) = r_opt {
+                    self.env.FltRad = r;
+                    let _ = self.env.save();
+                    self.history.push(format!(
+                        "  fillet — radius = {} (saved as FltRad)", r));
+                }
+                let r = self.env.FltRad;
+                self.fillet_state = FilletState::WaitingForFirst(r);
+                self.history.push(format!(
+                    "  fillet (r={}) — Click FIRST line on the SIDE you want to KEEP. Esc cancels.", r));
+            }
+            Ok(Command::Chamfer(opt)) => {
+                if let Some((d1, d2_opt)) = opt {
+                    let d2 = d2_opt.unwrap_or(d1);
+                    self.env.ChmDs1 = d1;
+                    self.env.ChmDs2 = d2;
+                    let _ = self.env.save();
+                    self.history.push(format!(
+                        "  chamfer — distances = ({}, {}) (saved as ChmDs1, ChmDs2)", d1, d2));
+                }
+                let d1 = self.env.ChmDs1;
+                let d2 = self.env.ChmDs2;
+                self.chamfer_state = ChamferState::WaitingForFirst(d1, d2);
+                self.history.push(format!(
+                    "  chamfer (d1={}, d2={}) — Click FIRST line on the SIDE you want to KEEP. Esc cancels.", d1, d2));
+            }
+            Ok(Command::Join) => {
+                if self.selection.is_empty() {
+                    // Auto-select session — like move/copy.
+                    self.begin_selection(SelectMode::ForSelect);
+                    self.queued_op = QueuedOp::Join;
+                    self.history.push(
+                        "  join — Select dobjects to merge: click / window / crossing / `all`, Enter to apply (Esc cancels)".into());
+                } else {
+                    // Apply immediately on the already-finalised selection.
+                    self.apply_join();
+                }
+            }
             Err(e) => self.history.push(format!("  ! {}", e)),
         }
     }
@@ -1113,6 +1183,9 @@ impl CadApp {
                 self.history.push(format!(
                     "  mirror — {} dobject(s). Click FIRST axis point",
                     self.selection.len()));
+            }
+            QueuedOp::Join => {
+                self.apply_join();
             }
         }
         // self.selection persists so follow-up commands (move, list, …) can use it.
@@ -2396,6 +2469,154 @@ impl CadApp {
         }
     }
 
+    // ---------------------------------------------------------------------
+    // Slice M.3 — Fillet (line-line). Two clicks; second click commits.
+    // ---------------------------------------------------------------------
+    fn apply_fillet(&mut self, r: f64, idx1: usize, pick1: Vec2,
+                                  idx2: usize, pick2: Vec2) {
+        if idx1 == idx2 {
+            self.history.push("  ! fillet: same dobject clicked twice".into());
+            return;
+        }
+        // Both must be Lines for v1.
+        let Some(d1) = self.doc.dobjects.get(idx1) else { return; };
+        let Some(d2) = self.doc.dobjects.get(idx2) else { return; };
+        let (l1, l2) = match (&d1.geom, &d2.geom) {
+            (Geom::Line(a), Geom::Line(b)) => (*a, *b),
+            _ => {
+                self.history.push(
+                    "  ! fillet: v1 supports LINE + LINE only (line/arc + arc/arc deferred)".into());
+                return;
+            }
+        };
+        let style1 = d1.style;
+        let style2 = d2.style;
+        self.snapshot_doc();
+        match cad_kernel::fillet_lines(&l1, pick1, &l2, pick2, r) {
+            Ok(out) => {
+                // Replace in place (preserve handles + styles) and append arc.
+                if let Some(d) = self.doc.dobjects.get_mut(idx1) { d.geom = out.g1_new; }
+                if let Some(d) = self.doc.dobjects.get_mut(idx2) { d.geom = out.g2_new; }
+                if let Some(arc) = out.arc {
+                    let mut d = DObject::new(arc);
+                    // Arc inherits style from the FIRST clicked line — same
+                    // convention AutoCAD uses for the fillet entity.
+                    d.style = style1;
+                    let _ = style2;
+                    self.doc.push(d);
+                }
+                self.history.push(format!(
+                    "  ⌐ fillet ✓ r={} between #{} and #{}", r, idx1, idx2));
+                self.intersections.clear();
+                self.index_dirty = true;
+                self.gpu_dirty = true;
+            }
+            Err(msg) => {
+                if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
+                self.history.push(format!("  ! fillet: {}", msg));
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Slice M.4 — Chamfer (line-line).
+    // ---------------------------------------------------------------------
+    fn apply_chamfer(&mut self, d1_dist: f64, d2_dist: f64,
+                                idx1: usize, pick1: Vec2,
+                                idx2: usize, pick2: Vec2) {
+        if idx1 == idx2 {
+            self.history.push("  ! chamfer: same dobject clicked twice".into());
+            return;
+        }
+        let Some(da) = self.doc.dobjects.get(idx1) else { return; };
+        let Some(db) = self.doc.dobjects.get(idx2) else { return; };
+        let (l1, l2) = match (&da.geom, &db.geom) {
+            (Geom::Line(a), Geom::Line(b)) => (*a, *b),
+            _ => {
+                self.history.push(
+                    "  ! chamfer: v1 supports LINE + LINE only".into());
+                return;
+            }
+        };
+        let style1 = da.style;
+        self.snapshot_doc();
+        match cad_kernel::chamfer_lines(&l1, pick1, &l2, pick2, d1_dist, d2_dist) {
+            Ok(out) => {
+                if let Some(d) = self.doc.dobjects.get_mut(idx1) { d.geom = out.g1_new; }
+                if let Some(d) = self.doc.dobjects.get_mut(idx2) { d.geom = out.g2_new; }
+                let mut bridge = DObject::new(out.bridge);
+                bridge.style = style1;
+                self.doc.push(bridge);
+                self.history.push(format!(
+                    "  ⌐ chamfer ✓ d=({}, {}) between #{} and #{}",
+                    d1_dist, d2_dist, idx1, idx2));
+                self.intersections.clear();
+                self.index_dirty = true;
+                self.gpu_dirty = true;
+            }
+            Err(msg) => {
+                if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
+                self.history.push(format!("  ! chamfer: {}", msg));
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Slice M.5 — Join. Operates on `self.selection`. Three-pass merge in
+    // the kernel; we remove consumed dobjects (descending) and append the
+    // merged ones at the doc's tail, inheriting style from the lowest-
+    // indexed contributor.
+    // ---------------------------------------------------------------------
+    fn apply_join(&mut self) {
+        if self.selection.is_empty() {
+            self.history.push("  ! join: empty basket".into());
+            return;
+        }
+        let items: Vec<(usize, Geom)> = self.selection.iter()
+            .filter_map(|&i| self.doc.dobjects.get(i).map(|d| (i, d.geom.clone())))
+            .collect();
+        if items.len() < 2 {
+            self.history.push("  ! join: need ≥ 2 dobjects".into());
+            return;
+        }
+        let out = cad_kernel::join_geoms(&items);
+        if out.merged.is_empty() || out.consumed_indices.is_empty() {
+            self.history.push(
+                "  ! join: nothing in the basket could be merged (need collinear lines, concentric arcs, or a touching chain)".into());
+            return;
+        }
+        self.snapshot_doc();
+        // Inherit style from the LOWEST-indexed consumed dobject in each
+        // merged piece — simple, deterministic, matches AutoCAD's "first
+        // selected wins" convention.
+        let inherit_style = out.consumed_indices.iter()
+            .filter_map(|&i| self.doc.dobjects.get(i).map(|d| d.style))
+            .next();
+        // Remove consumed dobjects in DESCENDING index order so shifts
+        // don't invalidate later removals.
+        let mut to_remove: Vec<usize> = out.consumed_indices.clone();
+        to_remove.sort_unstable_by(|a, b| b.cmp(a));
+        for idx in &to_remove {
+            if *idx < self.doc.dobjects.len() {
+                self.doc.dobjects.remove(*idx);
+            }
+        }
+        // Append merged geoms.
+        for g in out.merged {
+            let mut d = DObject::new(g);
+            if let Some(s) = inherit_style { d.style = s; }
+            self.doc.push(d);
+        }
+        // The selection's old indices are now stale — clear it.
+        self.selection.clear();
+        self.history.push(format!(
+            "  ⧙ join ✓ {} dobject(s) merged → {} new piece(s)",
+            to_remove.len(), self.doc.dobjects.len()));
+        self.intersections.clear();
+        self.index_dirty = true;
+        self.gpu_dirty = true;
+    }
+
     fn apply_chlayer(&mut self) {
         if self.selection.is_empty() {
             self.history.push("  ! chlayer: empty basket".into());
@@ -3619,6 +3840,14 @@ impl eframe::App for CadApp {
                 self.align_state = AlignState::Off;
                 self.history.push("  align cancelled".into());
             }
+            if self.fillet_state != FilletState::Off {
+                self.fillet_state = FilletState::Off;
+                self.history.push("  fillet cancelled".into());
+            }
+            if self.chamfer_state != ChamferState::Off {
+                self.chamfer_state = ChamferState::Off;
+                self.history.push("  chamfer cancelled".into());
+            }
             if self.stretch_state != StretchState::Off {
                 self.stretch_state = StretchState::Off;
                 self.history.push("  stretch cancelled".into());
@@ -4461,6 +4690,8 @@ impl eframe::App for CadApp {
                 || self.offset_state     != OffsetState::Off
                 || self.stretch_state    != StretchState::Off
                 || self.matchprops_state != MatchPropsState::Off
+                || self.fillet_state     != FilletState::Off
+                || self.chamfer_state    != ChamferState::Off
                 || self.picking_source
                 || self.intersect_pending_click;
             // When in an active phase: always promote. Otherwise (pointer
@@ -4806,6 +5037,43 @@ impl eframe::App for CadApp {
                         } else {
                             self.history.push(
                                 "  matchprop — no dobject under cursor (Esc to cancel)".into());
+                        }
+                        self.refocus_cmd = true;
+                    } else if self.fillet_state != FilletState::Off {
+                        // Slice M.3 — pick first object, then second.
+                        let tol_world = 10.0 / self.scale as f64;
+                        let hit = self.nearest_entity_under(world, tol_world);
+                        match (self.fillet_state, hit) {
+                            (FilletState::WaitingForFirst(r), Some(i)) => {
+                                self.fillet_state = FilletState::WaitingForSecond(r, i, click_world);
+                                self.history.push(format!(
+                                    "  fillet — first = #{}. Click SECOND line on the side to KEEP.", i));
+                            }
+                            (FilletState::WaitingForSecond(r, i1, p1), Some(i2)) => {
+                                self.apply_fillet(r, i1, p1, i2, click_world);
+                                self.fillet_state = FilletState::Off;
+                            }
+                            _ => self.history.push(
+                                "  fillet — click ON a line; missed".into()),
+                        }
+                        self.refocus_cmd = true;
+                    } else if self.chamfer_state != ChamferState::Off {
+                        // Slice M.4 — pick first object, then second.
+                        let tol_world = 10.0 / self.scale as f64;
+                        let hit = self.nearest_entity_under(world, tol_world);
+                        match (self.chamfer_state, hit) {
+                            (ChamferState::WaitingForFirst(d1, d2), Some(i)) => {
+                                self.chamfer_state =
+                                    ChamferState::WaitingForSecond(d1, d2, i, click_world);
+                                self.history.push(format!(
+                                    "  chamfer — first = #{}. Click SECOND line.", i));
+                            }
+                            (ChamferState::WaitingForSecond(d1, d2, i1, p1), Some(i2)) => {
+                                self.apply_chamfer(d1, d2, i1, p1, i2, click_world);
+                                self.chamfer_state = ChamferState::Off;
+                            }
+                            _ => self.history.push(
+                                "  chamfer — click ON a line; missed".into()),
                         }
                         self.refocus_cmd = true;
                     } else if self.mirror_state != MirrorState::Off {

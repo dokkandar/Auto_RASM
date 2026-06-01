@@ -98,6 +98,16 @@ pub enum Command {
     Trim,
     /// Extend: two-basket flow (boundary edges + targets). Mirror of trim.
     Extend,
+    /// Fillet two dobjects with the given radius (None = use UserEnv default).
+    /// App captures two clicks (object 1, object 2).
+    Fillet(Option<f64>),
+    /// Chamfer two dobjects with the given (d1, d2) distances. None for d2
+    /// means d2 = d1. None for the option means use UserEnv defaults.
+    Chamfer(Option<(f64, Option<f64>)>),
+    /// Join: standard selection session; on Enter, merge the selected
+    /// dobjects per the kernel's three-pass strategy (collinear lines →
+    /// concentric arcs → chain-to-polyline).
+    Join,
     /// Open a file from disk (.dxf or .rsm) and load it into the document.
     Open(String),
     /// Save the current document to disk (.dxf or .rsm). Extension
@@ -179,6 +189,40 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "stretch" | "s"   => Ok(Command::Stretch),
         "trim" | "tr"     => Ok(Command::Trim),
         "extend" | "ex"   => Ok(Command::Extend),
+        "fillet" | "flt" | "f" => {
+            // `fillet` alone → use default radius from UserEnv.
+            // `fillet <r>`    → use this radius (and update UserEnv default).
+            match toks.get(1) {
+                None    => Ok(Command::Fillet(None)),
+                Some(s) => {
+                    let r: f64 = s.parse().map_err(|_| "bad radius".to_string())?;
+                    if r < 0.0 { return Err("fillet radius must be >= 0".into()); }
+                    Ok(Command::Fillet(Some(r)))
+                }
+            }
+        }
+        "chamfer" | "cha" => {
+            // `chamfer`         → use default distances from UserEnv.
+            // `chamfer <d>`     → both distances = d.
+            // `chamfer <d1> <d2>` → use these two.
+            match (toks.get(1), toks.get(2)) {
+                (None, _) => Ok(Command::Chamfer(None)),
+                (Some(s1), None) => {
+                    let d: f64 = s1.parse().map_err(|_| "bad distance".to_string())?;
+                    if d < 0.0 { return Err("chamfer distance must be >= 0".into()); }
+                    Ok(Command::Chamfer(Some((d, None))))
+                }
+                (Some(s1), Some(s2)) => {
+                    let d1: f64 = s1.parse().map_err(|_| "bad distance".to_string())?;
+                    let d2: f64 = s2.parse().map_err(|_| "bad distance".to_string())?;
+                    if d1 < 0.0 || d2 < 0.0 {
+                        return Err("chamfer distances must be >= 0".into());
+                    }
+                    Ok(Command::Chamfer(Some((d1, Some(d2)))))
+                }
+            }
+        }
+        "join" | "j"      => Ok(Command::Join),
         "open"            => {
             let path = toks.get(1)
                 .ok_or("usage: open <path.dxf|path.rsm>")?
