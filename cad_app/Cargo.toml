@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 cad_kernel = { path = "../cad_kernel" }
+cad_io     = { path = "../cad_io" }
 eframe     = { version = "0.30", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 egui       = "0.30"
 egui_glow  = "0.30"

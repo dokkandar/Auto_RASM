@@ -9,6 +9,14 @@
 
 ## Where we are now (2026-06-01)
 
+**Slice H — cad_io / DXF: ● DONE.** New `cad_io` crate with
+`dxf::read_dxf(&str) -> Document` and `dxf::write_dxf(&Document) -> String`.
+Round-trips all current `Geom` variants (Line / Circle / Arc / Ellipse /
+EllipseArc / Point / LWPolyline) plus the LAYER and LTYPE tables. Files
+written by RUST_CAD open cleanly in LibreCAD. Wired into cad_app as
+`open <path.dxf>` and `save <path.dxf>` commands on the command line —
+no native file dialog yet. 9 DXF round-trip tests.
+
 **Slice E (Point + Polyline only): ● DONE.** `Geom` enum gains two new
 variants — `Point { location, style, size }` (AutoCAD POINT) and
 `Polyline { vertices: Vec<PolyVertex>, closed }` (LWPOLYLINE; bulge
@@ -106,7 +114,7 @@ is in place so it inherits layer/color/linetype/lineweight for free.
 | **E. New Dobject types** | ◐ Partial | `DobjectPoint` ● + `DobjectPolyline` ● done. `Text` / `MText` / `DimRotated` deferred — they need `TextStyleTable` / `DimStyleTable` first (each is its own slice). | Yes — two new shapes |
 | **F. Block table + Block panel** | ○ | `BlockTable` on `Document`; INSERT references; egui Blocks dock | Yes |
 | **G. UCS / Named Views / Library Browser / Command Line panel** | ○ | Lighter dependencies, can land in any order | Yes |
-| **H. `cad_io` (DXF reader / writer)** | ○ | Round-trip LINE / CIRCLE / ARC / ELLIPSE / ELLIPSE_ARC first; then per-entity dispatchers | Yes — open .dxf files |
+| **H. `cad_io` (DXF reader / writer)** | ● Done | Round-trips LINE / CIRCLE / ARC / ELLIPSE / ELLIPSE_ARC / POINT / LWPOLYLINE; LAYER + LTYPE tables. `open` / `save` commands on cmd line. File dialog (rfd) is a small follow-up. | Yes — `open file.dxf` / `save file.dxf` |
 | **I. `.rsm` binary format (AutoRASM-native)** | ○ | Fast load/save for big drawings; our own format | Yes |
 | **J. Editing operations** | ○ | copy / rotate / scale / mirror / delete / undo. Each consumes selection via QueuedOp pattern | Yes |
 

@@ -519,6 +519,12 @@ impl CadApp {
                     self.history.push("    → ADD mode (clicks now add/toggle)".into());
                 }
             }
+            Ok(Command::Open(path)) => {
+                self.do_open(&path);
+            }
+            Ok(Command::SaveAs(path)) => {
+                self.do_save(&path);
+            }
             Ok(Command::Move) => {
                 if self.selection.is_empty() {
                     // No basket yet — auto-enter a selection session that
@@ -1342,6 +1348,65 @@ impl CadApp {
                 });
                 ui.end_row();
             });
+    }
+
+    // ===================================================================
+    // Slice H — File I/O (DXF for now; .rsm in Slice I)
+    // ===================================================================
+
+    fn do_open(&mut self, path: &str) {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                self.history.push(format!("  ! open '{}' failed: {}", path, e));
+                return;
+            }
+        };
+        let lower = path.to_ascii_lowercase();
+        let doc_result = if lower.ends_with(".dxf") {
+            cad_io::dxf::read_dxf(&text)
+        } else if lower.ends_with(".rsm") {
+            cad_io::rsm::read_rsm(text.as_bytes())
+        } else {
+            Err(format!("unknown extension on '{}': expected .dxf or .rsm", path))
+        };
+        match doc_result {
+            Ok(doc) => {
+                let n = doc.dobjects.len();
+                let l = doc.layers.len();
+                self.doc = doc;
+                self.selection.clear();
+                self.selection_prev.clear();
+                self.selected = None;
+                self.intersections.clear();
+                self.index_dirty = true;
+                self.gpu_dirty = true;
+                self.history.push(format!(
+                    "  opened '{}'  ({} dobject(s), {} layer(s))", path, n, l
+                ));
+            }
+            Err(e) => self.history.push(format!("  ! open '{}': {}", path, e)),
+        }
+    }
+
+    fn do_save(&mut self, path: &str) {
+        let lower = path.to_ascii_lowercase();
+        let bytes: Vec<u8> = if lower.ends_with(".dxf") {
+            cad_io::dxf::write_dxf(&self.doc).into_bytes()
+        } else if lower.ends_with(".rsm") {
+            cad_io::rsm::write_rsm(&self.doc)
+        } else {
+            self.history.push(format!(
+                "  ! save '{}': unknown extension (expected .dxf or .rsm)", path
+            ));
+            return;
+        };
+        match std::fs::write(path, &bytes) {
+            Ok(()) => self.history.push(format!(
+                "  saved '{}'  ({} bytes)", path, bytes.len()
+            )),
+            Err(e) => self.history.push(format!("  ! save '{}': {}", path, e)),
+        }
     }
 
     fn add_dobject(&mut self, geom: Geom, origin: &str) {

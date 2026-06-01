@@ -205,6 +205,7 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 name = "cad_app"
 version = "0.1.0"
 dependencies = [
+ "cad_io",
  "cad_kernel",
  "eframe",
  "egui",
@@ -214,6 +215,13 @@ dependencies = [
 
 [[package]]
 name = "cad_cli"
+version = "0.1.0"
+dependencies = [
+ "cad_kernel",
+]
+
+[[package]]
+name = "cad_io"
 version = "0.1.0"
 dependencies = [
  "cad_kernel",

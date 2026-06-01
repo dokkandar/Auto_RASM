@@ -78,6 +78,9 @@ fn main() {
             Ok(Command::Move) => {
                 writeln!(out, "(move ignored — CLI has no interactive draw)").ok();
             }
+            Ok(Command::Open(_)) | Ok(Command::SaveAs(_)) => {
+                writeln!(out, "(open/save ignored — CLI is a math REPL, not a doc viewer)").ok();
+            }
             Err(e) => { writeln!(out, "! parse error: {}", e).ok(); }
         }
     }

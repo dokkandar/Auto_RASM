@@ -48,6 +48,11 @@ pub enum Command {
     /// Translate the current selection by the vector (end - base). The app
     /// captures the two clicks interactively.
     Move,
+    /// Open a file from disk (.dxf or .rsm) and load it into the document.
+    Open(String),
+    /// Save the current document to disk (.dxf or .rsm). Extension
+    /// determines the format.
+    SaveAs(String),
 }
 
 pub fn parse(line: &str) -> Result<Command, String> {
@@ -95,6 +100,18 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "rem"  | "remove"  => Ok(Command::SelectRemoveMode),
         "addmode" | "amode" => Ok(Command::SelectAddMode),
         "move" | "m"      => Ok(Command::Move),
+        "open"            => {
+            let path = toks.get(1)
+                .ok_or("usage: open <path.dxf|path.rsm>")?
+                .to_string();
+            Ok(Command::Open(path))
+        }
+        "save" | "saveas" => {
+            let path = toks.get(1)
+                .ok_or("usage: save <path.dxf|path.rsm>")?
+                .to_string();
+            Ok(Command::SaveAs(path))
+        }
         other            => Err(format!("unknown command '{}'", other)),
     }
 }
