@@ -4432,11 +4432,11 @@ impl eframe::App for CadApp {
             let click_now    = resp.clicked();
             let drag_stopped = resp.drag_stopped();
             // egui classifies press-release as `clicked()` or `drag_stopped()`
-            // depending on motion + duration. Small, intended clicks
-            // sometimes fall into the drag_stopped bucket — your 268-cutter
-            // log showed `drag_stopped() drag_motion=0.0px` events that the
-            // handler was silently dropping. Promote drag_stopped events with
-            // small press-to-release distance to clicks.
+            // depending on motion + duration. During any active editing /
+            // drafting / drawing phase, the user is placing points or
+            // picking targets — they never drag. Promote drag_stopped to a
+            // click unconditionally in those phases. See memo
+            // `feedback_rust_cad_no_drag_during_active_phase`.
             let press_release_dist = match (
                 ctx.input(|i| i.pointer.press_origin()),
                 resp.interact_pointer_pos(),
@@ -4444,7 +4444,30 @@ impl eframe::App for CadApp {
                 (Some(p), Some(r)) => (r - p).length(),
                 _ => 0.0,
             };
-            let drag_was_a_click = drag_stopped && press_release_dist < 5.0;
+            let in_click_only_phase =
+                self.tool != Tool::None
+                || matches!(self.trim_state,
+                    TrimState::PickingTargets(_) | TrimState::PickingTargetsAll)
+                || matches!(self.extend_state,
+                    ExtendState::PickingTargets(_) | ExtendState::PickingTargetsAll)
+                || self.move_state       != MoveState::Off
+                || self.copy_state       != CopyState::Off
+                || self.rotate_state     != RotateState::Off
+                || self.scale_state      != ScaleState::Off
+                || self.mirror_state     != MirrorState::Off
+                || self.align_state      != AlignState::Off
+                || self.break_state      != BreakState::Off
+                || self.lengthen_state   != LengthenState::Off
+                || self.offset_state     != OffsetState::Off
+                || self.stretch_state    != StretchState::Off
+                || self.matchprops_state != MatchPropsState::Off
+                || self.picking_source
+                || self.intersect_pending_click;
+            // When in an active phase: always promote. Otherwise (pointer
+            // mode + select-window phase), keep the distance heuristic so
+            // a real window-rubber-band drag isn't fired as a click.
+            let drag_was_a_click = drag_stopped
+                && (in_click_only_phase || press_release_dist < 5.0);
             let click_fired = click_now || drag_was_a_click;
             if (click_now || drag_stopped) && self.trim_debug_open {
                 // Only log when the user has the diagnostic window open, to

@@ -473,8 +473,11 @@ impl Geom {
                     .filter(|&t| t > 1e-9 && t < 1.0 - 1e-9).collect();
                 params.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 params.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+                // Endpoint-only hits → this is a stray fragment between two
+                // cutters; the user wants it removed entirely. See memo
+                // `feedback_rust_cad_trim_fragment_endpoint_only_deletes`.
                 if params.is_empty() {
-                    return Err("trim: no interior cuts on target (endpoint touches don't count)");
+                    return Ok(Vec::new());
                 }
                 let mut bounds = vec![0.0_f64];
                 bounds.extend(&params);
@@ -497,7 +500,7 @@ impl Geom {
                 params.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 params.dedup_by(|a, b| (*a - *b).abs() < EPS);
                 if params.is_empty() {
-                    return Err("trim: no interior cuts on target (endpoint touches don't count)");
+                    return Ok(Vec::new());
                 }
                 let mut bounds = vec![0.0_f64];
                 bounds.extend(&params);
@@ -521,7 +524,7 @@ impl Geom {
                 params.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 params.dedup_by(|a, b| (*a - *b).abs() < EPS);
                 if params.is_empty() {
-                    return Err("trim: no interior cuts on target (endpoint touches don't count)");
+                    return Ok(Vec::new());
                 }
                 let mut bounds = vec![0.0_f64];
                 bounds.extend(&params);
