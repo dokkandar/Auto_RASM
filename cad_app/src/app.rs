@@ -220,6 +220,10 @@ pub struct CadApp {
     // ---- Pen palette (Slice C) ----
     /// Is the pen palette dock open? Toggled from the top toolbar.
     pen_panel_open: bool,
+
+    // ---- Entity Info panel (Slice D) ----
+    /// Is the entity-info dock open? Toggled from the top toolbar.
+    info_panel_open: bool,
 }
 
 /// Active selection-gathering session. `ForList` dumps the chosen dobjects
@@ -314,6 +318,7 @@ impl Default for CadApp {
             layer_rename_buf:   String::new(),
             layer_name_counter: 0,
             pen_panel_open:     true,
+            info_panel_open:    true,
         };
         // Demo layers so the Layer panel has visible content at first launch.
         let walls = s.doc.layers.add(Layer {
@@ -1009,6 +1014,311 @@ impl CadApp {
                         self.gpu_dirty = true;
                     }
                 }
+            });
+    }
+
+    // ===================================================================
+    // Slice D — Entity Info panel
+    // ===================================================================
+    //
+    // Egui-port of LibreCAD's `lc_quickinfowidget`. Two modes:
+    //
+    //   1. Single Dobject selected (via `self.selected` from the right
+    //      panel) → full geometry breakdown + editable style fields.
+    //   2. Multi-Dobject selection (`self.selection`) → summary counts +
+    //      bulk-edit layer / visibility / color.
+
+    fn render_info_panel(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("info")
+            .min_width(240.0)
+            .default_width(280.0)
+            .show(ctx, |ui| {
+                ui.heading("Entity Info");
+                ui.separator();
+
+                // Decide which mode we're in.
+                let n_sel = self.selection.len();
+                let single = self.selected;
+
+                match (single, n_sel) {
+                    (None, 0) => {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(180, 180, 200),
+                            "(no selection — click a dobject in the right panel, or use `select`)",
+                        );
+                    }
+                    (Some(i), _) if i < self.doc.dobjects.len() => {
+                        self.render_info_single(ui, i);
+                    }
+                    (_, n) if n > 0 => {
+                        self.render_info_multi(ui, n);
+                    }
+                    _ => {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(180, 180, 200),
+                            "(no selection)",
+                        );
+                    }
+                }
+            });
+    }
+
+    fn render_info_single(&mut self, ui: &mut egui::Ui, idx: usize) {
+        ui.label(format!("Single dobject #{}", idx));
+        ui.separator();
+
+        // ---- Geometry (read-only) ----
+        let geom_desc = describe(&self.doc.dobjects[idx].geom);
+        ui.label("Geometry");
+        ui.add_space(2.0);
+        ui.monospace(geom_desc);
+        ui.add_space(8.0);
+
+        // ---- Style (editable) ----
+        ui.label("Style");
+        ui.add_space(2.0);
+        egui::Grid::new("info_single_style")
+            .num_columns(2)
+            .spacing([12.0, 4.0])
+            .show(ui, |ui| {
+                ui.label("Handle"); ui.monospace(format!("0x{:X}", self.doc.dobjects[idx].handle));
+                ui.end_row();
+
+                // Layer — combo of all layers in the doc
+                ui.label("Layer");
+                let layer_id = self.doc.dobjects[idx].style.layer;
+                let cur_name = self.doc.layers.get(layer_id)
+                    .map(|l| l.name.clone()).unwrap_or_else(|| "?".into());
+                let mut new_layer: Option<LayerId> = None;
+                egui::ComboBox::new(("info_layer", idx), "")
+                    .selected_text(cur_name)
+                    .show_ui(ui, |ui| {
+                        for lid in 0..(self.doc.layers.len() as LayerId) {
+                            let name = match self.doc.layers.get(lid) {
+                                Some(l) => l.name.clone(), None => continue,
+                            };
+                            if ui.selectable_label(lid == layer_id, name).clicked() {
+                                new_layer = Some(lid);
+                            }
+                        }
+                    });
+                if let Some(lid) = new_layer {
+                    self.doc.dobjects[idx].style.layer = lid;
+                    self.gpu_dirty = true;
+                }
+                ui.end_row();
+
+                // Visibility
+                ui.label("Visible");
+                let mut v = self.doc.dobjects[idx].style.visible;
+                if ui.checkbox(&mut v, "").changed() {
+                    self.doc.dobjects[idx].style.visible = v;
+                }
+                ui.end_row();
+
+                // Color (cycle: ByLayer → TrueColor picker → ByLayer)
+                ui.label("Color");
+                let color = self.doc.dobjects[idx].style.color;
+                let (r, g, b) = match color {
+                    Color::TrueColor(_) => color.rgb_bytes().unwrap_or((255, 255, 255)),
+                    Color::Aci(i)       => aci_palette(i),
+                    Color::ByLayer | Color::ByBlock =>
+                        resolve_color(color, self.doc.dobjects[idx].style.layer, &self.doc.layers),
+                };
+                let mut arr = [r, g, b];
+                let label = match color {
+                    Color::ByLayer => "ByLayer",
+                    Color::ByBlock => "ByBlock",
+                    Color::Aci(_)  => "ACI",
+                    Color::TrueColor(_) => "RGB",
+                };
+                ui.horizontal(|ui| {
+                    if ui.color_edit_button_srgb(&mut arr).changed() {
+                        self.doc.dobjects[idx].style.color =
+                            Color::rgb(arr[0], arr[1], arr[2]);
+                        self.gpu_dirty = true;
+                    }
+                    ui.small(label);
+                    if ui.small_button("ByLayer").clicked() {
+                        self.doc.dobjects[idx].style.color = Color::ByLayer;
+                        self.gpu_dirty = true;
+                    }
+                });
+                ui.end_row();
+
+                // Linetype (combo)
+                ui.label("Linetype");
+                let lt_id = self.doc.dobjects[idx].style.linetype;
+                let cur = self.doc.linetypes.get(lt_id)
+                    .map(|l| l.name.clone()).unwrap_or_else(|| "?".into());
+                let mut new_lt: Option<u32> = None;
+                egui::ComboBox::new(("info_lt", idx), "")
+                    .selected_text(cur)
+                    .show_ui(ui, |ui| {
+                        for ltid in 0..(self.doc.linetypes.len() as u32) {
+                            let name = match self.doc.linetypes.get(ltid) {
+                                Some(l) => l.name.clone(), None => continue,
+                            };
+                            if ui.selectable_label(ltid == lt_id, name).clicked() {
+                                new_lt = Some(ltid);
+                            }
+                        }
+                    });
+                if let Some(ltid) = new_lt {
+                    self.doc.dobjects[idx].style.linetype = ltid;
+                    self.gpu_dirty = true;
+                }
+                ui.end_row();
+
+                // Linetype scale (editable)
+                ui.label("Lt Scale");
+                let mut scale = self.doc.dobjects[idx].style.linetype_scale;
+                if ui.add(egui::DragValue::new(&mut scale).speed(0.05).range(0.01..=100.0)).changed() {
+                    self.doc.dobjects[idx].style.linetype_scale = scale;
+                }
+                ui.end_row();
+
+                // Lineweight (combo)
+                ui.label("Lineweight");
+                let lw = self.doc.dobjects[idx].style.lineweight;
+                let lw_text = match lw {
+                    Lineweight::ByLayer    => "ByLayer".to_string(),
+                    Lineweight::ByBlock    => "ByBlock".to_string(),
+                    Lineweight::Default    => "Default".to_string(),
+                    Lineweight::Custom(mm) => format!("{:.2} mm", mm),
+                };
+                let mut new_lw: Option<Lineweight> = None;
+                egui::ComboBox::new(("info_lw", idx), "")
+                    .selected_text(lw_text)
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(matches!(lw, Lineweight::ByLayer), "ByLayer").clicked() {
+                            new_lw = Some(Lineweight::ByLayer);
+                        }
+                        if ui.selectable_label(matches!(lw, Lineweight::ByBlock), "ByBlock").clicked() {
+                            new_lw = Some(Lineweight::ByBlock);
+                        }
+                        if ui.selectable_label(matches!(lw, Lineweight::Default), "Default").clicked() {
+                            new_lw = Some(Lineweight::Default);
+                        }
+                        for mm in [0.05_f32, 0.13, 0.18, 0.25, 0.35, 0.5, 0.7, 1.0, 1.4, 2.0] {
+                            let is_this = matches!(lw, Lineweight::Custom(x) if (x - mm).abs() < 1e-3);
+                            if ui.selectable_label(is_this, format!("{:.2} mm", mm)).clicked() {
+                                new_lw = Some(Lineweight::Custom(mm));
+                            }
+                        }
+                    });
+                if let Some(v) = new_lw {
+                    self.doc.dobjects[idx].style.lineweight = v;
+                }
+                ui.end_row();
+            });
+    }
+
+    fn render_info_multi(&mut self, ui: &mut egui::Ui, n: usize) {
+        ui.label(format!("Multi-selection: {} dobject(s)", n));
+        ui.separator();
+
+        // Count by Geom variant.
+        let (mut nl, mut nc, mut na, mut ne, mut nea) = (0, 0, 0, 0, 0);
+        for &i in &self.selection {
+            if let Some(d) = self.doc.dobjects.get(i) {
+                match &d.geom {
+                    Geom::Line(_)       => nl  += 1,
+                    Geom::Circle(_)     => nc  += 1,
+                    Geom::Arc(_)        => na  += 1,
+                    Geom::Ellipse(_)    => ne  += 1,
+                    Geom::EllipseArc(_) => nea += 1,
+                }
+            }
+        }
+        ui.monospace(format!(
+            "  lines: {}\n  circles: {}\n  arcs: {}\n  ellipses: {}\n  ellipse-arcs: {}",
+            nl, nc, na, ne, nea
+        ));
+        ui.add_space(8.0);
+
+        ui.label("Bulk edit");
+        ui.add_space(2.0);
+        egui::Grid::new("info_multi_bulk")
+            .num_columns(2)
+            .spacing([12.0, 4.0])
+            .show(ui, |ui| {
+                // Move all selected to a chosen layer
+                ui.label("Layer →");
+                let mut chosen: Option<LayerId> = None;
+                egui::ComboBox::new("info_multi_layer", "")
+                    .selected_text("(set all…)")
+                    .show_ui(ui, |ui| {
+                        for lid in 0..(self.doc.layers.len() as LayerId) {
+                            let name = match self.doc.layers.get(lid) {
+                                Some(l) => l.name.clone(), None => continue,
+                            };
+                            if ui.selectable_label(false, name).clicked() {
+                                chosen = Some(lid);
+                            }
+                        }
+                    });
+                if let Some(lid) = chosen {
+                    let count = self.selection.len();
+                    for &i in &self.selection {
+                        if let Some(d) = self.doc.dobjects.get_mut(i) {
+                            d.style.layer = lid;
+                        }
+                    }
+                    let lname = self.doc.layers.get(lid)
+                        .map(|l| l.name.clone()).unwrap_or_default();
+                    self.history.push(format!(
+                        "  {} dobject(s) moved to layer '{}'", count, lname
+                    ));
+                    self.gpu_dirty = true;
+                }
+                ui.end_row();
+
+                // Visibility toggle for the whole selection
+                ui.label("Visibility");
+                ui.horizontal(|ui| {
+                    if ui.small_button("show all").clicked() {
+                        let count = self.selection.len();
+                        for &i in &self.selection {
+                            if let Some(d) = self.doc.dobjects.get_mut(i) {
+                                d.style.visible = true;
+                            }
+                        }
+                        self.history.push(format!("  shown: {} dobject(s)", count));
+                        self.gpu_dirty = true;
+                    }
+                    if ui.small_button("hide all").clicked() {
+                        let count = self.selection.len();
+                        for &i in &self.selection {
+                            if let Some(d) = self.doc.dobjects.get_mut(i) {
+                                d.style.visible = false;
+                            }
+                        }
+                        self.history.push(format!("  hidden: {} dobject(s)", count));
+                        self.gpu_dirty = true;
+                    }
+                });
+                ui.end_row();
+
+                // ByLayer reset
+                ui.label("Reset to");
+                ui.horizontal(|ui| {
+                    if ui.small_button("ByLayer (all)").clicked() {
+                        let count = self.selection.len();
+                        for &i in &self.selection {
+                            if let Some(d) = self.doc.dobjects.get_mut(i) {
+                                d.style.color      = Color::ByLayer;
+                                d.style.linetype   = LinetypeTable::CONTINUOUS;
+                                d.style.lineweight = Lineweight::ByLayer;
+                            }
+                        }
+                        self.history.push(format!(
+                            "  {} dobject(s) reset to ByLayer", count
+                        ));
+                        self.gpu_dirty = true;
+                    }
+                });
+                ui.end_row();
             });
     }
 
@@ -2072,6 +2382,14 @@ impl eframe::App for CadApp {
                 {
                     self.pen_panel_open = !self.pen_panel_open;
                 }
+                // Entity Info panel toggle
+                let info_btn = if self.info_panel_open { "info ▾" } else { "info ▸" };
+                if ui.button(info_btn)
+                    .on_hover_text("Entity Info — properties of current selection (read + edit layer/color/visibility)")
+                    .clicked()
+                {
+                    self.info_panel_open = !self.info_panel_open;
+                }
                 ui.add_space(20.0);
                 ui.label("intersect:");
                 // View-mode: intersect only dobjects visible in the current viewport.
@@ -2453,6 +2771,11 @@ impl eframe::App for CadApp {
         // ---- left panel (further left): Pen palette (Slice C) -----------
         if self.pen_panel_open {
             self.render_pen_palette(ctx);
+        }
+
+        // ---- left panel: Entity Info (Slice D) --------------------------
+        if self.info_panel_open {
+            self.render_info_panel(ctx);
         }
 
         // ---- right panel: dobjects + intersection list ------------------
