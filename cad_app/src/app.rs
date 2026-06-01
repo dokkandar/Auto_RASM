@@ -16,7 +16,7 @@ use crate::settings::UserEnv;
 // 5 million pairs is roughly half a second on this CPU.
 const PAIR_LIMIT: usize = 5_000_000;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tool { None, Line, Circle, Arc, Ellipse, EllipseArc, Point, Polyline }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -4406,6 +4406,50 @@ impl eframe::App for CadApp {
             //   - if ∩ click is armed: compute intersections in 50px around it.
             //   - if PICK MODE (array source): hit-test dobjects.
             //   - else if a tool is active: register a draw point.
+            // Diagnostic for "click on screen didn't start drawing" reports.
+            // Logs which click handler branch a left-click ended up in. The
+            // Trim Debug Log window already exists; we piggyback on it.
+            // resp.clicked() fires only when egui classifies the press+release
+            // as a click (small motion); drag_stopped() fires when a release
+            // ends a drag — including a "click" that egui saw as a tiny drag.
+            let click_now    = resp.clicked();
+            let drag_stopped = resp.drag_stopped();
+            if (click_now || drag_stopped) && self.trim_debug_open {
+                // Only log when the user has the diagnostic window open, to
+                // keep the log uncluttered.
+                let drag_motion = if drag_stopped {
+                    ctx.input(|i| i.pointer.delta()).length()
+                } else { 0.0 };
+                let gates = format!(
+                    "tool={:?} pending={} move={:?} copy={:?} rotate={:?} \
+                     scale={:?} mirror={:?} align={:?} break={:?} lengthen={:?} \
+                     offset={:?} stretch={:?} matchprops={:?} trim={} extend={} \
+                     select_mode={:?} pick_src={} ∩pend={}",
+                    self.tool, self.pending.len(),
+                    self.move_state, self.copy_state, self.rotate_state,
+                    self.scale_state, self.mirror_state, self.align_state,
+                    self.break_state, self.lengthen_state,
+                    self.offset_state, self.stretch_state, self.matchprops_state,
+                    match self.trim_state {
+                        TrimState::Off => "Off",
+                        TrimState::SelectingCutters => "SelectingCutters",
+                        TrimState::PickingTargets(_) => "PickingTargets(list)",
+                        TrimState::PickingTargetsAll => "PickingTargetsAll",
+                    },
+                    match self.extend_state {
+                        ExtendState::Off => "Off",
+                        ExtendState::SelectingBoundaries => "SelectingBoundaries",
+                        ExtendState::PickingTargets(_) => "PickingTargets(list)",
+                        ExtendState::PickingTargetsAll => "PickingTargetsAll",
+                    },
+                    self.select_mode, self.picking_source, self.intersect_pending_click,
+                );
+                self.trim_dbg(format!(
+                    "CLICK {} (drag_motion={:.1}px) | {}",
+                    if click_now { "clicked()" } else { "drag_stopped()" },
+                    drag_motion, gates,
+                ));
+            }
             if resp.clicked() {
                 if let Some(pos) = resp.interact_pointer_pos() {
                     let world = self.s2w(pos, rect);
@@ -4539,6 +4583,11 @@ impl eframe::App for CadApp {
                         ));
                         if let Some(tgt) = hit {
                             let n_before = self.doc.dobjects.len();
+                            // Note this BEFORE the trim — we use it to
+                            // decide whether the new pieces inherit cutter
+                            // status from a cutter parent (see memo
+                            // `feedback_rust_cad_trim_pieces_inherit_cutter_status`).
+                            let tgt_was_cutter = cutters.contains(&tgt);
                             let did_trim = self.apply_trim_pick(&cutters, tgt, click_world);
                             let n_after = self.doc.dobjects.len();
                             let net = n_after as i64 - n_before as i64;
@@ -4550,15 +4599,31 @@ impl eframe::App for CadApp {
                             // In all-mode the next click re-derives cutters
                             // from doc, so no patch is needed.
                             if did_trim && !all_mode {
+                                // After remove(tgt) + append N pieces, the
+                                // doc has (n_before - 1 + n_pieces) entries.
+                                // n_pieces = n_after - (n_before - 1).
+                                let n_pieces = n_after + 1 - n_before;
+                                let first_new = n_after - n_pieces;
                                 let patched: Vec<usize> = if let TrimState::PickingTargets(c) = &mut self.trim_state {
                                     c.retain(|&i| i != tgt);
                                     for c_i in c.iter_mut() {
                                         if *c_i > tgt { *c_i -= 1; }
                                     }
+                                    // INHERIT: if the trimmed target was a
+                                    // cutter, its new pieces are cutters too.
+                                    if tgt_was_cutter && n_pieces > 0 {
+                                        c.extend(first_new..n_after);
+                                    }
                                     c.clone()
                                 } else { Vec::new() };
-                                self.trim_dbg(format!(
-                                    "  → cutters patched = {:?}", patched));
+                                if tgt_was_cutter && n_pieces > 0 {
+                                    self.trim_dbg(format!(
+                                        "  → cutters patched (parent #{} was a cutter → {} new pieces inherit) = {:?}",
+                                        tgt, n_pieces, patched));
+                                } else {
+                                    self.trim_dbg(format!(
+                                        "  → cutters patched = {:?}", patched));
+                                }
                             } else if all_mode {
                                 self.trim_dbg(
                                     "  → cutters: ALL mode (next click re-derives from doc)".to_string());
