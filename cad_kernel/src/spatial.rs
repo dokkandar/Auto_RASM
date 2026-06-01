@@ -1,0 +1,185 @@
+// Uniform-grid spatial index.
+//
+// Every dobject is bucketed into all cells its bounding box overlaps.
+// Queries take a rectangle (or a point + radius) and return a deduplicated
+// list of candidate dobject indices — typically O(visible cells × avg per cell)
+// instead of O(N).
+//
+// Bucketing decision: a fixed cell size, chosen by `auto_cell_size` to target
+// ~10 dobjects per cell on average. Memory cost is O(N · avg cells per dobject).
+//
+// Trade-off: this index assumes a roughly uniform dobject distribution. For
+// pathological cases (e.g. one giant dobject covering the whole drawing plus a
+// million tiny ones) a quadtree would do better. Uniform grid is fast to build,
+// trivially parallel, and matches the array-grid workload we want to stress.
+
+use std::collections::HashSet;
+
+use crate::dobject::DObject;
+use crate::math::Vec2;
+
+pub struct UniformGrid {
+    pub cell_size: f64,
+    pub origin:    Vec2,   // world coord of the grid's (0,0) corner
+    pub cols:      usize,
+    pub rows:      usize,
+    cells: Vec<Vec<u32>>,  // row-major, cells[row * cols + col]
+}
+
+impl UniformGrid {
+    pub fn empty() -> Self {
+        Self {
+            cell_size: 1.0,
+            origin:    Vec2::ZERO,
+            cols: 0, rows: 0,
+            cells: Vec::new(),
+        }
+    }
+
+    /// Build the index from `dobjects`. Panics if `cell_size <= 0`.
+    pub fn build(dobjects: &[DObject], cell_size: f64) -> Self {
+        assert!(cell_size > 0.0, "cell_size must be positive");
+        if dobjects.is_empty() { return Self::empty(); }
+
+        // overall world bbox
+        let mut min = Vec2::new(f64::INFINITY, f64::INFINITY);
+        let mut max = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for e in dobjects {
+            let (emin, emax) = e.bbox();
+            if emin.x < min.x { min.x = emin.x; }
+            if emin.y < min.y { min.y = emin.y; }
+            if emax.x > max.x { max.x = emax.x; }
+            if emax.y > max.y { max.y = emax.y; }
+        }
+
+        let cols = (((max.x - min.x) / cell_size).floor() as isize + 1).max(1) as usize;
+        let rows = (((max.y - min.y) / cell_size).floor() as isize + 1).max(1) as usize;
+        let mut cells: Vec<Vec<u32>> = vec![Vec::new(); cols * rows];
+
+        for (i, e) in dobjects.iter().enumerate() {
+            let (emin, emax) = e.bbox();
+            let xmin = (((emin.x - min.x) / cell_size).floor() as isize).max(0) as usize;
+            let xmax = (((emax.x - min.x) / cell_size).floor() as isize).max(0) as usize;
+            let ymin = (((emin.y - min.y) / cell_size).floor() as isize).max(0) as usize;
+            let ymax = (((emax.y - min.y) / cell_size).floor() as isize).max(0) as usize;
+            let xmax = xmax.min(cols - 1);
+            let ymax = ymax.min(rows - 1);
+            for cy in ymin..=ymax {
+                let row_start = cy * cols;
+                for cx in xmin..=xmax {
+                    cells[row_start + cx].push(i as u32);
+                }
+            }
+        }
+
+        Self { cell_size, origin: min, cols, rows, cells }
+    }
+
+    /// Pick a cell size that targets `target_per_cell` dobjects per cell, on
+    /// average, given the dobjects' overall bbox area.
+    pub fn auto_cell_size(dobjects: &[DObject], target_per_cell: f64) -> f64 {
+        if dobjects.is_empty() { return 1.0; }
+        let mut min = Vec2::new(f64::INFINITY, f64::INFINITY);
+        let mut max = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for e in dobjects {
+            let (emin, emax) = e.bbox();
+            if emin.x < min.x { min.x = emin.x; }
+            if emin.y < min.y { min.y = emin.y; }
+            if emax.x > max.x { max.x = emax.x; }
+            if emax.y > max.y { max.y = emax.y; }
+        }
+        let w = (max.x - min.x).max(1.0);
+        let h = (max.y - min.y).max(1.0);
+        let by_density = (w * h * target_per_cell / dobjects.len() as f64).sqrt();
+        by_density.max(0.001).min(1.0e6)
+    }
+
+    /// Candidate dobject indices whose stored cells overlap the rectangle.
+    /// Deduplicated. DObjects were bucketed by bbox so callers may still need
+    /// a tighter test for exact-overlap semantics.
+    pub fn query_bbox(&self, q_min: Vec2, q_max: Vec2) -> Vec<u32> {
+        if self.cells.is_empty() { return Vec::new(); }
+        let cs = self.cell_size;
+        let to_cell = |v: f64, axis_origin: f64| -> isize {
+            ((v - axis_origin) / cs).floor() as isize
+        };
+        let xmin = to_cell(q_min.x, self.origin.x).max(0) as usize;
+        let xmax = (to_cell(q_max.x, self.origin.x).max(0) as usize).min(self.cols - 1);
+        let ymin = to_cell(q_min.y, self.origin.y).max(0) as usize;
+        let ymax = (to_cell(q_max.y, self.origin.y).max(0) as usize).min(self.rows - 1);
+        if xmin > xmax || ymin > ymax { return Vec::new(); }
+
+        // HashSet for dedup. Result is typically small (hundreds to low
+        // thousands); HashSet's per-insert cost dominates only if we hit the
+        // entire grid, which the caller is responsible for avoiding.
+        let mut out: HashSet<u32> = HashSet::new();
+        for cy in ymin..=ymax {
+            let row = cy * self.cols;
+            for cx in xmin..=xmax {
+                for &idx in &self.cells[row + cx] {
+                    out.insert(idx);
+                }
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    pub fn query_near(&self, p: Vec2, radius: f64) -> Vec<u32> {
+        self.query_bbox(
+            Vec2::new(p.x - radius, p.y - radius),
+            Vec2::new(p.x + radius, p.y + radius),
+        )
+    }
+
+    /// (total_cells, total_index_entries, cell_size).
+    /// `total_index_entries / N_entities` gives the average cells-per-dobject.
+    pub fn stats(&self) -> (usize, usize, f64) {
+        let total: usize = self.cells.iter().map(|c| c.len()).sum();
+        (self.cols * self.rows, total, self.cell_size)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geom::Circle;
+
+    fn c(x: f64, y: f64, r: f64) -> DObject {
+        Circle { center: Vec2::new(x, y), radius: r }.into()
+    }
+
+    #[test]
+    fn empty_grid_returns_empty() {
+        let g = UniformGrid::build(&[], 1.0);
+        assert!(g.query_bbox(Vec2::new(0.0, 0.0), Vec2::new(10.0, 10.0)).is_empty());
+    }
+
+    #[test]
+    fn basic_query() {
+        let ents = vec![
+            c(  0.0,  0.0, 1.0),
+            c( 10.0, 10.0, 1.0),
+            c( 50.0, 50.0, 1.0),
+            c(100.0,100.0, 1.0),
+        ];
+        let g = UniformGrid::build(&ents, 5.0);
+        let r = g.query_bbox(Vec2::new(-2.0, -2.0), Vec2::new(12.0, 12.0));
+        // Should find indices 0 and 1, not 2 or 3
+        assert!(r.contains(&0) && r.contains(&1));
+        assert!(!r.contains(&2) && !r.contains(&3));
+    }
+
+    #[test]
+    fn near_point_query() {
+        let ents = vec![
+            c( 0.0, 0.0, 1.0),
+            c(50.0, 0.0, 1.0),
+            c( 0.0,50.0, 1.0),
+        ];
+        let g = UniformGrid::build(&ents, 5.0);
+        let r = g.query_near(Vec2::new(0.0, 0.0), 10.0);
+        assert!(r.contains(&0));
+        assert!(!r.contains(&1));
+        assert!(!r.contains(&2));
+    }
+}

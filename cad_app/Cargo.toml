@@ -1,0 +1,15 @@
+[package]
+name    = "cad_app"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rust_cad"
+path = "src/main.rs"
+
+[dependencies]
+cad_kernel = { path = "../cad_kernel" }
+eframe     = { version = "0.30", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui       = "0.30"
+egui_glow  = "0.30"
+glow       = "0.14"

@@ -1,0 +1,111 @@
+// DObject — the user-facing drafting object.
+//
+// A Dobject is geometry + style + identity. The internal geometry enum is
+// `Geom` (Line, Circle, Arc, Ellipse, EllipseArc, plus future variants);
+// this struct wraps it with the common properties every entity carries
+// (layer, color, linetype, lineweight, visibility) and a stable handle.
+//
+// API design choice: `&[DObject]` is the canonical kernel slice type for
+// snap / spatial / intersect dispatch — callers can index the slice to map
+// hits back to their storage. Pure-geometry math (intersect pairs, distance)
+// operates on `&Geom` internally; the struct exposes `.geom` for that.
+
+use crate::geom::{Arc, Circle, Ellipse, EllipseArc, Geom, Line};
+use crate::math::Vec2;
+use crate::style::Style;
+
+pub type Handle = u64;
+
+#[derive(Clone, Debug)]
+pub struct DObject {
+    pub geom:   Geom,
+    pub style:  Style,
+    pub handle: Handle,
+}
+
+impl DObject {
+    /// New Dobject with default style and a freshly allocated handle.
+    pub fn new(geom: Geom) -> Self {
+        Self { geom, style: Style::default(), handle: next_handle() }
+    }
+
+    /// New Dobject with an explicit style and a freshly allocated handle.
+    pub fn with_style(geom: Geom, style: Style) -> Self {
+        Self { geom, style, handle: next_handle() }
+    }
+
+    /// AABB of the contained geometry. Delegated for caller convenience —
+    /// the spatial index doesn't have to crack the struct on every iter.
+    pub fn bbox(&self) -> (Vec2, Vec2) { self.geom.bbox() }
+
+    /// Distance from the visible geometry to a world point. Style does NOT
+    /// affect this — invisible/locked layers are an enforcement concern at
+    /// the call site, not a geometry one.
+    pub fn distance_to_point(&self, p: Vec2) -> f64 { self.geom.distance_to_point(p) }
+
+    /// Return a copy of this Dobject with its geometry translated by `off`.
+    /// Style and handle are preserved.
+    pub fn translated(&self, off: Vec2) -> DObject {
+        DObject {
+            geom:   self.geom.translated(off),
+            style:  self.style,
+            handle: self.handle,
+        }
+    }
+}
+
+// ---- ergonomic constructors ------------------------------------------------
+//
+// `Line { … }.into()` builds a default-styled DObject. Keeps cad_snap-style
+// quick examples one line.
+
+impl From<Geom>       for DObject { fn from(g: Geom) -> Self        { Self::new(g) } }
+impl From<Line>       for DObject { fn from(l: Line) -> Self        { Self::new(Geom::Line(l)) } }
+impl From<Circle>     for DObject { fn from(c: Circle) -> Self      { Self::new(Geom::Circle(c)) } }
+impl From<Arc>        for DObject { fn from(a: Arc) -> Self         { Self::new(Geom::Arc(a)) } }
+impl From<Ellipse>    for DObject { fn from(e: Ellipse) -> Self     { Self::new(Geom::Ellipse(e)) } }
+impl From<EllipseArc> for DObject { fn from(ea: EllipseArc) -> Self { Self::new(Geom::EllipseArc(ea)) } }
+
+// ---- handle allocation -----------------------------------------------------
+//
+// Global counter is fine for now — handles are unique per process. When DXF
+// import lands we'll need handle preservation (load files keep their hex
+// handles), so this becomes per-Document. Today it's simple and sufficient.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+static HANDLE_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+pub fn next_handle() -> Handle {
+    HANDLE_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::math::Vec2;
+
+    #[test]
+    fn line_into_dobject() {
+        let d: DObject = Line { a: Vec2::new(0.0, 0.0), b: Vec2::new(10.0, 0.0) }.into();
+        assert!(matches!(d.geom, Geom::Line(_)));
+        assert!(d.handle > 0);
+    }
+
+    #[test]
+    fn handles_are_distinct() {
+        let a: DObject = Circle { center: Vec2::ZERO, radius: 1.0 }.into();
+        let b: DObject = Circle { center: Vec2::ZERO, radius: 2.0 }.into();
+        assert_ne!(a.handle, b.handle);
+    }
+
+    #[test]
+    fn translated_preserves_style_and_handle() {
+        let d: DObject = Circle { center: Vec2::ZERO, radius: 5.0 }.into();
+        let h = d.handle;
+        let t = d.translated(Vec2::new(10.0, 0.0));
+        assert_eq!(t.handle, h);
+        if let Geom::Circle(c) = t.geom {
+            assert_eq!(c.center, Vec2::new(10.0, 0.0));
+        } else { panic!(); }
+    }
+}

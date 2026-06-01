@@ -1,0 +1,129 @@
+// Headless CAD kernel REPL — no UI, no GL, no Qt.
+//
+// Reads commands from stdin (one per line), prints a structured report to
+// stdout. Designed for human verification of the math: write a fixture file
+// of commands, pipe it in, diff the output against expected values.
+//
+// Usage:
+//   cad_cli < fixtures/two_lines.txt
+//   echo -e "line 0,0 10,0\nline 5,-5 5,5" | cad_cli
+//
+// Lines beginning with '#' or empty lines are ignored.
+
+use cad_kernel::*;
+use std::io::{self, BufRead, Write};
+
+fn main() {
+    let stdin  = io::stdin();
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let mut doc = Document::default();
+
+    for line in stdin.lock().lines() {
+        let line = match line { Ok(l) => l, Err(_) => break };
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') { continue; }
+        match parse(trimmed) {
+            Ok(Command::Add(geom)) => {
+                let i = doc.push(DObject::new(geom));
+                writeln!(out, "+ #{} {}", i, describe(&doc.dobjects[i].geom)).ok();
+            }
+            Ok(Command::Delete(i)) => {
+                if i < doc.dobjects.len() {
+                    doc.dobjects.remove(i);
+                    writeln!(out, "- removed #{}", i).ok();
+                } else {
+                    writeln!(out, "! no dobject #{}", i).ok();
+                }
+            }
+            Ok(Command::Clear) => {
+                doc.dobjects.clear();
+                writeln!(out, "- cleared").ok();
+            }
+            Ok(Command::Help) => {
+                writeln!(out, "commands:").ok();
+                writeln!(out, "  line  x1,y1 x2,y2").ok();
+                writeln!(out, "  circle cx,cy r").ok();
+                writeln!(out, "  arc   cx,cy r start_deg end_deg").ok();
+                writeln!(out, "  arc3p p1 p2 p3                    [through 3 points]").ok();
+                writeln!(out, "  arcse cx,cy start end             [center + start + end]").ok();
+                writeln!(out, "  arccr start end r [major|minor]   [chord + radius]").ok();
+                writeln!(out, "  arccl start end length [left|right] [chord + arc length]").ok();
+                writeln!(out, "  del N / clear / help").ok();
+            }
+            Ok(Command::SnapOverride(k)) => {
+                // headless CLI doesn't have an in-progress draw, so snap
+                // overrides have no effect — just acknowledge.
+                writeln!(out, "(snap override '{}' ignored — CLI has no interactive draw)",
+                    k.name()).ok();
+            }
+            Ok(Command::GripsToggle) => {
+                writeln!(out, "(grips toggle ignored — CLI has no selection / display)").ok();
+            }
+            Ok(Command::List) => {
+                // Headless: no interactive selection — just dump everything.
+                writeln!(out, "list — all dobjects:").ok();
+                for (i, d) in doc.dobjects.iter().enumerate() {
+                    writeln!(out, "  #{} {}", i, describe(&d.geom)).ok();
+                }
+            }
+            Ok(Command::Select) => {
+                writeln!(out, "(select ignored — CLI has no interactive selection)").ok();
+            }
+            Ok(Command::SelectAll) | Ok(Command::SelectPrevious)
+            | Ok(Command::SelectNone) | Ok(Command::SelectRemoveMode)
+            | Ok(Command::SelectAddMode) => {
+                writeln!(out, "(selection sub-command ignored — CLI has no selection session)").ok();
+            }
+            Ok(Command::Move) => {
+                writeln!(out, "(move ignored — CLI has no interactive draw)").ok();
+            }
+            Err(e) => { writeln!(out, "! parse error: {}", e).ok(); }
+        }
+    }
+
+    writeln!(out).ok();
+    writeln!(out, "=== dobjects ({}) ===", doc.dobjects.len()).ok();
+    for (i, d) in doc.dobjects.iter().enumerate() {
+        writeln!(out, "  #{} {}", i, describe(&d.geom)).ok();
+    }
+
+    writeln!(out).ok();
+    writeln!(out, "=== intersections ===").ok();
+    let mut count = 0;
+    for i in 0..doc.dobjects.len() {
+        for j in (i + 1)..doc.dobjects.len() {
+            for p in intersect(&doc.dobjects[i].geom, &doc.dobjects[j].geom) {
+                writeln!(out,
+                    "  ({:>12.6}, {:>12.6})    [dobjects #{} ∩ #{}]",
+                    p.x, p.y, i, j).ok();
+                count += 1;
+            }
+        }
+    }
+    writeln!(out, "total: {}", count).ok();
+}
+
+fn describe(g: &Geom) -> String {
+    match g {
+        Geom::Line(l)   => format!(
+            "line ({:.4},{:.4}) -> ({:.4},{:.4})",
+            l.a.x, l.a.y, l.b.x, l.b.y),
+        Geom::Circle(c) => format!(
+            "circle c=({:.4},{:.4}) r={:.4}",
+            c.center.x, c.center.y, c.radius),
+        Geom::Arc(a)    => format!(
+            "arc c=({:.4},{:.4}) r={:.4} start={:.4}° sweep={:.4}°",
+            a.center.x, a.center.y, a.radius,
+            a.start_angle.to_degrees(), a.sweep_angle.to_degrees()),
+        Geom::Ellipse(el) => format!(
+            "ellipse c=({:.4},{:.4}) a={:.4} ratio={:.4} rot={:.4}°",
+            el.center.x, el.center.y, el.semi_major(), el.ratio,
+            el.major.angle().to_degrees()),
+        Geom::EllipseArc(ea) => format!(
+            "ellipsearc c=({:.4},{:.4}) a={:.4} ratio={:.4} start={:.4}° sweep={:.4}°",
+            ea.ellipse.center.x, ea.ellipse.center.y,
+            ea.ellipse.semi_major(), ea.ellipse.ratio,
+            ea.start_param.to_degrees(), ea.sweep_param.to_degrees()),
+    }
+}

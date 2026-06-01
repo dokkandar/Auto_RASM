@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members  = ["cad_kernel", "cad_snap", "cad_app", "cad_cli"]
+
+[profile.release]
+lto           = true
+codegen-units = 1

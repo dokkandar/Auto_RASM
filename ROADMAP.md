@@ -1,0 +1,137 @@
+# RUST_CAD — Project Roadmap
+
+> Living document. Update at the start of every new slice. The three
+> reference docs (`Variables.md`, `Dobject_DXF.md`, `Dobject_Properties.md`)
+> are the *contracts*; this file tracks **what we're working on, why, and
+> how we plan to get there**.
+
+---
+
+## Where we are now (2026-06-01)
+
+**Slice A — Property foundation: ● DONE.**
+
+Workspace builds clean, 70 tests pass.
+
+| What landed | Files |
+|---|---|
+| `Color { ByLayer / ByBlock / Aci / TrueColor }` + `resolve_color()` chain | `cad_kernel/src/color.rs` |
+| `Lineweight { ByLayer / ByBlock / Default / Custom(mm) }` + resolver | `cad_kernel/src/lineweight.rs` |
+| `Linetype` + `LinetypeTable` (Continuous / Dashed / DashDot built-ins) | `cad_kernel/src/linetype.rs` |
+| `Layer` + `LayerTable` (layer "0" reserved, can't delete) | `cad_kernel/src/layer.rs` |
+| `Style` struct (layer + color + linetype + linetype_scale + lineweight + visible) | `cad_kernel/src/style.rs` |
+| `DObject` struct = `geom: Geom` + `style: Style` + `handle: Handle` | `cad_kernel/src/dobject.rs` |
+| `Document` container = dobjects + layers + linetypes | `cad_kernel/src/document.rs` |
+| Rename: existing `DObject` enum → `Geom` enum across the whole workspace | (149 refs swept) |
+| Renderer resolves `Color::ByLayer` + honours `style.visible` + `layer.visible/frozen` | `cad_app/src/app.rs` |
+
+**Slice B — Layer panel: ○ NEXT.** Egui dock equivalent to LibreCAD's
+`qg_layerwidget` — add / rename / delete layers, visibility / lock / freeze
+toggles, click to set active. First visible UI deliverable on top of the
+foundation.
+
+---
+
+## North-star objectives
+
+1. **A pure-Rust 2D CAD math workbench** that scales to millions of
+   Dobjects. No webview, no Qt. eframe (egui + glow) gives us a GL context
+   on the main thread and zero IPC.
+2. **Bring LibreCAD's QT panels in, but more complete.** Layer / Pen /
+   Blocks / Library Browser / Entity Info / Command Line / UCS / Named
+   Views — each as an egui dock with feature parity at minimum.
+3. **AutoCAD-grade interop.** DXF round-trip via the `dxf…` / `dob…` /
+   `xd…` group-code dictionary in `Dobject_DXF.md`. Eventually our own
+   binary `.rsm` format for AutoRASM-native fast load/save.
+4. **AutoCAD-feel settings.** User-Environment Settings (the SYSVAR
+   analog) with cryptic short names like `SpTGSZ`, `GrpEnb`, surfaced in
+   a settings window and persisted to `~/.config/rust_cad/user_env.txt`.
+
+---
+
+## How we implement — foundation-first, slice-by-slice
+
+**The rule**: every behavior toggle or hardcoded constant goes into
+`UserEnv` *first* (with a row in `Variables.md`), then gets wired.
+Every Dobject type lands as a `Geom` variant *after* the property model
+is in place so it inherits layer/color/linetype/lineweight for free.
+
+### Slice progression
+
+| Slice | Status | Scope | First visible-to-user moment |
+|-------|--------|-------|------------------------------|
+| **A. Property foundation** (kernel) | ● Done | Layer/Linetype/Color/Lineweight types, Style struct, DObject wrapper, Document container, renderer resolves ByLayer | (internals — visible to next slice) |
+| **B. Layer panel** (UI) | ○ Next | Egui dock — list/add/rename/delete/freeze/lock/visibility/active | Yes — first new panel |
+| **C. Pen palette** (UI) | ○ | Egui dock — pen presets (color + linetype + lineweight bundles), "Apply to selection" | Yes |
+| **D. Entity Info panel** (UI) | ○ | Read-only / partially-editable property inspector for current selection | Yes |
+| **E. New Dobject types** | ○ | `DobjectPoint` → `Polyline` → `Text` → `MText` → `DimRotated`. Each gets the full property model for free. | Yes — many new shapes |
+| **F. Block table + Block panel** | ○ | `BlockTable` on `Document`; INSERT references; egui Blocks dock | Yes |
+| **G. UCS / Named Views / Library Browser / Command Line panel** | ○ | Lighter dependencies, can land in any order | Yes |
+| **H. `cad_io` (DXF reader / writer)** | ○ | Round-trip LINE / CIRCLE / ARC / ELLIPSE / ELLIPSE_ARC first; then per-entity dispatchers | Yes — open .dxf files |
+| **I. `.rsm` binary format (AutoRASM-native)** | ○ | Fast load/save for big drawings; our own format | Yes |
+| **J. Editing operations** | ○ | copy / rotate / scale / mirror / delete / undo. Each consumes selection via QueuedOp pattern | Yes |
+
+### Operating principles
+
+- **Kernel changes before UI changes.** Every UI panel reads from a kernel
+  table that already exists. Slice B can build the Layer panel because
+  Slice A landed `LayerTable`.
+- **Document model is THE container.** New tables (blocks, text styles,
+  dim styles, ucs, named views) get added as `Document` fields. Nothing
+  lives loose on `CadApp`.
+- **Common properties live on `DObject`, not on each variant.** Adding
+  a new `Geom` variant must not require touching style infrastructure.
+  This is the architectural payoff of Slice A.
+- **Three docs are the contracts** — keep in sync as types evolve:
+  - [`Variables.md`](Variables.md) — user-settable SYSVARS
+  - [`Dobject_DXF.md`](Dobject_DXF.md) — file-format I/O dictionary
+  - [`Dobject_Properties.md`](Dobject_Properties.md) — in-memory property model
+- **Snap / spatial / intersect API split**: pure-geom helpers take `&Geom`,
+  index-returning APIs (`find_snap`, `UniformGrid::build`) take `&[DObject]`.
+- **Cad_snap dual maintenance**: changes to `cad_kernel::snap` public API
+  must update `cad_snap` re-exports, example, README in the same change.
+
+---
+
+## Crate layout
+
+| Crate | Role |
+|-------|------|
+| `cad_kernel` | Geometry primitives, intersection math, snap engine, spatial index, parser, the new property model (`color`, `lineweight`, `linetype`, `layer`, `style`, `dobject`, `document`). Zero UI deps. |
+| `cad_app` | egui front-end. Pure visualization + command dispatch + interactive draw tools. All math comes from cad_kernel. |
+| `cad_snap` | Thin facade over `cad_kernel::snap` for distributing the snap engine as a library. Has its own README + example. |
+| `cad_cli` | Headless REPL — pipe commands in, get a structured intersection report out. For verifying the math line-by-line. |
+
+---
+
+## Naming conventions
+
+| Concept | Rule |
+|---------|------|
+| Drafting object type | `DObject` struct (geom + style + handle). Was an enum pre-Slice-A; now a struct. |
+| Inner geometry enum | `Geom` (Line, Circle, Arc, Ellipse, EllipseArc, …) |
+| Field / variable | `dobject` / `dobjects` (snake_case) |
+| Variant dispatch | `match &d.geom { Geom::Line(l) => …, … }` |
+| Storage | `Document { dobjects, layers, linetypes }` |
+| **SYSVAR identifier** | cryptic 5–7 char mixed-case no-underscore: `SpTGSZ`, `GrpEnb`, `AtDlgM`. ONLY for `UserEnv` fields. |
+| **Regular kernel/app fields** | idiomatic Rust `snake_case`: `start_angle`, `sweep_param`, `dobjects`, `selection`. |
+| **DXF dictionary prefixes** | `dxf…` (structural), `dob…` (Dobject common), `xd…` (extended data). |
+| **External Dobject naming** (docs only) | `DobjectLine`, `DobjectCircle`, … — the conceptual name. In code the struct is `Line`/`Circle` nested in `Geom`. |
+
+---
+
+## Deferred / parked
+
+- **Spline** — math-heavy; deferred indefinitely. Plan in `Dobject_Properties.md`.
+- **3D types** (SubDMesh, NurbsSurface, 3D Solid) — deferred until RUST_CAD goes 3D.
+- **Niche entity types** (REGION / MLINE / HELIX / UNDERLAY / FIELD / LIGHT / CAMERA / etc.) — tracked in `Dobject_Properties.md` "Possibly missing" table. Parked, no action.
+- **Code cleanups** (e.g. rename `Line.a`/`Line.b` → `start`/`end`) — `~/.claude/...memory/project_rust_cad_future_cleanups.md`. Own pass, never inside a feature PR.
+
+---
+
+## What "save and commit" means here
+
+`RUST_CAD/` was not under git until now. Initial commit captures the
+state at the end of Slice A (everything above is in that snapshot).
+Future slices each get their own commit, with the slice title and the
+status changes in this doc as the message body.
