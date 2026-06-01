@@ -180,6 +180,11 @@ pub struct CadApp {
     selection:          Vec<usize>,
     /// First corner of an in-progress window selection.
     window_first:       Option<Vec2>,
+    /// When the user explicitly typed `w` / `c` to arm window/crossing
+    /// mode, this overrides the drag-direction default for the next two
+    /// clicks. None = direction-based default (L→R inside, R→L crossing).
+    /// Some(true) = forced inside-window, Some(false) = forced crossing.
+    armed_window_inside: Option<bool>,
     /// When true, canvas clicks REMOVE the under-cursor dobject from the
     /// selection instead of adding. Toggled by typing `remove` / `add`
     /// during the session.
@@ -437,6 +442,7 @@ impl Default for CadApp {
             select_mode:        SelectMode::Off,
             selection:          Vec::new(),
             window_first:       None,
+            armed_window_inside: None,
             select_remove_mode: false,
             selection_prev:     Vec::new(),
             move_state:         MoveState::Off,
@@ -547,7 +553,27 @@ impl CadApp {
 
     fn run_command(&mut self, raw: &str) {
         self.history.push(format!("> {}", raw));
-        match parse(raw) {
+        // ---- Selection-mode shortcut intercept ----
+        //
+        // While a select session is active, single-letter input is a
+        // SELECTION SUB-COMMAND, not the same-letter global command.
+        // See memo `feedback_rust_cad_selection_shortcuts`. We rewrite
+        // the input below so the parser hands back the right Command.
+        let effective = if self.select_mode != SelectMode::Off {
+            let lc = raw.trim().to_ascii_lowercase();
+            match lc.as_str() {
+                "w"                                => "window".to_string(),
+                "c" | "cr"                         => "crossing".to_string(),
+                "a"                                => "all".to_string(),
+                "b" | "bef"                        => "before".to_string(),
+                "l"                                => "last".to_string(),
+                "n"                                => "none".to_string(),
+                _                                  => raw.to_string(),
+            }
+        } else {
+            raw.to_string()
+        };
+        match parse(&effective) {
             Ok(Command::Add(e))   => self.add_dobject(e, "command"),
             Ok(Command::Delete(i)) => {
                 if i < self.doc.dobjects.len() {
@@ -668,14 +694,40 @@ impl CadApp {
             }
             Ok(Command::SelectWindow) => {
                 if self.select_mode == SelectMode::Off {
-                    self.history.push("  ! `window` only works during a select session (run `select` or `trim` first)".into());
+                    self.history.push("  ! `window` / `w` only works during a select session (run `select` or `trim` first)".into());
                 } else {
-                    // Note: window selection already works implicitly when
-                    // the user clicks empty space, but typing `window`
-                    // gives the same affordance as AutoCAD's W keyword.
-                    self.window_first = None;   // make sure we're armed for the FIRST corner
+                    self.window_first = None;
+                    self.armed_window_inside = Some(true);   // forced inside
                     self.history.push(
-                        "    window — click FIRST corner on empty space, then OPPOSITE corner. L→R = inside; R→L = crossing. Shift = remove.".into());
+                        "    window armed — click FIRST corner, then OPPOSITE. Only dobjects FULLY INSIDE the box are added.".into());
+                }
+            }
+            Ok(Command::SelectCrossing) => {
+                if self.select_mode == SelectMode::Off {
+                    self.history.push("  ! `crossing` / `c` only works during a select session".into());
+                } else {
+                    self.window_first = None;
+                    self.armed_window_inside = Some(false);  // forced crossing
+                    self.history.push(
+                        "    crossing armed — click FIRST corner, then OPPOSITE. Any dobject TOUCHING the box is added.".into());
+                }
+            }
+            Ok(Command::SelectLast) => {
+                if self.select_mode == SelectMode::Off {
+                    self.history.push("  ! `last` / `l` only works during a select session".into());
+                } else if self.doc.dobjects.is_empty() {
+                    self.history.push("  ! last: document is empty".into());
+                } else {
+                    let last = self.doc.dobjects.len() - 1;
+                    if !self.selection.contains(&last) {
+                        self.selection.push(last);
+                        self.history.push(format!(
+                            "    + last drawn dobject #{} added (basket: {})",
+                            last, self.selection.len()));
+                    } else {
+                        self.history.push(format!(
+                            "    last drawn dobject #{} already in basket", last));
+                    }
                 }
             }
             Ok(Command::Open(path)) => {
@@ -894,6 +946,7 @@ impl CadApp {
         self.select_mode        = SelectMode::Off;
         self.selection.clear();
         self.window_first       = None;
+        self.armed_window_inside = None;
         self.select_remove_mode = false;
         let had_queued = self.queued_op != QueuedOp::None;
         self.queued_op          = QueuedOp::None;
@@ -1079,7 +1132,13 @@ impl CadApp {
     fn add_window_selection(&mut self, p1: Vec2, p2: Vec2, shift: bool) {
         let bbox_min = Vec2::new(p1.x.min(p2.x), p1.y.min(p2.y));
         let bbox_max = Vec2::new(p1.x.max(p2.x), p1.y.max(p2.y));
-        let crossing    = p2.x < p1.x;
+        // If the user explicitly armed window/crossing via typed `w` /
+        // `c`, that mode wins; otherwise fall back to drag direction.
+        let crossing = match self.armed_window_inside.take() {
+            Some(true)  => false,            // armed window → inside-only
+            Some(false) => true,             // armed crossing
+            None        => p2.x < p1.x,      // direction-default
+        };
         let want_remove = shift ^ self.select_remove_mode;
 
         let cands: Vec<usize> = match (self.index.as_ref(), self.index_dirty) {
@@ -3413,48 +3472,50 @@ impl eframe::App for CadApp {
         // selection — this is the LibreCAD / AutoCAD convention. The cmd
         // box's own Enter handler only fires when the text isn't empty, so
         // there's no double-handling.
-        if self.select_mode != SelectMode::Off && self.cmd.trim().is_empty()
-            && ctx.input(|i| i.key_pressed(egui::Key::Enter))
-        {
-            self.finalise_selection();
-        }
-
-        // Enter (empty cmd line) during trim/extend target-pick phase ends
-        // the session cleanly.
-        if self.cmd.trim().is_empty()
-            && ctx.input(|i| i.key_pressed(egui::Key::Enter))
-        {
-            if matches!(self.trim_state, TrimState::PickingTargets(_)) {
+        // ONE Enter press = ONE state transition per frame. See memo
+        // `feedback_rust_cad_user_terminates_sessions` — the program
+        // never auto-terminates editing sessions; only the user does,
+        // and a single Enter must not chain through multiple phases.
+        let enter_now = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+        let cmd_is_empty = self.cmd.trim().is_empty();
+        if enter_now && cmd_is_empty {
+            if self.select_mode != SelectMode::Off {
+                // Confirming a select session (incl. trim/extend cutter
+                // basket). The transition into PickingTargets happens
+                // here; the NEXT Enter (separate keystroke) will end
+                // the target-pick phase.
+                self.finalise_selection();
+            } else if matches!(self.trim_state, TrimState::PickingTargets(_)) {
                 self.trim_state = TrimState::Off;
-                self.history.push("  trim — session ended".into());
-            }
-            if matches!(self.extend_state, ExtendState::PickingTargets(_)) {
+                self.history.push("  trim — session ended (Enter)".into());
+            } else if matches!(self.extend_state, ExtendState::PickingTargets(_)) {
                 self.extend_state = ExtendState::Off;
-                self.history.push("  extend — session ended".into());
+                self.history.push("  extend — session ended (Enter)".into());
+            } else if self.tool == Tool::Polyline && self.pending.len() >= 2 {
+                let verts = self.pending.drain(..).map(|p| PolyVertex {
+                    pos: p, bulge: 0.0,
+                }).collect();
+                self.add_dobject(Geom::Polyline(Polyline {
+                    vertices: verts, closed: false,
+                }), "canvas");
             }
         }
-
-        // Polyline tool: Enter (with empty cmd line) finishes the open
-        // polyline at its current vertex list. Typed "c" or "close"
-        // followed by Enter finishes with closed=true.
-        if self.tool == Tool::Polyline
-            && ctx.input(|i| i.key_pressed(egui::Key::Enter))
-        {
+        // Polyline `c`/`close` then Enter — handled separately because
+        // it consumes a non-empty cmd line, so it doesn't collide with
+        // the empty-Enter cascade above.
+        if self.tool == Tool::Polyline && enter_now && !cmd_is_empty {
             let trimmed = self.cmd.trim().to_ascii_lowercase();
-            let close = trimmed == "c" || trimmed == "close" || trimmed == "closed";
-            if trimmed.is_empty() || close {
+            if trimmed == "c" || trimmed == "close" || trimmed == "closed" {
                 if self.pending.len() >= 2 {
                     let verts = self.pending.drain(..).map(|p| PolyVertex {
                         pos: p, bulge: 0.0,
                     }).collect();
                     self.add_dobject(Geom::Polyline(Polyline {
-                        vertices: verts, closed: close,
-                    }), if close { "canvas (closed)" } else { "canvas" });
-                    if close { self.cmd.clear(); }
+                        vertices: verts, closed: true,
+                    }), "canvas (closed)");
+                    self.cmd.clear();
                 } else {
-                    self.history.push(
-                        "  ! polyline needs at least 2 vertices".into()
-                    );
+                    self.history.push("  ! polyline needs at least 2 vertices".into());
                     self.pending.clear();
                 }
             }

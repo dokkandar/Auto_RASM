@@ -49,6 +49,14 @@ pub enum Command {
     /// window (selection mode only). Recognised both as a top-level
     /// convenience and as a sub-command during a select session.
     SelectWindow,
+    /// Arm crossing-selection: same shape as SelectWindow but the next
+    /// click captures corner 1 of a CROSSING window (R→L style — any
+    /// dobject touching the box joins the basket).
+    SelectCrossing,
+    /// Add the most recently created dobject (highest index) to the
+    /// selection basket. Distinct from `SelectPrevious` (which re-adds
+    /// the whole last-finalised selection).
+    SelectLast,
     /// Translate the current selection by the vector (end - base). The app
     /// captures the two clicks interactively.
     Move,
@@ -141,7 +149,9 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "none" | "deselect" => Ok(Command::SelectNone),
         "rem"  | "remove"  => Ok(Command::SelectRemoveMode),
         "addmode" | "amode" => Ok(Command::SelectAddMode),
-        "window" | "win" | "crossing" => Ok(Command::SelectWindow),
+        "window" | "win" => Ok(Command::SelectWindow),
+        "crossing"       => Ok(Command::SelectCrossing),
+        "last"           => Ok(Command::SelectLast),
         "move" | "m"      => Ok(Command::Move),
         "copy" | "cp" | "co" => Ok(Command::Copy),
         "rotate" | "ro"   => Ok(Command::Rotate),
