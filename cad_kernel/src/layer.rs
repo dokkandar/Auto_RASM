@@ -49,6 +49,7 @@ impl Layer {
     }
 }
 
+#[derive(Clone)]
 pub struct LayerTable {
     pub layers: Vec<Layer>,            // index = LayerId
     /// The layer new Dobjects get assigned to. Index into `layers`.

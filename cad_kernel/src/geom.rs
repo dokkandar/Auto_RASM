@@ -158,6 +158,158 @@ pub enum Geom {
 }
 
 impl Geom {
+    /// Return a copy rotated by `angle` radians around `pivot` (CCW).
+    pub fn rotated(&self, pivot: Vec2, angle: f64) -> Geom {
+        let c = angle.cos();
+        let s = angle.sin();
+        let rot = |p: Vec2| -> Vec2 {
+            let d = p - pivot;
+            Vec2 { x: pivot.x + d.x * c - d.y * s, y: pivot.y + d.x * s + d.y * c }
+        };
+        let rot_dir = |v: Vec2| -> Vec2 {
+            // direction vectors don't shift by pivot
+            Vec2 { x: v.x * c - v.y * s, y: v.x * s + v.y * c }
+        };
+        match self {
+            Geom::Line(l) => Geom::Line(Line { a: rot(l.a), b: rot(l.b) }),
+            Geom::Circle(c) => Geom::Circle(Circle { center: rot(c.center), radius: c.radius }),
+            Geom::Arc(a) => Geom::Arc(Arc {
+                center: rot(a.center),
+                radius: a.radius,
+                start_angle: (a.start_angle + angle).rem_euclid(std::f64::consts::TAU),
+                sweep_angle: a.sweep_angle,
+            }),
+            Geom::Ellipse(e) => Geom::Ellipse(Ellipse {
+                center: rot(e.center),
+                major:  rot_dir(e.major),
+                ratio:  e.ratio,
+            }),
+            Geom::EllipseArc(ea) => Geom::EllipseArc(EllipseArc {
+                ellipse: Ellipse {
+                    center: rot(ea.ellipse.center),
+                    major:  rot_dir(ea.ellipse.major),
+                    ratio:  ea.ellipse.ratio,
+                },
+                // Parameter space is local to the ellipse's own frame, which
+                // we rotated by `angle` (the major direction moved). The
+                // start_param stays — it's measured against the (now rotated)
+                // local axes.
+                start_param: ea.start_param,
+                sweep_param: ea.sweep_param,
+            }),
+            Geom::Point(pt) => Geom::Point(Point {
+                location: rot(pt.location), style: pt.style, size: pt.size,
+            }),
+            Geom::Polyline(p) => Geom::Polyline(Polyline {
+                vertices: p.vertices.iter()
+                    .map(|v| PolyVertex { pos: rot(v.pos), bulge: v.bulge })
+                    .collect(),
+                closed: p.closed,
+            }),
+        }
+    }
+
+    /// Return a copy scaled uniformly by `factor` around `pivot`.
+    /// Non-uniform scale (different x/y) isn't supported because it
+    /// turns circles into ellipses — a separate refactor.
+    pub fn scaled(&self, pivot: Vec2, factor: f64) -> Geom {
+        let sc = |p: Vec2| -> Vec2 {
+            pivot + (p - pivot) * factor
+        };
+        let sc_dir = |v: Vec2| -> Vec2 { v * factor };
+        let f_abs = factor.abs();
+        match self {
+            Geom::Line(l) => Geom::Line(Line { a: sc(l.a), b: sc(l.b) }),
+            Geom::Circle(c) => Geom::Circle(Circle {
+                center: sc(c.center), radius: c.radius * f_abs,
+            }),
+            Geom::Arc(a) => Geom::Arc(Arc {
+                center: sc(a.center), radius: a.radius * f_abs,
+                start_angle: a.start_angle, sweep_angle: a.sweep_angle,
+            }),
+            Geom::Ellipse(e) => Geom::Ellipse(Ellipse {
+                center: sc(e.center), major: sc_dir(e.major), ratio: e.ratio,
+            }),
+            Geom::EllipseArc(ea) => Geom::EllipseArc(EllipseArc {
+                ellipse: Ellipse {
+                    center: sc(ea.ellipse.center),
+                    major:  sc_dir(ea.ellipse.major),
+                    ratio:  ea.ellipse.ratio,
+                },
+                start_param: ea.start_param, sweep_param: ea.sweep_param,
+            }),
+            Geom::Point(pt) => Geom::Point(Point {
+                location: sc(pt.location), style: pt.style, size: pt.size * factor as f32,
+            }),
+            Geom::Polyline(p) => Geom::Polyline(Polyline {
+                vertices: p.vertices.iter()
+                    .map(|v| PolyVertex { pos: sc(v.pos), bulge: v.bulge })
+                    .collect(),
+                closed: p.closed,
+            }),
+        }
+    }
+
+    /// Return a copy mirrored across the line through `a` and `b`.
+    pub fn mirrored(&self, a: Vec2, b: Vec2) -> Geom {
+        let dir = b - a;
+        let len_sq = dir.len_sq();
+        if len_sq < EPS {
+            return self.clone();   // degenerate axis — no-op
+        }
+        let mirror = |p: Vec2| -> Vec2 {
+            let d = p - a;
+            let t = d.dot(dir) / len_sq;
+            let foot = a + dir * t;
+            foot * 2.0 - p
+        };
+        let mirror_dir = |v: Vec2| -> Vec2 {
+            // direction reflection is the same formula without the `a` shift.
+            let t = v.dot(dir) / len_sq;
+            let foot = dir * t;
+            foot * 2.0 - v
+        };
+        match self {
+            Geom::Line(l) => Geom::Line(Line { a: mirror(l.a), b: mirror(l.b) }),
+            Geom::Circle(c) => Geom::Circle(Circle {
+                center: mirror(c.center), radius: c.radius,
+            }),
+            Geom::Arc(arc) => {
+                // Mirroring flips CCW → CW; we keep CCW convention by starting
+                // from the OTHER endpoint and sweeping the same magnitude.
+                let (_e1, e2) = arc.endpoints();
+                let m2 = mirror(e2);
+                let new_center = mirror(arc.center);
+                let new_start = (m2 - new_center).angle();
+                Geom::Arc(Arc {
+                    center: new_center, radius: arc.radius,
+                    start_angle: new_start.rem_euclid(std::f64::consts::TAU),
+                    sweep_angle: arc.sweep_angle,
+                })
+            }
+            Geom::Ellipse(e) => Geom::Ellipse(Ellipse {
+                center: mirror(e.center), major: mirror_dir(e.major), ratio: e.ratio,
+            }),
+            Geom::EllipseArc(ea) => Geom::EllipseArc(EllipseArc {
+                ellipse: Ellipse {
+                    center: mirror(ea.ellipse.center),
+                    major:  mirror_dir(ea.ellipse.major),
+                    ratio:  ea.ellipse.ratio,
+                },
+                start_param: ea.start_param, sweep_param: ea.sweep_param,
+            }),
+            Geom::Point(pt) => Geom::Point(Point {
+                location: mirror(pt.location), style: pt.style, size: pt.size,
+            }),
+            Geom::Polyline(p) => Geom::Polyline(Polyline {
+                vertices: p.vertices.iter()
+                    .map(|v| PolyVertex { pos: mirror(v.pos), bulge: v.bulge })
+                    .collect(),
+                closed: p.closed,
+            }),
+        }
+    }
+
     /// Return a copy of this geometry translated by `off`.
     pub fn translated(&self, off: Vec2) -> Geom {
         match self {
@@ -354,6 +506,58 @@ impl Ellipse {
     pub fn distance_to_point(&self, p: Vec2) -> f64 {
         let t = self.nearest_param(p);
         self.point_at(t).dist(p)
+    }
+}
+
+#[cfg(test)]
+mod transform_tests {
+    use super::*;
+    use crate::math::approx_eq;
+
+    #[test]
+    fn line_rotated_90_around_origin() {
+        let g = Geom::Line(Line { a: Vec2::new(1.0, 0.0), b: Vec2::new(2.0, 0.0) });
+        let r = g.rotated(Vec2::ZERO, std::f64::consts::FRAC_PI_2);
+        if let Geom::Line(l) = r {
+            assert!(approx_eq(l.a.x, 0.0)); assert!(approx_eq(l.a.y, 1.0));
+            assert!(approx_eq(l.b.x, 0.0)); assert!(approx_eq(l.b.y, 2.0));
+        } else { panic!(); }
+    }
+
+    #[test]
+    fn circle_scaled_2x_around_origin() {
+        let g = Geom::Circle(Circle { center: Vec2::new(5.0, 0.0), radius: 3.0 });
+        let s = g.scaled(Vec2::ZERO, 2.0);
+        if let Geom::Circle(c) = s {
+            assert!(approx_eq(c.center.x, 10.0));
+            assert!(approx_eq(c.radius, 6.0));
+        } else { panic!(); }
+    }
+
+    #[test]
+    fn line_mirrored_across_x_axis() {
+        // Axis from (-10,0) to (10,0). Point (3,4) mirrors to (3,-4).
+        let g = Geom::Line(Line { a: Vec2::new(3.0, 4.0), b: Vec2::new(8.0, 2.0) });
+        let m = g.mirrored(Vec2::new(-10.0, 0.0), Vec2::new(10.0, 0.0));
+        if let Geom::Line(l) = m {
+            assert!(approx_eq(l.a.x, 3.0)); assert!(approx_eq(l.a.y, -4.0));
+            assert!(approx_eq(l.b.x, 8.0)); assert!(approx_eq(l.b.y, -2.0));
+        } else { panic!(); }
+    }
+
+    #[test]
+    fn translate_then_rotate_then_translate_back() {
+        // Translation invariance under rotation around the SAME pivot
+        let g = Geom::Circle(Circle { center: Vec2::new(7.0, 3.0), radius: 2.0 });
+        let g2 = g.translated(Vec2::new(10.0, 0.0));
+        let g3 = g2.rotated(Vec2::new(17.0, 3.0), std::f64::consts::PI);
+        let g4 = g3.translated(Vec2::new(-10.0, 0.0));
+        if let Geom::Circle(c) = g4 {
+            // Should be rotated 180° about (7,3) which moves (7,3)+r=2 to the same spot
+            assert!(approx_eq(c.center.x, 7.0));
+            assert!(approx_eq(c.center.y, 3.0));
+            assert!(approx_eq(c.radius, 2.0));
+        } else { panic!(); }
     }
 }
 

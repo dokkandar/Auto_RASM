@@ -48,6 +48,18 @@ pub enum Command {
     /// Translate the current selection by the vector (end - base). The app
     /// captures the two clicks interactively.
     Move,
+    /// Same as `Move` but leaves the originals in place — appends copies.
+    Copy,
+    /// Rotate the selection. App captures pivot + reference + target clicks.
+    Rotate,
+    /// Scale the selection uniformly. App captures pivot + reference distance + target distance.
+    Scale,
+    /// Mirror the selection across a line (two clicks define the line).
+    Mirror,
+    /// Delete every dobject in the current selection.
+    DeleteSelected,
+    /// Undo the most recent editing operation.
+    Undo,
     /// Open a file from disk (.dxf or .rsm) and load it into the document.
     Open(String),
     /// Save the current document to disk (.dxf or .rsm). Extension
@@ -100,6 +112,12 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "rem"  | "remove"  => Ok(Command::SelectRemoveMode),
         "addmode" | "amode" => Ok(Command::SelectAddMode),
         "move" | "m"      => Ok(Command::Move),
+        "copy" | "cp" | "co" => Ok(Command::Copy),
+        "rotate" | "ro"   => Ok(Command::Rotate),
+        "scale" | "sc"    => Ok(Command::Scale),
+        "mirror" | "mi"   => Ok(Command::Mirror),
+        "delete" | "erase" | "e" => Ok(Command::DeleteSelected),
+        "undo" | "u"      => Ok(Command::Undo),
         "open"            => {
             let path = toks.get(1)
                 .ok_or("usage: open <path.dxf|path.rsm>")?

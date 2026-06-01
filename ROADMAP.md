@@ -9,6 +9,17 @@
 
 ## Where we are now (2026-06-01)
 
+**Slice J — Editing operations: ● DONE.** `Geom::rotated()`,
+`Geom::scaled()`, `Geom::mirrored()` added to the kernel (delegating
+methods on `DObject` preserve style + handle). Six new commands wired
+into the parser: `copy`, `rotate`, `scale`, `mirror`, `delete`,
+`undo`. Each uses the QueuedOp pattern: if nothing is selected, the
+command opens a selection session and re-enters the op when Enter
+finalises. Interactive flows (pivot + reference + target clicks) live
+in new state machines per op. **Snapshot-based undo** — every mutation
+clones the Document onto a 64-deep stack; `undo` pops and restores.
+4 new geom transform tests; 89 tests passing workspace-wide.
+
 **Slice I — .rsm binary format: ● DONE.** Hand-rolled little-endian
 versioned format in `cad_io::rsm`. Lossless `Document` round-trip
 including every Geom variant, every layer/linetype/pen field, and
@@ -125,7 +136,7 @@ is in place so it inherits layer/color/linetype/lineweight for free.
 | **G. UCS / Named Views / Library Browser / Command Line panel** | ○ | Lighter dependencies, can land in any order | Yes |
 | **H. `cad_io` (DXF reader / writer)** | ● Done | Round-trips LINE / CIRCLE / ARC / ELLIPSE / ELLIPSE_ARC / POINT / LWPOLYLINE; LAYER + LTYPE tables. `open` / `save` commands on cmd line. File dialog (rfd) is a small follow-up. | Yes — `open file.dxf` / `save file.dxf` |
 | **I. `.rsm` binary format (AutoRASM-native)** | ● Done | Hand-rolled LE binary, versioned header, lossless. Handle preservation; no deps. | Yes — `open file.rsm` / `save file.rsm` |
-| **J. Editing operations** | ○ | copy / rotate / scale / mirror / delete / undo. Each consumes selection via QueuedOp pattern | Yes |
+| **J. Editing operations** | ● Done | copy / rotate / scale / mirror / delete / undo. All consume selection via QueuedOp pattern; snapshot-based undo stack (64-deep). | Yes |
 
 ### Operating principles
 

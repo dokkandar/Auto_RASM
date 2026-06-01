@@ -228,7 +228,19 @@ pub struct CadApp {
     // ---- Entity Info panel (Slice D) ----
     /// Is the entity-info dock open? Toggled from the top toolbar.
     info_panel_open: bool,
+
+    // ---- Editing operations (Slice J) ----
+    copy_state:   CopyState,
+    rotate_state: RotateState,
+    scale_state:  ScaleState,
+    mirror_state: MirrorState,
+    /// Snapshot-based undo stack — every editing operation pushes the
+    /// pre-mutation Document. `undo` pops and restores. Bounded so a
+    /// long editing session doesn't grow without bound.
+    undo_stack:   Vec<Document>,
 }
+
+const UNDO_STACK_CAP: usize = 64;
 
 /// Active selection-gathering session. `ForList` dumps the chosen dobjects
 /// to the command history when finalised; `ForSelect` just keeps them as
@@ -262,6 +274,47 @@ pub enum MoveState {
 pub enum QueuedOp {
     None,
     Move,
+    Copy,
+    Rotate,
+    Scale,
+    Mirror,
+}
+
+/// State machine for the interactive copy tool — same shape as MoveState.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum CopyState {
+    Off,
+    WaitingForBase,
+    WaitingForDest(Vec2),
+}
+
+/// State machine for the interactive rotate tool:
+/// click pivot, then a reference point (the angle baseline), then the
+/// target point — sweep = atan2(target - pivot) - atan2(ref - pivot).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum RotateState {
+    Off,
+    WaitingForPivot,
+    WaitingForRef(Vec2),
+    WaitingForTarget(Vec2, Vec2),   // (pivot, ref)
+}
+
+/// State machine for the interactive scale tool — pivot + reference
+/// distance + target distance; factor = |target| / |ref|.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ScaleState {
+    Off,
+    WaitingForPivot,
+    WaitingForRef(Vec2),
+    WaitingForTarget(Vec2, f64),    // (pivot, ref_dist)
+}
+
+/// State machine for the interactive mirror tool — two clicks define the axis.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum MirrorState {
+    Off,
+    WaitingForA,
+    WaitingForB(Vec2),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -323,6 +376,11 @@ impl Default for CadApp {
             layer_name_counter: 0,
             pen_panel_open:     true,
             info_panel_open:    true,
+            copy_state:   CopyState::Off,
+            rotate_state: RotateState::Off,
+            scale_state:  ScaleState::Off,
+            mirror_state: MirrorState::Off,
+            undo_stack:   Vec::new(),
         };
         // Demo layers so the Layer panel has visible content at first launch.
         let walls = s.doc.layers.add(Layer {
@@ -525,6 +583,83 @@ impl CadApp {
             Ok(Command::SaveAs(path)) => {
                 self.do_save(&path);
             }
+            Ok(Command::Copy) => {
+                if self.selection.is_empty() {
+                    self.begin_selection(SelectMode::ForSelect);
+                    self.queued_op = QueuedOp::Copy;
+                    self.history.push(
+                        "  copy — Select dobjects to copy, Enter to continue (Esc cancels)".into());
+                } else {
+                    self.copy_state = CopyState::WaitingForBase;
+                    self.history.push(format!(
+                        "  copy — {} dobject(s) selected. Click BASE point (Esc cancels)",
+                        self.selection.len()));
+                }
+            }
+            Ok(Command::Rotate) => {
+                if self.selection.is_empty() {
+                    self.begin_selection(SelectMode::ForSelect);
+                    self.queued_op = QueuedOp::Rotate;
+                    self.history.push(
+                        "  rotate — Select dobjects, Enter to continue (Esc cancels)".into());
+                } else {
+                    self.rotate_state = RotateState::WaitingForPivot;
+                    self.history.push(format!(
+                        "  rotate — {} dobject(s) selected. Click PIVOT point",
+                        self.selection.len()));
+                }
+            }
+            Ok(Command::Scale) => {
+                if self.selection.is_empty() {
+                    self.begin_selection(SelectMode::ForSelect);
+                    self.queued_op = QueuedOp::Scale;
+                    self.history.push(
+                        "  scale — Select dobjects, Enter to continue (Esc cancels)".into());
+                } else {
+                    self.scale_state = ScaleState::WaitingForPivot;
+                    self.history.push(format!(
+                        "  scale — {} dobject(s) selected. Click PIVOT point",
+                        self.selection.len()));
+                }
+            }
+            Ok(Command::Mirror) => {
+                if self.selection.is_empty() {
+                    self.begin_selection(SelectMode::ForSelect);
+                    self.queued_op = QueuedOp::Mirror;
+                    self.history.push(
+                        "  mirror — Select dobjects, Enter to continue (Esc cancels)".into());
+                } else {
+                    self.mirror_state = MirrorState::WaitingForA;
+                    self.history.push(format!(
+                        "  mirror — {} dobject(s) selected. Click FIRST axis point",
+                        self.selection.len()));
+                }
+            }
+            Ok(Command::DeleteSelected) => {
+                if self.selection.is_empty() {
+                    self.history.push("  ! nothing selected — use `select` first or click a dobject".into());
+                } else {
+                    self.snapshot_doc();
+                    // Remove from highest index downward so earlier indices stay valid.
+                    let mut sorted = self.selection.clone();
+                    sorted.sort_unstable();
+                    sorted.dedup();
+                    let n = sorted.len();
+                    for &idx in sorted.iter().rev() {
+                        if idx < self.doc.dobjects.len() {
+                            self.doc.dobjects.remove(idx);
+                        }
+                    }
+                    self.selection_prev = self.selection.clone();
+                    self.selection.clear();
+                    self.selected = None;
+                    self.intersections.clear();
+                    self.index_dirty = true;
+                    self.gpu_dirty = true;
+                    self.history.push(format!("  - deleted {} dobject(s)", n));
+                }
+            }
+            Ok(Command::Undo) => self.do_undo(),
             Ok(Command::Move) => {
                 if self.selection.is_empty() {
                     // No basket yet — auto-enter a selection session that
@@ -623,18 +758,41 @@ impl CadApp {
         // (e.g. `move` opened the session; finalising it transitions
         // straight to base-point capture).
         let queued = std::mem::replace(&mut self.queued_op, QueuedOp::None);
+        if queued != QueuedOp::None && self.selection.is_empty() {
+            self.history.push(format!(
+                "  ! {:?}: nothing selected — operation cancelled", queued
+            ));
+            return;
+        }
         match queued {
             QueuedOp::None => {}
             QueuedOp::Move => {
-                if self.selection.is_empty() {
-                    self.history.push(
-                        "  ! move: nothing selected — operation cancelled".into());
-                } else {
-                    self.move_state = MoveState::WaitingForBase;
-                    self.history.push(format!(
-                        "  move — {} dobject(s). Click BASE point (Esc cancels)",
-                        self.selection.len()));
-                }
+                self.move_state = MoveState::WaitingForBase;
+                self.history.push(format!(
+                    "  move — {} dobject(s). Click BASE point (Esc cancels)",
+                    self.selection.len()));
+            }
+            QueuedOp::Copy => {
+                self.copy_state = CopyState::WaitingForBase;
+                self.history.push(format!(
+                    "  copy — {} dobject(s). Click BASE point",
+                    self.selection.len()));
+            }
+            QueuedOp::Rotate => {
+                self.rotate_state = RotateState::WaitingForPivot;
+                self.history.push(format!(
+                    "  rotate — {} dobject(s). Click PIVOT", self.selection.len()));
+            }
+            QueuedOp::Scale => {
+                self.scale_state = ScaleState::WaitingForPivot;
+                self.history.push(format!(
+                    "  scale — {} dobject(s). Click PIVOT", self.selection.len()));
+            }
+            QueuedOp::Mirror => {
+                self.mirror_state = MirrorState::WaitingForA;
+                self.history.push(format!(
+                    "  mirror — {} dobject(s). Click FIRST axis point",
+                    self.selection.len()));
             }
         }
         // self.selection persists so follow-up commands (move, list, …) can use it.
@@ -674,6 +832,7 @@ impl CadApp {
     /// `before` in the next selection session.
     fn apply_move(&mut self, v: Vec2) {
         if v.len() < EPS { return; }
+        self.snapshot_doc();
         for &i in &self.selection {
             if let Some(d) = self.doc.dobjects.get_mut(i) {
                 *d = d.translated(v);
@@ -1412,6 +1571,118 @@ impl CadApp {
             )),
             Err(e) => self.history.push(format!("  ! save '{}': {}", path, e)),
         }
+    }
+
+    // ===================================================================
+    // Slice J — Editing operations
+    // ===================================================================
+    //
+    // Each operation snapshots the Document before mutating so `undo` can
+    // roll back. The snapshot stack is bounded (UNDO_STACK_CAP) — oldest
+    // snapshots fall off when the stack is full.
+
+    fn snapshot_doc(&mut self) {
+        if self.undo_stack.len() >= UNDO_STACK_CAP {
+            self.undo_stack.remove(0);
+        }
+        self.undo_stack.push(self.doc.clone());
+    }
+
+    fn do_undo(&mut self) {
+        match self.undo_stack.pop() {
+            Some(prev) => {
+                self.doc = prev;
+                self.selection.clear();
+                self.selected = None;
+                self.intersections.clear();
+                self.index_dirty = true;
+                self.gpu_dirty = true;
+                self.history.push(format!(
+                    "  undo applied ({} snapshot(s) left)", self.undo_stack.len()
+                ));
+            }
+            None => self.history.push("  ! nothing to undo".into()),
+        }
+    }
+
+    /// Append translated copies of the current selection (`copy` op).
+    fn apply_copy(&mut self, v: Vec2) {
+        if v.x.abs() < EPS && v.y.abs() < EPS { return; }
+        self.snapshot_doc();
+        let copies: Vec<DObject> = self.selection.iter()
+            .filter_map(|&i| self.doc.dobjects.get(i))
+            .map(|d| {
+                let g = d.geom.translated(v);
+                let mut new = DObject::new(g);
+                new.style = d.style;
+                new
+            })
+            .collect();
+        let n = copies.len();
+        for c in copies { self.doc.push(c); }
+        self.selection_prev = self.selection.clone();
+        self.selection.clear();
+        self.history.push(format!("  + copy: {} dobject(s) duplicated", n));
+        self.intersections.clear();
+        self.index_dirty = true;
+        self.gpu_dirty = true;
+    }
+
+    /// Rotate the current selection in place by `angle` around `pivot`.
+    fn apply_rotate(&mut self, pivot: Vec2, angle: f64) {
+        if angle.abs() < EPS { return; }
+        self.snapshot_doc();
+        let n = self.selection.len();
+        for &i in &self.selection {
+            if let Some(d) = self.doc.dobjects.get_mut(i) {
+                d.geom = d.geom.rotated(pivot, angle);
+            }
+        }
+        self.history.push(format!(
+            "  ⟳ rotate: {} dobject(s) by {:.2}° around ({:.2}, {:.2})",
+            n, angle.to_degrees(), pivot.x, pivot.y
+        ));
+        self.intersections.clear();
+        self.index_dirty = true;
+        self.gpu_dirty = true;
+    }
+
+    /// Scale the current selection in place by `factor` around `pivot`.
+    fn apply_scale(&mut self, pivot: Vec2, factor: f64) {
+        if (factor - 1.0).abs() < EPS || factor.abs() < EPS { return; }
+        self.snapshot_doc();
+        let n = self.selection.len();
+        for &i in &self.selection {
+            if let Some(d) = self.doc.dobjects.get_mut(i) {
+                d.geom = d.geom.scaled(pivot, factor);
+            }
+        }
+        self.history.push(format!(
+            "  ⊕ scale: {} dobject(s) by {:.3}× around ({:.2}, {:.2})",
+            n, factor, pivot.x, pivot.y
+        ));
+        self.intersections.clear();
+        self.index_dirty = true;
+        self.gpu_dirty = true;
+    }
+
+    /// Mirror the current selection in place across the axis A→B.
+    fn apply_mirror(&mut self, a: Vec2, b: Vec2) {
+        if a.dist(b) < EPS { return; }
+        self.snapshot_doc();
+        let n = self.selection.len();
+        for &i in &self.selection {
+            if let Some(d) = self.doc.dobjects.get_mut(i) {
+                d.geom = d.geom.mirrored(a, b);
+            }
+        }
+        self.history.push(format!(
+            "  ⇄ mirror: {} dobject(s) across axis ({:.2},{:.2})–({:.2},{:.2})",
+            n, a.x, a.y, b.x, b.y
+        ));
+        self.intersections.clear();
+        self.index_dirty = true;
+        self.gpu_dirty = true;
     }
 
     fn add_dobject(&mut self, geom: Geom, origin: &str) {
@@ -2407,6 +2678,22 @@ impl eframe::App for CadApp {
                 self.move_state = MoveState::Off;
                 self.history.push("  move cancelled".into());
             }
+            if self.copy_state != CopyState::Off {
+                self.copy_state = CopyState::Off;
+                self.history.push("  copy cancelled".into());
+            }
+            if self.rotate_state != RotateState::Off {
+                self.rotate_state = RotateState::Off;
+                self.history.push("  rotate cancelled".into());
+            }
+            if self.scale_state != ScaleState::Off {
+                self.scale_state = ScaleState::Off;
+                self.history.push("  scale cancelled".into());
+            }
+            if self.mirror_state != MirrorState::Off {
+                self.mirror_state = MirrorState::Off;
+                self.history.push("  mirror cancelled".into());
+            }
         }
 
         // Enter (when the command line is empty) finalises an in-progress
@@ -3174,6 +3461,95 @@ impl eframe::App for CadApp {
                                     v.x, v.y, self.selection.len()));
                             }
                             MoveState::Off => unreachable!(),
+                        }
+                        self.refocus_cmd = true;
+                    } else if self.copy_state != CopyState::Off {
+                        match self.copy_state {
+                            CopyState::WaitingForBase => {
+                                self.copy_state = CopyState::WaitingForDest(click_world);
+                                self.history.push(format!(
+                                    "    copy: BASE = ({:.3}, {:.3}) — click DESTINATION",
+                                    click_world.x, click_world.y));
+                            }
+                            CopyState::WaitingForDest(base) => {
+                                let v = click_world - base;
+                                self.apply_copy(v);
+                                self.copy_state = CopyState::Off;
+                            }
+                            CopyState::Off => unreachable!(),
+                        }
+                        self.refocus_cmd = true;
+                    } else if self.rotate_state != RotateState::Off {
+                        match self.rotate_state {
+                            RotateState::WaitingForPivot => {
+                                self.rotate_state = RotateState::WaitingForRef(click_world);
+                                self.history.push(format!(
+                                    "    rotate: PIVOT = ({:.3}, {:.3}) — click REFERENCE direction",
+                                    click_world.x, click_world.y));
+                            }
+                            RotateState::WaitingForRef(pivot) => {
+                                self.rotate_state = RotateState::WaitingForTarget(pivot, click_world);
+                                self.history.push(
+                                    "    rotate: REFERENCE captured — click TARGET direction".into());
+                            }
+                            RotateState::WaitingForTarget(pivot, refpt) => {
+                                let a0 = (refpt - pivot).angle();
+                                let a1 = (click_world - pivot).angle();
+                                let dtheta = (a1 - a0).rem_euclid(std::f64::consts::TAU);
+                                // Take the shorter rotation (negative if past PI)
+                                let signed = if dtheta > std::f64::consts::PI {
+                                    dtheta - std::f64::consts::TAU
+                                } else { dtheta };
+                                self.apply_rotate(pivot, signed);
+                                self.rotate_state = RotateState::Off;
+                            }
+                            RotateState::Off => unreachable!(),
+                        }
+                        self.refocus_cmd = true;
+                    } else if self.scale_state != ScaleState::Off {
+                        match self.scale_state {
+                            ScaleState::WaitingForPivot => {
+                                self.scale_state = ScaleState::WaitingForRef(click_world);
+                                self.history.push(format!(
+                                    "    scale: PIVOT = ({:.3}, {:.3}) — click REFERENCE distance",
+                                    click_world.x, click_world.y));
+                            }
+                            ScaleState::WaitingForRef(pivot) => {
+                                let d = pivot.dist(click_world);
+                                if d < EPS {
+                                    self.history.push("  ! reference too close to pivot".into());
+                                    self.scale_state = ScaleState::Off;
+                                } else {
+                                    self.scale_state = ScaleState::WaitingForTarget(pivot, d);
+                                    self.history.push(format!(
+                                        "    scale: REFERENCE d = {:.3} — click TARGET distance", d));
+                                }
+                            }
+                            ScaleState::WaitingForTarget(pivot, ref_d) => {
+                                let target_d = pivot.dist(click_world);
+                                if target_d < EPS {
+                                    self.history.push("  ! target too close to pivot".into());
+                                } else {
+                                    self.apply_scale(pivot, target_d / ref_d);
+                                }
+                                self.scale_state = ScaleState::Off;
+                            }
+                            ScaleState::Off => unreachable!(),
+                        }
+                        self.refocus_cmd = true;
+                    } else if self.mirror_state != MirrorState::Off {
+                        match self.mirror_state {
+                            MirrorState::WaitingForA => {
+                                self.mirror_state = MirrorState::WaitingForB(click_world);
+                                self.history.push(format!(
+                                    "    mirror: A = ({:.3}, {:.3}) — click SECOND axis point",
+                                    click_world.x, click_world.y));
+                            }
+                            MirrorState::WaitingForB(a) => {
+                                self.apply_mirror(a, click_world);
+                                self.mirror_state = MirrorState::Off;
+                            }
+                            MirrorState::Off => unreachable!(),
                         }
                         self.refocus_cmd = true;
                     } else if self.select_mode != SelectMode::Off {

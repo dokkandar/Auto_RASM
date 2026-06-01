@@ -46,6 +46,7 @@ impl Linetype {
     pub fn is_continuous(&self) -> bool { self.pattern.is_empty() }
 }
 
+#[derive(Clone)]
 pub struct LinetypeTable {
     pub linetypes: Vec<Linetype>,
 }

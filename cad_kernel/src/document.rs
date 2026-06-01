@@ -11,6 +11,7 @@ use crate::layer::LayerTable;
 use crate::linetype::LinetypeTable;
 use crate::pen::PenTable;
 
+#[derive(Clone)]
 pub struct Document {
     pub dobjects:  Vec<DObject>,
     pub layers:    LayerTable,

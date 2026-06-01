@@ -20,6 +20,7 @@ pub struct Pen {
     pub lineweight: Lineweight,
 }
 
+#[derive(Clone)]
 pub struct PenTable {
     pub pens: Vec<Pen>,
 }

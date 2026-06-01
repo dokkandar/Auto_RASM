@@ -52,6 +52,24 @@ impl DObject {
             handle: self.handle,
         }
     }
+
+    /// Rotate around `pivot` by `angle` radians (CCW). Style + handle preserved.
+    pub fn rotated(&self, pivot: Vec2, angle: f64) -> DObject {
+        DObject { geom: self.geom.rotated(pivot, angle),
+                  style: self.style, handle: self.handle }
+    }
+
+    /// Scale uniformly by `factor` around `pivot`. Style + handle preserved.
+    pub fn scaled(&self, pivot: Vec2, factor: f64) -> DObject {
+        DObject { geom: self.geom.scaled(pivot, factor),
+                  style: self.style, handle: self.handle }
+    }
+
+    /// Mirror across the line through `a` and `b`. Style + handle preserved.
+    pub fn mirrored(&self, a: Vec2, b: Vec2) -> DObject {
+        DObject { geom: self.geom.mirrored(a, b),
+                  style: self.style, handle: self.handle }
+    }
 }
 
 // ---- ergonomic constructors ------------------------------------------------
