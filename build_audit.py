@@ -171,27 +171,28 @@ CATEGORIES = [
         ),
         "rows": [
             ["Move",            "● `move` cmd",        "done",     "Translate selection by (end - base)"],
-            ["Copy",            "Copy",                "planned",  "Slice J"],
-            ["Duplicate",       "Duplicate",           "planned",  "Slice J — degenerate copy"],
-            ["Rotate",          "Rotate",              "planned",  "Slice J"],
-            ["Scale",           "Scale",               "planned",  "Slice J"],
-            ["Mirror",          "Mirror",              "planned",  "Slice J"],
-            ["Stretch",         "Stretch",             "planned",  "Slice J — moves vertices inside a window"],
-            ["Offset (parallel)",  "Offset",           "planned",  "Slice J — geometric offset, per-Geom impl"],
+            ["Copy",            "● `copy` cmd",        "done",     "Slice J — like move but leaves originals; appends translated copies"],
+            ["Duplicate",       "≡ Copy with zero offset", "partial", "No dedicated cmd; achievable via copy with same start+end click"],
+            ["Rotate",          "● `rotate` cmd",      "done",     "Slice J — pivot + reference + target clicks; Geom::rotated handles ellipse major-axis correctly"],
+            ["Scale",           "● `scale` cmd",       "done",     "Slice J — uniform factor via pivot + reference + target distances"],
+            ["Mirror",          "● `mirror` cmd",      "done",     "Slice J — two clicks define the axis; preserves Arc CCW convention"],
+            ["Stretch",         "Stretch",             "missing",  "Moves vertices inside a window; not Slice J — its own slice"],
+            ["Offset (parallel)",  "Offset",           "missing",  "Geometric offset, per-Geom impl; not Slice J"],
             ["Align (3 variants)", "Align",            "missing",  "Not on roadmap; lower priority"],
-            ["Trim / Trim-by-amount", "Trim",          "planned",  "Slice J — likely a large slice on its own"],
-            ["Cut / Break",     "Break",               "planned",  "Slice J"],
-            ["Divide",          "Divide",              "planned",  "Slice J"],
-            ["Fillet (round)",  "Fillet",              "planned",  "Slice J"],
-            ["Chamfer (bevel)", "Chamfer",             "planned",  "Slice J"],
+            ["Trim / Trim-by-amount", "Trim",          "missing",  "Likely a large slice on its own; LibreCAD parity needs proper Geom-cut math"],
+            ["Cut / Break",     "Break",               "missing",  "Same — break a Geom at a point"],
+            ["Divide",          "Divide",              "missing",  "Equal-distance subdivision"],
+            ["Fillet (round)",  "Fillet",              "missing",  "Round corner at intersection"],
+            ["Chamfer (bevel)", "Chamfer",             "missing",  "Bevel corner at intersection"],
             ["Polyline segment ops (add / append / delete / change type / trim / offset)", "—", "missing", "8 LibreCAD ops — none yet"],
-            ["Delete",          "● `del N`",           "partial",  "Single-index delete via cmd line. Bulk delete on selection: missing"],
+            ["Delete",          "● `delete` / `erase` / `e` / `del N`", "done", "Slice J — bulk delete on current selection AND single-index delete via cmd line"],
             ["Explode (blocks → entities)", "Explode", "missing",  "Depends on Slice F"],
             ["Explode text",    "ExplodeText",         "missing",  "Depends on text + outline conversion"],
             ["Attributes (pen/layer edit)", "● Entity Info panel", "done", "Slice D — per-entity layer / color / linetype / lineweight editing"],
             ["Array (rect / polar)", "● Rect array",   "partial",  "Rect array works on a single source dobject; polar array missing"],
             ["Order (Z-order)", "Order",               "missing",  "Send-to-back / bring-to-front"],
-            ["Undo / Redo",     "—",                   "missing",  "No transaction system — biggest functional gap"],
+            ["Undo",            "● `undo` / `u` cmd",  "done",     "Slice J — 64-deep snapshot stack; every editing op snapshots first"],
+            ["Redo",            "Redo",                "missing",  "Undo only — no redo-from-undone stack yet; next small follow-up"],
         ],
     },
     {
@@ -271,7 +272,7 @@ CATEGORIES = [
             ["LFF (LibreCAD native)", "—",    "missing", "Not on roadmap"],
             ["JWW",       "—",                "missing", "Niche"],
             ["CXF",       "—",                "missing", "Niche"],
-            [".rsm (native binary)", "—",     "planned", "Slice I — AutoRASM-native; format shape TBD (serde/rkyv/custom)"],
+            [".rsm (native binary)", "● rsm::read / write", "done", "Slice I — RUST_CAD-native binary format for fast load/save"],
             ["File dialog (rfd / native)", "—", "missing", "Today: `open <path>` / `save <path>` via cmd line only"],
             ["3D formats (STEP / IGES)", "—", "deferred", "Out of scope until RUST_CAD goes 3D"],
         ],
@@ -353,6 +354,18 @@ STRENGTHS = [
      "current 7 entity types + LAYER + LTYPE tables. Foundation for serious "
      "interop is in."),
 
+    ("Editing loop has Undo from day one",
+     "Slice J wired Move / Copy / Rotate / Scale / Mirror / Delete simultaneously "
+     "with snapshot Undo (64-deep). Every editing op snapshots Document first — "
+     "users cannot accidentally destroy work irrecoverably. Geom::rotated, "
+     "scaled, mirrored cover all current Geom variants including the tricky "
+     "ellipse-major-axis case."),
+
+    ("Native binary format alongside DXF",
+     "Slice I added .rsm — a RUST_CAD-native binary format for fast load/save, "
+     "complementing the DXF interop path. Two-track persistence: round-trip "
+     "with the AutoCAD world via DXF, fast local saves via .rsm."),
+
     ("Reference documents are real contracts",
      "Variables.md (209 SYSVARS), Dobject_DXF.md (~310 group codes), "
      "Dobject_Properties.md (per-type fields). Three docs, plus ROADMAP.md, "
@@ -361,11 +374,11 @@ STRENGTHS = [
 ]
 
 RISKS = [
-    ("No undo / redo",
-     "Single biggest functional gap. Every other commercial / open CAD has "
-     "undo as table-stakes. Touches every edit op, every panel mutation, every "
-     "import. Plan: implement at the Document level (full snapshot diff or "
-     "operation log) before Slice J editing ops land — not after."),
+    ("No Redo (Undo only)",
+     "Slice J shipped a 64-deep snapshot undo stack — every editing op "
+     "snapshots Document first. But there's no redo: an undone state is "
+     "discarded as soon as the next edit happens. Small follow-up: keep a "
+     "parallel redo stack, clear it on any non-undo edit. Half-day of work."),
 
     ("No UI tests",
      "egui is hard to drive headlessly. CPU renderer ByLayer resolution, "
@@ -818,11 +831,10 @@ CAD or BIM tools belong in a different document.</p>
 <h1>Recommendations</h1>
 
 <div class="recommendation">
-<strong>1. Land Undo/Redo before any more editing ops (J).</strong>
-Doing copy/rotate/scale/mirror/trim with no undo is a CAD anti-pattern —
-users WILL ruin drawings. Plan: snapshot-based DocumentState log at first;
-move to operation-diff once it bottlenecks. This is a Slice of its own,
-sitting between H and J in the queue.
+<strong>1. Add Redo to complete the undo/redo loop.</strong>
+Slice J shipped Undo (snapshot stack, 64-deep). Redo is a parallel stack
+cleared on any non-undo edit — half-day of work. Users expect Ctrl-Z /
+Ctrl-Shift-Z; right now they get the first half only.
 </div>
 
 <div class="recommendation">
