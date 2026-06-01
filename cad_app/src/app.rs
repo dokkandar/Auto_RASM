@@ -2333,7 +2333,24 @@ impl CadApp {
             }
             Err(msg) => {
                 if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
+                // Surface the kernel error in BOTH history and the trim
+                // debug log — the user needs the actual reason to diagnose
+                // "trim silently fails" (the bug your 268-cutter log
+                // exposed: every retry returned Err but the log only said
+                // 'success=false', not which Err).
+                let kind = match self.doc.dobjects.get(target_idx).map(|d| &d.geom) {
+                    Some(Geom::Line(_))       => "Line",
+                    Some(Geom::Circle(_))     => "Circle",
+                    Some(Geom::Arc(_))        => "Arc",
+                    Some(Geom::Ellipse(_))    => "Ellipse",
+                    Some(Geom::EllipseArc(_)) => "EllipseArc",
+                    Some(Geom::Polyline(_))   => "Polyline",
+                    Some(Geom::Point(_))      => "Point",
+                    None                      => "<gone>",
+                };
                 self.history.push(format!("  ! trim #{}: {}", target_idx, msg));
+                self.trim_dbg(format!(
+                    "  ! trim_at Err on #{} ({}): {}", target_idx, kind, msg));
                 false
             }
         }
@@ -4414,11 +4431,26 @@ impl eframe::App for CadApp {
             // ends a drag — including a "click" that egui saw as a tiny drag.
             let click_now    = resp.clicked();
             let drag_stopped = resp.drag_stopped();
+            // egui classifies press-release as `clicked()` or `drag_stopped()`
+            // depending on motion + duration. Small, intended clicks
+            // sometimes fall into the drag_stopped bucket — your 268-cutter
+            // log showed `drag_stopped() drag_motion=0.0px` events that the
+            // handler was silently dropping. Promote drag_stopped events with
+            // small press-to-release distance to clicks.
+            let press_release_dist = match (
+                ctx.input(|i| i.pointer.press_origin()),
+                resp.interact_pointer_pos(),
+            ) {
+                (Some(p), Some(r)) => (r - p).length(),
+                _ => 0.0,
+            };
+            let drag_was_a_click = drag_stopped && press_release_dist < 5.0;
+            let click_fired = click_now || drag_was_a_click;
             if (click_now || drag_stopped) && self.trim_debug_open {
                 // Only log when the user has the diagnostic window open, to
                 // keep the log uncluttered.
                 let drag_motion = if drag_stopped {
-                    ctx.input(|i| i.pointer.delta()).length()
+                    press_release_dist
                 } else { 0.0 };
                 let gates = format!(
                     "tool={:?} pending={} move={:?} copy={:?} rotate={:?} \
@@ -4445,12 +4477,14 @@ impl eframe::App for CadApp {
                     self.select_mode, self.picking_source, self.intersect_pending_click,
                 );
                 self.trim_dbg(format!(
-                    "CLICK {} (drag_motion={:.1}px) | {}",
+                    "CLICK {} (press→release={:.1}px{}) | {}",
                     if click_now { "clicked()" } else { "drag_stopped()" },
-                    drag_motion, gates,
+                    drag_motion,
+                    if drag_was_a_click { ", promoted to click" } else { "" },
+                    gates,
                 ));
             }
-            if resp.clicked() {
+            if click_fired {
                 if let Some(pos) = resp.interact_pointer_pos() {
                     let world = self.s2w(pos, rect);
                     // Use the snap point if one is active — same convention
