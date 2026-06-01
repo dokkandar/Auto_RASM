@@ -9,6 +9,15 @@
 
 ## Where we are now (2026-06-01)
 
+**Slice I — .rsm binary format: ● DONE.** Hand-rolled little-endian
+versioned format in `cad_io::rsm`. Lossless `Document` round-trip
+including every Geom variant, every layer/linetype/pen field, and
+**stable handles** (DXF can't preserve our handles — RSM does). No
+external deps, no compression in v1 (~64 B per Line, well under 100 KB
+for 1000 lines). Wired into the same `open <path.rsm>` / `save
+<path.rsm>` commands as DXF — file dispatcher picks by extension. 6
+RSM round-trip tests.
+
 **Slice H — cad_io / DXF: ● DONE.** New `cad_io` crate with
 `dxf::read_dxf(&str) -> Document` and `dxf::write_dxf(&Document) -> String`.
 Round-trips all current `Geom` variants (Line / Circle / Arc / Ellipse /
@@ -115,7 +124,7 @@ is in place so it inherits layer/color/linetype/lineweight for free.
 | **F. Block table + Block panel** | ○ | `BlockTable` on `Document`; INSERT references; egui Blocks dock | Yes |
 | **G. UCS / Named Views / Library Browser / Command Line panel** | ○ | Lighter dependencies, can land in any order | Yes |
 | **H. `cad_io` (DXF reader / writer)** | ● Done | Round-trips LINE / CIRCLE / ARC / ELLIPSE / ELLIPSE_ARC / POINT / LWPOLYLINE; LAYER + LTYPE tables. `open` / `save` commands on cmd line. File dialog (rfd) is a small follow-up. | Yes — `open file.dxf` / `save file.dxf` |
-| **I. `.rsm` binary format (AutoRASM-native)** | ○ | Fast load/save for big drawings; our own format | Yes |
+| **I. `.rsm` binary format (AutoRASM-native)** | ● Done | Hand-rolled LE binary, versioned header, lossless. Handle preservation; no deps. | Yes — `open file.rsm` / `save file.rsm` |
 | **J. Editing operations** | ○ | copy / rotate / scale / mirror / delete / undo. Each consumes selection via QueuedOp pattern | Yes |
 
 ### Operating principles

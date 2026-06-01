@@ -1355,18 +1355,23 @@ impl CadApp {
     // ===================================================================
 
     fn do_open(&mut self, path: &str) {
-        let text = match std::fs::read_to_string(path) {
-            Ok(t) => t,
-            Err(e) => {
-                self.history.push(format!("  ! open '{}' failed: {}", path, e));
-                return;
-            }
-        };
         let lower = path.to_ascii_lowercase();
         let doc_result = if lower.ends_with(".dxf") {
-            cad_io::dxf::read_dxf(&text)
+            match std::fs::read_to_string(path) {
+                Ok(text) => cad_io::dxf::read_dxf(&text),
+                Err(e) => {
+                    self.history.push(format!("  ! open '{}' failed: {}", path, e));
+                    return;
+                }
+            }
         } else if lower.ends_with(".rsm") {
-            cad_io::rsm::read_rsm(text.as_bytes())
+            match std::fs::read(path) {
+                Ok(bytes) => cad_io::rsm::read_rsm(&bytes),
+                Err(e) => {
+                    self.history.push(format!("  ! open '{}' failed: {}", path, e));
+                    return;
+                }
+            }
         } else {
             Err(format!("unknown extension on '{}': expected .dxf or .rsm", path))
         };
