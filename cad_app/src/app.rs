@@ -879,14 +879,14 @@ impl CadApp {
                 self.trim_state = TrimState::SelectingCutters;
                 self.begin_selection(SelectMode::ForCuttingEdges);
                 self.history.push(
-                    "  trim — Select CUTTING edges. Click a dobject to add. Click empty space then opposite corner = window (L→R inside, R→L crossing). Shift-click removes. Type `all`/`before`/`none`/`window`. Enter to confirm, Esc to cancel.".into());
+                    "  trim — Select CUTTING edges (or press Enter NOW to use ALL dobjects as cutters). Click to add, shift-click to remove. Type w=window, c=crossing, a=all, b=before, l=last, n=none. Enter to confirm, Esc to cancel.".into());
             }
             Ok(Command::Extend) => {
                 self.pre_op_selection = std::mem::take(&mut self.selection);
                 self.extend_state = ExtendState::SelectingBoundaries;
                 self.begin_selection(SelectMode::ForBoundaryEdges);
                 self.history.push(
-                    "  extend — Select BOUNDARY edges. Click a dobject to add. Click empty space then opposite corner = window (L→R inside, R→L crossing). Shift-click removes. Type `all`/`before`/`none`/`window`. Enter to confirm, Esc to cancel.".into());
+                    "  extend — Select BOUNDARY edges (or press Enter NOW to use ALL dobjects as boundaries). Click to add, shift-click to remove. Type w=window, c=crossing, a=all, b=before, l=last, n=none. Enter to confirm, Esc to cancel.".into());
             }
             Ok(Command::Move) => {
                 if self.selection.is_empty() {
@@ -973,36 +973,49 @@ impl CadApp {
                     self.selection.len()));
             }
             SelectMode::ForCuttingEdges => {
-                let cutters = std::mem::take(&mut self.selection);
+                let mut cutters = std::mem::take(&mut self.selection);
                 // Restore the user's main selection — trim must not nuke it.
                 self.selection = std::mem::take(&mut self.pre_op_selection);
                 self.select_mode        = SelectMode::Off;
                 self.window_first       = None;
                 self.select_remove_mode = false;
+                // Empty cutter basket = use ALL dobjects as cutters
+                // (AutoCAD default; see memo
+                // `feedback_rust_cad_trim_default_all_cutters`).
                 if cutters.is_empty() {
-                    self.history.push("  ! trim: no cutting edges selected — cancelled".into());
+                    cutters = (0..self.doc.dobjects.len()).collect();
+                    self.history.push(format!(
+                        "  trim — no cutters picked; using ALL {} dobjects as cutters", cutters.len()));
+                }
+                if cutters.is_empty() {
+                    self.history.push("  ! trim: document is empty — cancelled".into());
                     self.trim_state = TrimState::Off;
                     return;
                 }
                 self.history.push(format!(
-                    "  trim — {} cutter(s) captured. Click each TARGET to cut (Enter / Esc to finish)",
+                    "  trim — {} cutter(s) ready (warm orange). Click each TARGET to cut. Enter / Esc to finish.",
                     cutters.len()));
                 self.trim_state = TrimState::PickingTargets(cutters);
                 return;
             }
             SelectMode::ForBoundaryEdges => {
-                let bounds = std::mem::take(&mut self.selection);
+                let mut bounds = std::mem::take(&mut self.selection);
                 self.selection = std::mem::take(&mut self.pre_op_selection);
                 self.select_mode        = SelectMode::Off;
                 self.window_first       = None;
                 self.select_remove_mode = false;
                 if bounds.is_empty() {
-                    self.history.push("  ! extend: no boundary edges selected — cancelled".into());
+                    bounds = (0..self.doc.dobjects.len()).collect();
+                    self.history.push(format!(
+                        "  extend — no boundaries picked; using ALL {} dobjects as boundaries", bounds.len()));
+                }
+                if bounds.is_empty() {
+                    self.history.push("  ! extend: document is empty — cancelled".into());
                     self.extend_state = ExtendState::Off;
                     return;
                 }
                 self.history.push(format!(
-                    "  extend — {} boundary edge(s) captured. Click each TARGET END to extend (Enter / Esc to finish)",
+                    "  extend — {} boundary edge(s) ready (warm amber). Click each TARGET END to extend. Enter / Esc to finish.",
                     bounds.len()));
                 self.extend_state = ExtendState::PickingTargets(bounds);
                 return;
@@ -4589,6 +4602,21 @@ impl eframe::App for CadApp {
             // when the snap point lands far away on the dobject's extension.
             let snap_source: Option<usize> = snap_hit.and_then(|h| h.dobject);
 
+            // ---- Cutter / boundary highlighting during trim / extend
+            // target-pick phase. Cutters render in warm orange so the user
+            // sees what's actually intersecting. See memo
+            // `feedback_rust_cad_trim_default_all_cutters`.
+            let trim_cutters: Option<&Vec<usize>> = match &self.trim_state {
+                TrimState::PickingTargets(c) => Some(c),
+                _ => None,
+            };
+            let extend_bounds: Option<&Vec<usize>> = match &self.extend_state {
+                ExtendState::PickingTargets(b) => Some(b),
+                _ => None,
+            };
+            let cutter_color   = egui::Color32::from_rgb(255, 170,  60); // warm orange
+            let boundary_color = egui::Color32::from_rgb(255, 220,  90); // warm amber
+
             let mut drawn   = 0usize;
             let mut skipped = 0usize;
             let mut gpu_circles_count = 0usize;
@@ -4616,6 +4644,17 @@ impl eframe::App for CadApp {
                             && !in_selection
                         {
                             skipped += 1;
+                            continue;
+                        }
+                        // Trim/extend visualization: cutters render warm-orange,
+                        // boundaries warm-amber. Solid thick lines (NOT dashed)
+                        // so they're distinguishable from basket dashed-gray.
+                        let is_cutter   = trim_cutters.map_or(false, |c| c.contains(&i));
+                        let is_boundary = extend_bounds.map_or(false, |b| b.contains(&i));
+                        if is_cutter || is_boundary {
+                            let col = if is_cutter { cutter_color } else { boundary_color };
+                            draw_dobject(&painter, rect, self, &e.geom, col);
+                            drawn += 1;
                             continue;
                         }
                         // Basket members render as DASHED GRAY (the pointer-
