@@ -140,7 +140,7 @@ tr:hover td { background: rgba(255, 255, 255, 0.025); }
 <section class="cover">
 <h1>RUST_CAD — Engineering Discussion Pack</h1>
 <div class="meta">
-Generated <strong>2026-06-01 12:50</strong> &nbsp;•&nbsp;
+Generated <strong>2026-06-01 13:23</strong> &nbsp;•&nbsp;
 Workspace: <code>~/workspace/RUST_CAD/</code> &nbsp;•&nbsp;
 Branch: <code>main</code> &nbsp;•&nbsp;
 Current slice: <strong>A — Property foundation (done)</strong>
@@ -249,6 +249,11 @@ and <strong>(6)</strong> every open question / decision pending.
 <blockquote><p>Living document. Update at the start of every new slice. The three reference docs (<code>Variables.md</code>, <code>Dobject_DXF.md</code>, <code>Dobject_Properties.md</code>) are the <em>contracts</em>; this file tracks <strong>what we&#x27;re working on, why, and how we plan to get there</strong>.</p></blockquote>
 <hr/>
 <h2 id="roadmap-where-we-are-now-2026-06-01">Where we are now (2026-06-01)<a class="anchor" href="#roadmap-where-we-are-now-2026-06-01">¶</a></h2>
+<p><strong>Slice E (Point + Polyline only): <span class="status-ok">●</span> DONE.</strong> <code>Geom</code> enum gains two new variants — <code>Point { location, style, size }</code> (AutoCAD POINT) and <code>Polyline { vertices: Vec&lt;PolyVertex&gt;, closed }</code> (LWPOLYLINE; bulge field on PolyVertex accepted but renderer treats every segment as straight today). Drafting tools wired to the toolbar (<code>point</code>, <code>pline</code>); polyline draws on click and finishes on Enter (<code>c</code> Enter closes). <code>From&lt;Point&gt;</code> / <code>From&lt;Polyline&gt;</code> impls keep ergonomic construction. All snap kinds extended (END snaps polyline vertices, MID snaps every segment midpoint, NEA/PER project onto each segment, Point acts as its own END snap). 70 tests still passing.</p>
+<p>Text / MText / DimRotated are deliberately deferred — they need new tables (TextStyleTable, DimStyleTable) which are slices of their own.</p>
+<p><strong>Slice D — Entity Info panel: <span class="status-ok">●</span> DONE.</strong> Egui dock with two modes: single-Dobject (full geometry breakdown + editable Layer / Visibility / Color / Linetype / LinetypeScale / Lineweight) and multi-selection (Geom-type counts + bulk layer reassign, bulk show/hide, bulk &quot;ByLayer reset&quot;). Combos for Layer/Linetype/Lineweight are populated live from <code>Document.layers</code> / <code>linetypes</code> so editing one is reflected everywhere.</p>
+<p><strong>Slice C — Pen palette: <span class="status-ok">●</span> DONE.</strong> Egui dock to the left of the Layer panel; toggle from the toolbar (&quot;pens ▾/▸&quot;). 7 default presets in <code>Document.pens</code> (a new <code>PenTable</code> in cad_kernel) — ByLayer, Red/Green/Blue 0.25 mm, Heavy black 0.7 mm, Dashed gray, Dash-dot center. Each row shows a color swatch + name + linetype/lineweight description, with an &quot;apply&quot; button that rewrites <code>style.color / linetype / lineweight</code> on every Dobject in the current selection.</p>
+<p><strong>Slice B — Layer panel: <span class="status-ok">●</span> DONE.</strong> Egui dock at left side; toggle from toolbar (&quot;layers ▾/▸&quot;). Per-layer visibility / freeze / lock, color swatch (egui color picker), double-click name to rename, active-layer radio. Toolbar buttons: ➕ add (auto-named <code>Layer1</code>, <code>Layer2</code>, …) and 🗑 delete (active layer; Dobjects on it reassigned to layer &quot;0&quot;; layer &quot;0&quot; is reserved and cannot be deleted). Demo layers &quot;WALLS&quot; (red) and &quot;HIDDEN&quot; (green, invisible) created at startup so the panel is non-empty.</p>
 <p><strong>Slice A — Property foundation: <span class="status-ok">●</span> DONE.</strong></p>
 <p>Workspace builds clean, 70 tests pass.</p>
 <div class="tbl-wrap"><table>
@@ -331,27 +336,27 @@ and <strong>(6)</strong> every open question / decision pending.
 </tr>
 <tr>
 <td><strong>B. Layer panel</strong> (UI)</td>
-<td><span class="status-planned">○</span> Next</td>
+<td><span class="status-ok">●</span> Done</td>
 <td>Egui dock — list/add/rename/delete/freeze/lock/visibility/active</td>
 <td>Yes — first new panel</td>
 </tr>
 <tr>
 <td><strong>C. Pen palette</strong> (UI)</td>
-<td><span class="status-planned">○</span></td>
+<td><span class="status-ok">●</span> Done</td>
 <td>Egui dock — pen presets (color + linetype + lineweight bundles), &quot;Apply to selection&quot;</td>
 <td>Yes</td>
 </tr>
 <tr>
 <td><strong>D. Entity Info panel</strong> (UI)</td>
-<td><span class="status-planned">○</span></td>
+<td><span class="status-ok">●</span> Done</td>
 <td>Read-only / partially-editable property inspector for current selection</td>
 <td>Yes</td>
 </tr>
 <tr>
 <td><strong>E. New Dobject types</strong></td>
-<td><span class="status-planned">○</span></td>
-<td><code>DobjectPoint</code> → <code>Polyline</code> → <code>Text</code> → <code>MText</code> → <code>DimRotated</code>. Each gets the full property model for free.</td>
-<td>Yes — many new shapes</td>
+<td><span class="status-partial">◐</span> Partial</td>
+<td><code>DobjectPoint</code> <span class="status-ok">●</span> + <code>DobjectPolyline</code> <span class="status-ok">●</span> done. <code>Text</code> / <code>MText</code> / <code>DimRotated</code> deferred — they need <code>TextStyleTable</code> / <code>DimStyleTable</code> first (each is its own slice).</td>
+<td>Yes — two new shapes</td>
 </tr>
 <tr>
 <td><strong>F. Block table + Block panel</strong></td>
@@ -5088,7 +5093,7 @@ and <strong>(6)</strong> every open question / decision pending.
 <hr/>
 <h1 id="properties-planned-types-not-in-code-yet">Planned types (not in code yet)<a class="anchor" href="#properties-planned-types-not-in-code-yet">¶</a></h1>
 <p>Suggested Rust struct names and field shapes. All status <code><span class="status-planned">○</span></code>. Listed roughly in order of likely implementation priority.</p>
-<h2 id="properties-dobjectpoint-point-struct-planned">DobjectPoint — <code>Point</code> struct (planned)<a class="anchor" href="#properties-dobjectpoint-point-struct-planned">¶</a></h2>
+<h2 id="properties-dobjectpoint-point-struct-modeled">DobjectPoint — <code>Point</code> struct (<span class="status-ok">●</span> modeled)<a class="anchor" href="#properties-dobjectpoint-point-struct-modeled">¶</a></h2>
 <p>AutoCAD <code>POINT</code> entity — a single marker point.</p>
 <div class="tbl-wrap"><table>
 <thead><tr>
@@ -5116,7 +5121,7 @@ and <strong>(6)</strong> every open question / decision pending.
 <td>PDSIZE in AutoCAD</td>
 </tr>
 </tbody></table></div>
-<h2 id="properties-dobjectpolyline-polyline-struct-planned-lwpolyline">DobjectPolyline — <code>Polyline</code> struct (planned, LWPOLYLINE)<a class="anchor" href="#properties-dobjectpolyline-polyline-struct-planned-lwpolyline">¶</a></h2>
+<h2 id="properties-dobjectpolyline-polyline-struct-modeled-straight-segments-only-bulges-accepted-b">DobjectPolyline — <code>Polyline</code> struct (<span class="status-ok">●</span> modeled — straight segments only, bulges accepted but not yet rendered)<a class="anchor" href="#properties-dobjectpolyline-polyline-struct-modeled-straight-segments-only-bulges-accepted-b">¶</a></h2>
 <p>2D lightweight polyline.</p>
 <div class="tbl-wrap"><table>
 <thead><tr>
