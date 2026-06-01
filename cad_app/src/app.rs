@@ -267,6 +267,16 @@ pub struct CadApp {
     /// `self.selection` as its working basket without nuking the user's
     /// real selection. Restored on finalise/cancel.
     pre_op_selection: Vec<usize>,
+
+    // ---- Trim debug log (instrumentation for diagnosis) ----
+    /// Detailed click-by-click log of the active trim/extend session.
+    /// Auto-cleared at each `trim`/`extend` command start. User opens
+    /// the Trim Debug window, copies the log, pastes to repro reports.
+    trim_debug_log:  Vec<String>,
+    trim_debug_open: bool,
+    /// Frame counter for log timestamping — gives ordering even when
+    /// multiple clicks happen close in wall-clock time.
+    trim_debug_frame: u64,
 }
 
 const UNDO_STACK_CAP: usize = 64;
@@ -476,6 +486,9 @@ impl Default for CadApp {
             trim_state:     TrimState::Off,
             extend_state:   ExtendState::Off,
             pre_op_selection: Vec::new(),
+            trim_debug_log:  Vec::new(),
+            trim_debug_open: false,
+            trim_debug_frame: 0,
         };
         // Demo layers so the Layer panel has visible content at first launch.
         let walls = s.doc.layers.add(Layer {
@@ -873,9 +886,8 @@ impl CadApp {
                     "  stretch — Click FIRST corner of crossing window (Esc cancels)".into());
             }
             Ok(Command::Trim) => {
-                // Stash main selection so the cutting-edge select session
-                // can use `self.selection` as its scratch basket.
                 self.pre_op_selection = std::mem::take(&mut self.selection);
+                self.trim_dbg_session_start("TRIM");
                 self.trim_state = TrimState::SelectingCutters;
                 self.begin_selection(SelectMode::ForCuttingEdges);
                 self.history.push(
@@ -883,6 +895,7 @@ impl CadApp {
             }
             Ok(Command::Extend) => {
                 self.pre_op_selection = std::mem::take(&mut self.selection);
+                self.trim_dbg_session_start("EXTEND");
                 self.extend_state = ExtendState::SelectingBoundaries;
                 self.begin_selection(SelectMode::ForBoundaryEdges);
                 self.history.push(
@@ -989,9 +1002,12 @@ impl CadApp {
                 }
                 if cutters.is_empty() {
                     self.history.push("  ! trim: document is empty — cancelled".into());
+                    self.trim_dbg("CUTTERS captured = []  (empty doc → session cancelled)");
                     self.trim_state = TrimState::Off;
                     return;
                 }
+                self.trim_dbg(format!(
+                    "CUTTERS captured = {} indices: {:?}", cutters.len(), cutters));
                 self.history.push(format!(
                     "  trim — {} cutter(s) ready (warm orange). Click each TARGET to cut. Enter / Esc to finish.",
                     cutters.len()));
@@ -1011,9 +1027,12 @@ impl CadApp {
                 }
                 if bounds.is_empty() {
                     self.history.push("  ! extend: document is empty — cancelled".into());
+                    self.trim_dbg("BOUNDARIES captured = []  (empty doc → session cancelled)");
                     self.extend_state = ExtendState::Off;
                     return;
                 }
+                self.trim_dbg(format!(
+                    "BOUNDARIES captured = {} indices: {:?}", bounds.len(), bounds));
                 self.history.push(format!(
                     "  extend — {} boundary edge(s) ready (warm amber). Click each TARGET END to extend. Enter / Esc to finish.",
                     bounds.len()));
@@ -1197,6 +1216,59 @@ impl CadApp {
     // Egui-port of LibreCAD's `qg_layerwidget`. Operates directly on
     // `self.doc.layers` (the `LayerTable` from cad_kernel). Active layer
     // = the one new Dobjects get assigned to on `Document::push`.
+
+    /// Trim Debug floating window — instrumented log of every trim /
+    /// extend state transition + canvas click. User pastes the log back
+    /// when reporting a bug.
+    fn render_trim_debug_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.trim_debug_open;
+        egui::Window::new("Trim Debug Log")
+            .open(&mut open)
+            .default_width(640.0)
+            .default_height(400.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("📋 Copy Log").on_hover_text("Copy the whole log to the clipboard").clicked() {
+                        let text = self.trim_debug_log.join("\n");
+                        ui.ctx().copy_text(text);
+                        self.history.push("  trim debug log → clipboard".into());
+                    }
+                    if ui.button("🗑 Clear").clicked() {
+                        self.trim_debug_log.clear();
+                    }
+                    ui.label(format!("{} entries", self.trim_debug_log.len()));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let trim_active = matches!(self.trim_state, TrimState::PickingTargets(_));
+                        let extend_active = matches!(self.extend_state, ExtendState::PickingTargets(_));
+                        if trim_active {
+                            ui.colored_label(egui::Color32::from_rgb(255, 170, 60),
+                                "● TRIM target-pick active");
+                        } else if extend_active {
+                            ui.colored_label(egui::Color32::from_rgb(255, 220, 90),
+                                "● EXTEND target-pick active");
+                        } else {
+                            ui.colored_label(egui::Color32::from_rgb(140, 140, 150),
+                                "○ no session running");
+                        }
+                    });
+                });
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        if self.trim_debug_log.is_empty() {
+                            ui.colored_label(egui::Color32::from_rgb(140, 140, 150),
+                                "(empty — run `trim` or `extend` to start logging)");
+                        }
+                        for line in &self.trim_debug_log {
+                            ui.monospace(line);
+                        }
+                    });
+            });
+        self.trim_debug_open = open;
+    }
 
     fn render_layer_panel(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("layers")
@@ -2149,6 +2221,38 @@ impl CadApp {
         self.intersections.clear();
         self.index_dirty = true;
         self.gpu_dirty = true;
+    }
+
+    // ---- Trim debug instrumentation ----
+
+    /// Append one line to the trim debug log. Bounded so a runaway
+    /// session can't blow memory; oldest entries drop first.
+    fn trim_dbg<S: Into<String>>(&mut self, msg: S) {
+        const CAP: usize = 1000;
+        if self.trim_debug_log.len() >= CAP {
+            self.trim_debug_log.drain(..200);
+        }
+        self.trim_debug_log.push(format!(
+            "[{:>5}] {}", self.trim_debug_frame, msg.into()
+        ));
+    }
+
+    /// Wipe + open the debug log at the start of a fresh trim/extend
+    /// session. Called from the command handlers.
+    fn trim_dbg_session_start(&mut self, op: &str) {
+        self.trim_debug_log.clear();
+        self.trim_debug_open = true;
+        self.trim_dbg(format!("=== {} session START ===", op));
+        self.trim_dbg(format!(
+            "  pre_op_selection = {:?}", self.pre_op_selection));
+        self.trim_dbg(format!(
+            "  doc.dobjects.len() = {}  EdgMod = {}",
+            self.doc.dobjects.len(), self.env.EdgMod));
+    }
+
+    /// Format a Vec2 compactly for log entries.
+    fn fmt_v(v: Vec2) -> String {
+        format!("({:.3},{:.3})", v.x, v.y)
     }
 
     // ---- Slice M.1 / M.2: trim / extend apply methods ----
@@ -3394,6 +3498,7 @@ impl eframe::App for CadApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // ensure continuous repaint, never frozen
         ctx.request_repaint();
+        self.trim_debug_frame = self.trim_debug_frame.wrapping_add(1);
 
         // FPS — exponential moving average so the number doesn't jitter
         let dt = ctx.input(|i| i.stable_dt);
@@ -3466,10 +3571,12 @@ impl eframe::App for CadApp {
             let trim_running = !matches!(self.trim_state, TrimState::Off);
             let extend_running = !matches!(self.extend_state, ExtendState::Off);
             if trim_running {
+                self.trim_dbg("=== TRIM session END (Esc cancel) ===");
                 self.trim_state = TrimState::Off;
                 self.history.push("  trim cancelled".into());
             }
             if extend_running {
+                self.trim_dbg("=== EXTEND session END (Esc cancel) ===");
                 self.extend_state = ExtendState::Off;
                 self.history.push("  extend cancelled".into());
             }
@@ -3499,9 +3606,11 @@ impl eframe::App for CadApp {
                 // the target-pick phase.
                 self.finalise_selection();
             } else if matches!(self.trim_state, TrimState::PickingTargets(_)) {
+                self.trim_dbg("=== TRIM session END (Enter) ===");
                 self.trim_state = TrimState::Off;
                 self.history.push("  trim — session ended (Enter)".into());
             } else if matches!(self.extend_state, ExtendState::PickingTargets(_)) {
+                self.trim_dbg("=== EXTEND session END (Enter) ===");
                 self.extend_state = ExtendState::Off;
                 self.history.push("  extend — session ended (Enter)".into());
             } else if self.tool == Tool::Polyline && self.pending.len() >= 2 {
@@ -3635,6 +3744,14 @@ impl eframe::App for CadApp {
                     .clicked()
                 {
                     self.info_panel_open = !self.info_panel_open;
+                }
+                // Trim Debug window toggle
+                let tdbg_label = if self.trim_debug_open { "trim dbg ▾" } else { "trim dbg ▸" };
+                if ui.button(tdbg_label)
+                    .on_hover_text("Trim Debug — log every click + state transition; Copy Log button writes to clipboard")
+                    .clicked()
+                {
+                    self.trim_debug_open = !self.trim_debug_open;
                 }
                 ui.add_space(20.0);
                 ui.label("intersect:");
@@ -4027,6 +4144,11 @@ impl eframe::App for CadApp {
             self.render_info_panel(ctx);
         }
 
+        // ---- floating: Trim Debug log (instrumentation) ----------------
+        if self.trim_debug_open {
+            self.render_trim_debug_window(ctx);
+        }
+
         // ---- right panel: dobjects + intersection list ------------------
         egui::SidePanel::right("dobjects").min_width(280.0).show(ctx, |ui| {
             ui.heading(format!("DObjects ({})", self.doc.dobjects.len()));
@@ -4340,28 +4462,45 @@ impl eframe::App for CadApp {
                         }
                         self.refocus_cmd = true;
                     } else if matches!(self.trim_state, TrimState::PickingTargets(_)) {
-                        // Single-pick mode for trim. (Wand-drag mode is v2;
-                        // each click trims one dobject.)
                         let cutters = if let TrimState::PickingTargets(c) = &self.trim_state {
                             c.clone()
                         } else { Vec::new() };
                         let tol_world = 10.0 / self.scale as f64;
-                        if let Some(tgt) = self.nearest_entity_under(world, tol_world) {
+                        let hit = self.nearest_entity_under(world, tol_world);
+                        self.trim_dbg(format!(
+                            "TRIM target click  world={}  screen={}  hit={}  cutters={:?}",
+                            Self::fmt_v(click_world),
+                            format!("({:.1},{:.1})", pos.x, pos.y),
+                            match hit {
+                                Some(i) => format!("#{}", i),
+                                None    => "VOID (no dobject under cursor)".into(),
+                            },
+                            cutters,
+                        ));
+                        if let Some(tgt) = hit {
+                            let n_before = self.doc.dobjects.len();
                             self.apply_trim_pick(&cutters, tgt, click_world);
-                            // The trim removed the target — patch the cutter
-                            // list so indices above `tgt` shift down and the
-                            // appended pieces are excluded.
-                            if let TrimState::PickingTargets(c) = &mut self.trim_state {
-                                let original_len = self.doc.dobjects.len();
+                            let n_after = self.doc.dobjects.len();
+                            // Trim might have failed (no intersection / etc.);
+                            // detect via doc-size delta: success removes 1 and
+                            // appends N>=0 pieces → net change is N-1.
+                            let net = n_after as i64 - n_before as i64;
+                            self.trim_dbg(format!(
+                                "  → apply_trim_pick result: dobjects {}→{}  (net {:+})",
+                                n_before, n_after, net));
+                            let patched: Vec<usize> = if let TrimState::PickingTargets(c) = &mut self.trim_state {
                                 c.retain(|&i| i != tgt);
                                 for c_i in c.iter_mut() {
                                     if *c_i > tgt { *c_i -= 1; }
                                 }
-                                let _ = original_len;
-                            }
+                                c.clone()
+                            } else { Vec::new() };
+                            self.trim_dbg(format!(
+                                "  → cutters patched = {:?}", patched));
                         } else {
+                            // Void click — log + do nothing. Session continues.
                             self.history.push(
-                                "  trim — no dobject under cursor (Enter / Esc to finish)".into());
+                                "  trim — void click (no dobject) — session continues, click another target or press Enter".into());
                         }
                         self.refocus_cmd = true;
                     } else if matches!(self.extend_state, ExtendState::PickingTargets(_)) {
@@ -4369,11 +4508,21 @@ impl eframe::App for CadApp {
                             b.clone()
                         } else { Vec::new() };
                         let tol_world = 10.0 / self.scale as f64;
-                        if let Some(tgt) = self.nearest_entity_under(world, tol_world) {
+                        let hit = self.nearest_entity_under(world, tol_world);
+                        self.trim_dbg(format!(
+                            "EXTEND target click  world={}  hit={}  bounds={:?}",
+                            Self::fmt_v(click_world),
+                            match hit {
+                                Some(i) => format!("#{}", i),
+                                None    => "VOID".into(),
+                            },
+                            bounds,
+                        ));
+                        if let Some(tgt) = hit {
                             self.apply_extend_pick(&bounds, tgt, click_world);
                         } else {
                             self.history.push(
-                                "  extend — no dobject under cursor (Enter / Esc to finish)".into());
+                                "  extend — void click — session continues, click another target or press Enter".into());
                         }
                         self.refocus_cmd = true;
                     } else if self.offset_state != OffsetState::Off {
