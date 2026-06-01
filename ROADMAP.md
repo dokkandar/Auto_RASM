@@ -9,6 +9,15 @@
 
 ## Where we are now (2026-06-01)
 
+**Slice B — Layer panel: ● DONE.** Egui dock at left side; toggle from
+toolbar ("layers ▾/▸"). Per-layer visibility / freeze / lock, color
+swatch (egui color picker), double-click name to rename, active-layer
+radio. Toolbar buttons: ➕ add (auto-named `Layer1`, `Layer2`, …) and
+🗑 delete (active layer; Dobjects on it reassigned to layer "0"; layer
+"0" is reserved and cannot be deleted). Demo layers "WALLS" (red) and
+"HIDDEN" (green, invisible) created at startup so the panel is
+non-empty.
+
 **Slice A — Property foundation: ● DONE.**
 
 Workspace builds clean, 70 tests pass.
@@ -61,7 +70,7 @@ is in place so it inherits layer/color/linetype/lineweight for free.
 | Slice | Status | Scope | First visible-to-user moment |
 |-------|--------|-------|------------------------------|
 | **A. Property foundation** (kernel) | ● Done | Layer/Linetype/Color/Lineweight types, Style struct, DObject wrapper, Document container, renderer resolves ByLayer | (internals — visible to next slice) |
-| **B. Layer panel** (UI) | ○ Next | Egui dock — list/add/rename/delete/freeze/lock/visibility/active | Yes — first new panel |
+| **B. Layer panel** (UI) | ● Done | Egui dock — list/add/rename/delete/freeze/lock/visibility/active | Yes — first new panel |
 | **C. Pen palette** (UI) | ○ | Egui dock — pen presets (color + linetype + lineweight bundles), "Apply to selection" | Yes |
 | **D. Entity Info panel** (UI) | ○ | Read-only / partially-editable property inspector for current selection | Yes |
 | **E. New Dobject types** | ○ | `DobjectPoint` → `Polyline` → `Text` → `MText` → `DimRotated`. Each gets the full property model for free. | Yes — many new shapes |

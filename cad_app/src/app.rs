@@ -205,6 +205,17 @@ pub struct CadApp {
     debug_open:   bool,
     gpu_renderer: StdArc<Mutex<GpuCircleRenderer>>,
     gpu_dirty:    bool,
+
+    // ---- Layer panel (Slice B) ----
+    /// Is the layer dock open? Toggled from the top toolbar.
+    layer_panel_open: bool,
+    /// LayerId currently being renamed in the panel (click name to enter
+    /// rename mode); None = no rename in progress.
+    layer_rename: Option<LayerId>,
+    /// Scratch buffer for the in-progress rename text.
+    layer_rename_buf: String,
+    /// Counter for default layer names ("Layer1", "Layer2", …).
+    layer_name_counter: u32,
 }
 
 /// Active selection-gathering session. `ForList` dumps the chosen dobjects
@@ -294,7 +305,23 @@ impl Default for CadApp {
             debug_open:   true,
             gpu_renderer: StdArc::new(Mutex::new(GpuCircleRenderer::default())),
             gpu_dirty:    true,
+            layer_panel_open:   true,
+            layer_rename:       None,
+            layer_rename_buf:   String::new(),
+            layer_name_counter: 0,
         };
+        // Demo layers so the Layer panel has visible content at first launch.
+        let walls = s.doc.layers.add(Layer {
+            name: "WALLS".into(), color: Color::rgb(255, 90, 90),
+            ..Layer::layer_zero()
+        });
+        let _hidden = s.doc.layers.add(Layer {
+            name: "HIDDEN".into(), color: Color::rgb(120, 220, 160),
+            visible: false,
+            ..Layer::layer_zero()
+        });
+        s.doc.layers.active = walls;
+
         // Demo dobjects so the canvas is never empty on first launch.
         s.doc.push(Line {
             a: Vec2::new(-40.0, -20.0), b: Vec2::new(40.0, 20.0),
@@ -685,6 +712,200 @@ impl CadApp {
             if crossing { "crossing" } else { "inside" },
             self.selection.len(),
         ));
+    }
+
+    // ===================================================================
+    // Slice B — Layer panel
+    // ===================================================================
+    //
+    // Egui-port of LibreCAD's `qg_layerwidget`. Operates directly on
+    // `self.doc.layers` (the `LayerTable` from cad_kernel). Active layer
+    // = the one new Dobjects get assigned to on `Document::push`.
+
+    fn render_layer_panel(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("layers")
+            .min_width(240.0)
+            .default_width(280.0)
+            .show(ctx, |ui| {
+                ui.heading(format!("Layers ({})", self.doc.layers.len()));
+                ui.separator();
+
+                // ---- toolbar row: add + rename + delete -----------------
+                ui.horizontal(|ui| {
+                    if ui.button("➕ add").on_hover_text("Add a new layer").clicked() {
+                        self.layer_name_counter += 1;
+                        let mut name = format!("Layer{}", self.layer_name_counter);
+                        // Bump the counter until the name is unique.
+                        while self.doc.layers.find(&name).is_some() {
+                            self.layer_name_counter += 1;
+                            name = format!("Layer{}", self.layer_name_counter);
+                        }
+                        let id = self.doc.layers.add(Layer {
+                            name,
+                            ..Layer::layer_zero()
+                        });
+                        self.doc.layers.active = id;
+                        self.history.push(format!(
+                            "  + layer #{} (active)", id
+                        ));
+                    }
+                    let active = self.doc.layers.active;
+                    let can_delete = active != LayerTable::LAYER_ZERO;
+                    ui.add_enabled_ui(can_delete, |ui| {
+                        if ui.button("🗑 delete")
+                            .on_hover_text("Delete the ACTIVE layer (Dobjects on it are NOT deleted; reassign them first)")
+                            .clicked()
+                        {
+                            let name = self.doc.layers.get(active)
+                                .map(|l| l.name.clone()).unwrap_or_default();
+                            if self.doc.layers.remove(active) {
+                                self.history.push(format!(
+                                    "  - layer '{}' (#{}) deleted; active → 0", name, active
+                                ));
+                                // Reassign Dobjects on the removed layer to "0".
+                                // Layers above `active` shifted down by 1; we
+                                // need to remap their style.layer too.
+                                for d in self.doc.dobjects.iter_mut() {
+                                    if d.style.layer == active {
+                                        d.style.layer = LayerTable::LAYER_ZERO;
+                                    } else if d.style.layer > active {
+                                        d.style.layer -= 1;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                });
+                ui.separator();
+
+                // ---- header row -----------------------------------------
+                egui::Grid::new("layer_header_grid")
+                    .num_columns(5)
+                    .spacing([6.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label(""); // active
+                        ui.label("👁");
+                        ui.label("❄");
+                        ui.label("🔒");
+                        ui.label("name");
+                        ui.end_row();
+                    });
+
+                // ---- one row per layer ----------------------------------
+                let active = self.doc.layers.active;
+                let mut new_active: Option<LayerId> = None;
+                let mut rename_commit: Option<(LayerId, String)> = None;
+                let mut rename_cancel = false;
+                let n = self.doc.layers.len();
+
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| {
+                        egui::Grid::new("layer_rows")
+                            .num_columns(6)
+                            .spacing([6.0, 4.0])
+                            .striped(true)
+                            .show(ui, |ui| {
+                                for id in 0..(n as LayerId) {
+                                    let layer = match self.doc.layers.get_mut(id) {
+                                        Some(l) => l, None => continue,
+                                    };
+
+                                    // ----- active radio -------------------
+                                    if ui.radio(id == active, "")
+                                        .on_hover_text("Click to make this the active layer")
+                                        .clicked()
+                                    {
+                                        new_active = Some(id);
+                                    }
+
+                                    // ----- visible toggle -----------------
+                                    let mut v = layer.visible;
+                                    if ui.checkbox(&mut v, "")
+                                        .on_hover_text("Visible")
+                                        .changed()
+                                    {
+                                        layer.visible = v;
+                                    }
+
+                                    // ----- freeze toggle ------------------
+                                    let mut f = layer.frozen;
+                                    if ui.checkbox(&mut f, "")
+                                        .on_hover_text("Frozen (like hidden, also skipped on regen)")
+                                        .changed()
+                                    {
+                                        layer.frozen = f;
+                                    }
+
+                                    // ----- lock toggle --------------------
+                                    let mut l = layer.locked;
+                                    if ui.checkbox(&mut l, "")
+                                        .on_hover_text("Locked — Dobjects render but can't be selected")
+                                        .changed()
+                                    {
+                                        layer.locked = l;
+                                    }
+
+                                    // ----- color swatch -------------------
+                                    let mut rgb = match layer.color {
+                                        Color::TrueColor(_) =>
+                                            layer.color.rgb_bytes().unwrap_or((255, 255, 255)),
+                                        Color::Aci(i) => aci_palette(i),
+                                        _ => (255, 255, 255),
+                                    };
+                                    let mut arr = [rgb.0, rgb.1, rgb.2];
+                                    if ui.color_edit_button_srgb(&mut arr).changed() {
+                                        rgb = (arr[0], arr[1], arr[2]);
+                                        layer.color = Color::rgb(rgb.0, rgb.1, rgb.2);
+                                    }
+
+                                    // ----- name (click to rename) ---------
+                                    if self.layer_rename == Some(id) {
+                                        let resp = ui.text_edit_singleline(&mut self.layer_rename_buf);
+                                        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                            rename_commit = Some((id, self.layer_rename_buf.clone()));
+                                        }
+                                        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                            rename_cancel = true;
+                                        }
+                                    } else {
+                                        let mut label = layer.name.clone();
+                                        if id == LayerTable::LAYER_ZERO {
+                                            label.push_str("  (reserved)");
+                                        }
+                                        let resp = ui.selectable_label(false, label);
+                                        if resp.double_clicked() && id != LayerTable::LAYER_ZERO {
+                                            self.layer_rename = Some(id);
+                                            self.layer_rename_buf = layer.name.clone();
+                                        }
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                    });
+
+                // Apply deferred mutations (made outside the borrow chain).
+                if let Some(id) = new_active {
+                    self.doc.layers.active = id;
+                    self.history.push(format!("  active layer → #{}", id));
+                }
+                if let Some((id, new_name)) = rename_commit {
+                    let trimmed = new_name.trim().to_string();
+                    if !trimmed.is_empty() && self.doc.layers.rename(id, &trimmed) {
+                        self.history.push(format!("  layer #{} renamed → '{}'", id, trimmed));
+                    } else {
+                        self.history.push(format!(
+                            "  ! rename failed (empty or duplicate)"
+                        ));
+                    }
+                    self.layer_rename = None;
+                    self.layer_rename_buf.clear();
+                }
+                if rename_cancel {
+                    self.layer_rename = None;
+                    self.layer_rename_buf.clear();
+                }
+            });
     }
 
     fn add_dobject(&mut self, geom: Geom, origin: &str) {
@@ -1731,6 +1952,14 @@ impl eframe::App for CadApp {
                 {
                     self.settings_open = !self.settings_open;
                 }
+                // Layer panel toggle
+                let layer_btn = if self.layer_panel_open { "layers ▾" } else { "layers ▸" };
+                if ui.button(layer_btn)
+                    .on_hover_text("Layer panel — add / rename / delete / visibility / lock / freeze")
+                    .clicked()
+                {
+                    self.layer_panel_open = !self.layer_panel_open;
+                }
                 ui.add_space(20.0);
                 ui.label("intersect:");
                 // View-mode: intersect only dobjects visible in the current viewport.
@@ -2102,6 +2331,11 @@ impl eframe::App for CadApp {
                 if do_generate { self.generate_array(); }
                 if close_it    { self.array_open = false; }
             }
+        }
+
+        // ---- left panel: Layer dock (Slice B) ---------------------------
+        if self.layer_panel_open {
+            self.render_layer_panel(ctx);
         }
 
         // ---- right panel: dobjects + intersection list ------------------
