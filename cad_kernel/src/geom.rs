@@ -412,15 +412,23 @@ impl Geom {
         }
     }
 
-    /// Trim this geometry by the given cutting edges. `pick` is a click point
-    /// indicating the segment to REMOVE (AutoCAD convention). `edge_mode`
-    /// controls whether the cutters are treated as their infinite extensions.
+    /// Trim this geometry by the given cutting edges.
     ///
-    /// Returns the surviving piece(s) — 0 (whole curve removed), 1 (single
-    /// piece), or 2 (clicked segment was in the middle; outer pieces survive).
+    /// **Semantics (matches AutoCAD's TRIM):** the target is broken at
+    /// EVERY intersection with the cutters into `N+1` separate segments;
+    /// the segment containing the click is REMOVED; every other segment
+    /// is returned as its OWN piece. The caller wraps each piece in a
+    /// fresh `DObject` with the target's preserved style.
     ///
-    /// Supported targets in v1: Line, Arc, EllipseArc. Other variants return
-    /// an Err so the caller can leave them untouched and report.
+    /// Returns `Vec<Geom>` of the surviving sub-segments. For a target
+    /// with N cuts, the user clicks one segment; you get back exactly N
+    /// surviving pieces.
+    ///
+    /// `edge_mode` ON treats cutters as their infinite extensions for
+    /// the intersection step (see `extended_for_edgemode`).
+    ///
+    /// Supported targets in v1: Line, Arc, EllipseArc. Other variants
+    /// return an `Err` so the caller can leave them untouched.
     pub fn trim_at(
         &self,
         cutters: &[Geom],
@@ -432,8 +440,6 @@ impl Geom {
         // Gather intersection points with every cutter.
         let mut hits: Vec<Vec2> = Vec::new();
         for c in cutters {
-            // Skip self-as-cutter (same handle would be ideal; here equality
-            // by geometry shape is enough to avoid trivial 0-length cuts).
             let c_eff = if edge_mode { c.extended_for_edgemode() } else { c.clone() };
             hits.extend(intersect(self, &c_eff));
         }
@@ -441,48 +447,40 @@ impl Geom {
             return Err("trim: target has no intersection with the cutting edges");
         }
 
+        /// Drop the segment containing `pick_t` from a list of consecutive
+        /// param bounds; return every other segment as (t_start, t_end).
+        fn surviving_segments(bounds: &[f64], pick_t: f64, eps: f64) -> Vec<(f64, f64)> {
+            let mut out = Vec::new();
+            for i in 0..bounds.len() - 1 {
+                let t1 = bounds[i];
+                let t2 = bounds[i + 1];
+                if (t2 - t1) <= eps { continue; }   // skip empty segments
+                let click_inside = pick_t > t1 - eps && pick_t < t2 + eps;
+                if click_inside { continue; }       // drop the clicked one
+                out.push((t1, t2));
+            }
+            out
+        }
+
         match self {
             Geom::Line(l) => {
                 let d = l.b - l.a;
                 let len_sq = d.len_sq();
                 if len_sq < EPS { return Err("trim: zero-length line"); }
-                let len = len_sq.sqrt();
-                // Project each hit and the pick onto the parameter t ∈ [0,1].
                 let to_t = |p: Vec2| -> f64 { (p - l.a).dot(d) / len_sq };
                 let pick_t = to_t(pick).clamp(0.0, 1.0);
-                let mut params: Vec<f64> = hits.iter()
-                    .map(|&p| to_t(p))
-                    .filter(|&t| t > EPS / len && t < 1.0 - EPS / len)
-                    .collect();
+                let mut params: Vec<f64> = hits.iter().map(|&p| to_t(p))
+                    .filter(|&t| t > 1e-9 && t < 1.0 - 1e-9).collect();
                 params.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                params.dedup_by(|a, b| (*a - *b).abs() < EPS / len);
-                // Find the bounds of the click's segment.
-                let before = params.iter().rev().find(|&&t| t < pick_t).copied();
-                let after  = params.iter().find(|&&t| t > pick_t).copied();
-                let mut out: Vec<Geom> = Vec::new();
-                match (before, after) {
-                    (Some(t1), Some(t2)) => {
-                        // Middle segment removed; outer pieces survive.
-                        if t1 > EPS / len {
-                            out.push(Geom::Line(Line { a: l.a, b: l.a + d * t1 }));
-                        }
-                        if t2 < 1.0 - EPS / len {
-                            out.push(Geom::Line(Line { a: l.a + d * t2, b: l.b }));
-                        }
-                    }
-                    (Some(t1), None) => {
-                        // Click is past the last intersection — trim toward b
-                        out.push(Geom::Line(Line { a: l.a, b: l.a + d * t1 }));
-                    }
-                    (None, Some(t2)) => {
-                        // Click is before the first intersection — trim toward a
-                        out.push(Geom::Line(Line { a: l.a + d * t2, b: l.b }));
-                    }
-                    (None, None) => {
-                        return Err("trim: pick on the wrong side of all intersections");
-                    }
-                }
-                Ok(out)
+                params.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+                let mut bounds = vec![0.0_f64];
+                bounds.extend(&params);
+                bounds.push(1.0);
+                Ok(surviving_segments(&bounds, pick_t, 1e-9).into_iter()
+                    .map(|(t1, t2)| Geom::Line(Line {
+                        a: l.a + d * t1,
+                        b: l.a + d * t2,
+                    })).collect())
             }
             Geom::Arc(arc) => {
                 if arc.radius < EPS { return Err("trim: zero-radius arc"); }
@@ -491,71 +489,74 @@ impl Geom {
                         .rem_euclid(std::f64::consts::TAU)
                 };
                 let pick_t = to_local(pick).clamp(0.0, arc.sweep_angle);
-                let mut params: Vec<f64> = hits.iter()
-                    .map(|&p| to_local(p))
-                    .filter(|&t| t > EPS && t < arc.sweep_angle - EPS)
-                    .collect();
+                let mut params: Vec<f64> = hits.iter().map(|&p| to_local(p))
+                    .filter(|&t| t > EPS && t < arc.sweep_angle - EPS).collect();
                 params.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 params.dedup_by(|a, b| (*a - *b).abs() < EPS);
-                let before = params.iter().rev().find(|&&t| t < pick_t).copied();
-                let after  = params.iter().find(|&&t| t > pick_t).copied();
-                let mk = |s: f64, w: f64| Geom::Arc(Arc {
-                    center: arc.center, radius: arc.radius,
-                    start_angle: (arc.start_angle + s).rem_euclid(std::f64::consts::TAU),
-                    sweep_angle: w,
-                });
-                let mut out: Vec<Geom> = Vec::new();
-                match (before, after) {
-                    (Some(t1), Some(t2)) => {
-                        if t1 > EPS { out.push(mk(0.0, t1)); }
-                        if t2 < arc.sweep_angle - EPS {
-                            out.push(mk(t2, arc.sweep_angle - t2));
-                        }
-                    }
-                    (Some(t1), None) => out.push(mk(0.0, t1)),
-                    (None, Some(t2)) => out.push(mk(t2, arc.sweep_angle - t2)),
-                    (None, None) => return Err("trim: pick on the wrong side of all intersections"),
-                }
-                Ok(out)
+                let mut bounds = vec![0.0_f64];
+                bounds.extend(&params);
+                bounds.push(arc.sweep_angle);
+                Ok(surviving_segments(&bounds, pick_t, EPS).into_iter()
+                    .map(|(t1, t2)| Geom::Arc(Arc {
+                        center: arc.center,
+                        radius: arc.radius,
+                        start_angle: (arc.start_angle + t1).rem_euclid(std::f64::consts::TAU),
+                        sweep_angle: t2 - t1,
+                    })).collect())
             }
             Geom::EllipseArc(ea) => {
-                // Same shape as Arc, but with parameter space (sweep_param).
                 let to_local = |p: Vec2| -> f64 {
                     (ea.ellipse.nearest_param(p) - ea.start_param)
                         .rem_euclid(std::f64::consts::TAU)
                 };
                 let pick_t = to_local(pick).clamp(0.0, ea.sweep_param);
-                let mut params: Vec<f64> = hits.iter()
-                    .map(|&p| to_local(p))
-                    .filter(|&t| t > EPS && t < ea.sweep_param - EPS)
-                    .collect();
+                let mut params: Vec<f64> = hits.iter().map(|&p| to_local(p))
+                    .filter(|&t| t > EPS && t < ea.sweep_param - EPS).collect();
                 params.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 params.dedup_by(|a, b| (*a - *b).abs() < EPS);
-                let before = params.iter().rev().find(|&&t| t < pick_t).copied();
-                let after  = params.iter().find(|&&t| t > pick_t).copied();
-                let mk = |s: f64, w: f64| Geom::EllipseArc(EllipseArc {
-                    ellipse: ea.ellipse,
-                    start_param: (ea.start_param + s).rem_euclid(std::f64::consts::TAU),
-                    sweep_param: w,
-                });
-                let mut out: Vec<Geom> = Vec::new();
-                match (before, after) {
-                    (Some(t1), Some(t2)) => {
-                        if t1 > EPS { out.push(mk(0.0, t1)); }
-                        if t2 < ea.sweep_param - EPS {
-                            out.push(mk(t2, ea.sweep_param - t2));
-                        }
-                    }
-                    (Some(t1), None) => out.push(mk(0.0, t1)),
-                    (None, Some(t2)) => out.push(mk(t2, ea.sweep_param - t2)),
-                    (None, None) => return Err("trim: pick on the wrong side of all intersections"),
+                let mut bounds = vec![0.0_f64];
+                bounds.extend(&params);
+                bounds.push(ea.sweep_param);
+                Ok(surviving_segments(&bounds, pick_t, EPS).into_iter()
+                    .map(|(t1, t2)| Geom::EllipseArc(EllipseArc {
+                        ellipse: ea.ellipse,
+                        start_param: (ea.start_param + t1).rem_euclid(std::f64::consts::TAU),
+                        sweep_param: t2 - t1,
+                    })).collect())
+            }
+            Geom::Circle(c) => {
+                // Closed loop: 2+ cuts break it into N arcs.
+                // Find all intersection angles (relative to angle 0); sort;
+                // build segments; drop the one containing pick_angle.
+                if c.radius < EPS { return Err("trim: zero-radius circle"); }
+                let to_ang = |p: Vec2| (p - c.center).angle().rem_euclid(std::f64::consts::TAU);
+                let pick_t = to_ang(pick);
+                let mut params: Vec<f64> = hits.iter().map(|&p| to_ang(p)).collect();
+                params.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                params.dedup_by(|a, b| (*a - *b).abs() < EPS);
+                if params.len() < 2 {
+                    return Err("trim: circle needs at least 2 intersections to break");
+                }
+                // Wrap segments end-to-end around the circle.
+                let mut out = Vec::new();
+                let n = params.len();
+                for i in 0..n {
+                    let t1 = params[i];
+                    let t2 = params[(i + 1) % n];
+                    let sweep = (t2 - t1).rem_euclid(std::f64::consts::TAU);
+                    // Pick-angle in this arc iff (t1 → pick_t → t2) in CCW order.
+                    let pick_offset = (pick_t - t1).rem_euclid(std::f64::consts::TAU);
+                    let click_inside = pick_offset > EPS && pick_offset < sweep - EPS;
+                    if click_inside { continue; }
+                    out.push(Geom::Arc(Arc {
+                        center: c.center, radius: c.radius,
+                        start_angle: t1, sweep_angle: sweep,
+                    }));
                 }
                 Ok(out)
             }
-            Geom::Circle(_) =>
-                Err("trim: Circle requires two-pick cut (v2) — pick removed segment on an Arc instead"),
             Geom::Ellipse(_) =>
-                Err("trim: Ellipse requires two-pick cut (v2)"),
+                Err("trim: Ellipse trim not implemented yet (closed-loop param math TBD)"),
             Geom::Polyline(_) =>
                 Err("trim: Polyline trim not implemented yet (per-segment dispatch TBD)"),
             Geom::Point(_) =>
@@ -1191,18 +1192,79 @@ mod transform_tests {
     #[test]
     fn trim_line_between_two_cutters_keeps_outer_pieces() {
         // 0→10 cut at x=3 and x=7; click at x=5 (middle) removes 3..7.
+        // Two cuts = three segments; click middle → 2 outer pieces survive.
         let target = Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(10.0, 0.0) });
         let c1 = Geom::Line(Line { a: Vec2::new(3.0, -5.0), b: Vec2::new(3.0, 5.0) });
         let c2 = Geom::Line(Line { a: Vec2::new(7.0, -5.0), b: Vec2::new(7.0, 5.0) });
         let out = target.trim_at(&[c1, c2], Vec2::new(5.0, 0.0), false).unwrap();
         assert_eq!(out.len(), 2);
-        // Outer pieces 0→3 and 7→10
         let mut xs: Vec<(f64, f64)> = out.iter().map(|g| {
             if let Geom::Line(l) = g { (l.a.x, l.b.x) } else { panic!() }
         }).collect();
         xs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         assert!(approx_eq(xs[0].0, 0.0)); assert!(approx_eq(xs[0].1, 3.0));
         assert!(approx_eq(xs[1].0, 7.0)); assert!(approx_eq(xs[1].1, 10.0));
+    }
+
+    #[test]
+    fn trim_line_with_three_cutters_breaks_into_separate_pieces() {
+        // Critical multi-cut test: line 0→10 with cuts at x=2, 5, 8.
+        // 3 cuts = 4 segments. Click in segment (2..5) → 3 separate pieces
+        // remain: (0..2), (5..8), (8..10). NOT merged into 2 outer chunks.
+        let target = Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(10.0, 0.0) });
+        let cs: Vec<Geom> = [2.0, 5.0, 8.0].iter().map(|&x| {
+            Geom::Line(Line { a: Vec2::new(x, -5.0), b: Vec2::new(x, 5.0) })
+        }).collect();
+        let out = target.trim_at(&cs, Vec2::new(3.5, 0.0), false).unwrap();
+        assert_eq!(out.len(), 3, "expected 3 surviving pieces, got {}", out.len());
+        let mut xs: Vec<(f64, f64)> = out.iter().map(|g| {
+            if let Geom::Line(l) = g { (l.a.x, l.b.x) } else { panic!() }
+        }).collect();
+        xs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        assert!(approx_eq(xs[0].0, 0.0) && approx_eq(xs[0].1, 2.0));
+        assert!(approx_eq(xs[1].0, 5.0) && approx_eq(xs[1].1, 8.0));
+        assert!(approx_eq(xs[2].0, 8.0) && approx_eq(xs[2].1, 10.0));
+    }
+
+    #[test]
+    fn trim_line_with_five_cutters_makes_5_pieces_on_middle_click() {
+        // 5 cuts = 6 segments. Click in segment 3 → 5 pieces survive.
+        let target = Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(12.0, 0.0) });
+        let cs: Vec<Geom> = [2.0, 4.0, 6.0, 8.0, 10.0].iter().map(|&x| {
+            Geom::Line(Line { a: Vec2::new(x, -5.0), b: Vec2::new(x, 5.0) })
+        }).collect();
+        // Click in segment (4..6), at x=5.
+        let out = target.trim_at(&cs, Vec2::new(5.0, 0.0), false).unwrap();
+        assert_eq!(out.len(), 5, "expected 5 surviving pieces, got {}", out.len());
+    }
+
+    #[test]
+    fn trim_arc_with_two_cutters_breaks_into_two_subarcs_on_middle_click() {
+        use std::f64::consts::FRAC_PI_2;
+        // Half-arc 0°→180° at radius 5. Cuts at 60° and 120°. Click at 90°
+        // (between the cuts) → segments (0..60) and (120..180) survive.
+        let arc = Geom::Arc(Arc {
+            center: Vec2::ZERO, radius: 5.0,
+            start_angle: 0.0, sweep_angle: std::f64::consts::PI,
+        });
+        let cx_60 = 5.0 * (60.0_f64).to_radians().cos();
+        let cy_60 = 5.0 * (60.0_f64).to_radians().sin();
+        let cx_120 = 5.0 * (120.0_f64).to_radians().cos();
+        let cy_120 = 5.0 * (120.0_f64).to_radians().sin();
+        // Radial cut lines from origin through each angle, long enough.
+        let c1 = Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(cx_60 * 2.0, cy_60 * 2.0) });
+        let c2 = Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(cx_120 * 2.0, cy_120 * 2.0) });
+        // Click at 90° (top of arc): (0, 5)
+        let out = arc.trim_at(&[c1, c2], Vec2::new(0.0, 5.0), false).unwrap();
+        assert_eq!(out.len(), 2, "expected 2 sub-arcs, got {}", out.len());
+        for g in &out {
+            if let Geom::Arc(a) = g {
+                let sweep_deg = a.sweep_angle.to_degrees();
+                assert!((sweep_deg - 60.0).abs() < 1.0,
+                    "each surviving sub-arc should sweep ~60°, got {}°", sweep_deg);
+            } else { panic!() }
+        }
+        let _ = FRAC_PI_2;
     }
 
     #[test]
