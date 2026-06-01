@@ -1225,6 +1225,140 @@ mod transform_tests {
     }
 
     #[test]
+    fn trim_arc_at_single_radial_cutter_keeps_other_side() {
+        // Quarter-arc 0°→90° at origin, radius 5. Cutter is a vertical line
+        // at x = 5·cos(45°) ≈ 3.536, which intersects the arc at 45°.
+        // Click at angle 22° (lower-left half) → removes that side, keeps 45°→90°.
+        let arc = Geom::Arc(Arc {
+            center: Vec2::ZERO, radius: 5.0,
+            start_angle: 0.0, sweep_angle: std::f64::consts::FRAC_PI_2,
+        });
+        let cut_x = 5.0 * std::f64::consts::FRAC_1_SQRT_2;
+        let cutter = Geom::Line(Line {
+            a: Vec2::new(cut_x, -10.0), b: Vec2::new(cut_x, 10.0),
+        });
+        // Click below the cutter (small angle on the arc)
+        let pick = Vec2::new(4.5, 1.0);   // ≈12° on the arc
+        let out = arc.trim_at(&[cutter], pick, false).unwrap();
+        assert_eq!(out.len(), 1);
+        if let Geom::Arc(a) = &out[0] {
+            // Should start at ≈45° and sweep to ≈90°
+            assert!(a.start_angle > 0.5 && a.start_angle < 1.0,
+                "start_angle = {} rad ({}°)", a.start_angle, a.start_angle.to_degrees());
+            assert!((a.sweep_angle - std::f64::consts::FRAC_PI_4).abs() < 0.05,
+                "sweep_angle = {} rad", a.sweep_angle);
+        } else { panic!(); }
+    }
+
+    #[test]
+    fn trim_target_with_disjoint_cutters_errors_when_pick_is_outside() {
+        // Line 0→10. Cutter at x=15 (no intersection on the visible line).
+        // EdgMod OFF — no imaginary intersection either. trim should fail.
+        let target = Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(10.0, 0.0) });
+        let cutter = Geom::Line(Line {
+            a: Vec2::new(15.0, -1.0), b: Vec2::new(15.0, 1.0),
+        });
+        let r = target.trim_at(&[cutter], Vec2::new(5.0, 0.0), false);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn trim_with_pick_on_endpoint_side_of_intersection() {
+        // Line 0→10 cut at x=5. Click at x=2 (left of cut) → trims toward a;
+        // result keeps the right half (5..10).
+        let target = Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(10.0, 0.0) });
+        let cutter = Geom::Line(Line { a: Vec2::new(5.0, -1.0), b: Vec2::new(5.0, 1.0) });
+        let out = target.trim_at(&[cutter], Vec2::new(2.0, 0.0), false).unwrap();
+        assert_eq!(out.len(), 1);
+        if let Geom::Line(l) = &out[0] {
+            assert!(approx_eq(l.a.x, 5.0)); assert!(approx_eq(l.b.x, 10.0));
+        } else { panic!(); }
+    }
+
+    #[test]
+    fn trim_uses_visible_intersection_first_with_edgemode_off() {
+        // Cutter VISIBLY intersects target. EdgMod OFF: should use the real
+        // intersection (no need to extend). Confirms we don't accidentally
+        // always extend.
+        let target = Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(10.0, 0.0) });
+        let cutter = Geom::Line(Line { a: Vec2::new(5.0, -5.0), b: Vec2::new(5.0, 5.0) });
+        let out = target.trim_at(&[cutter.clone()], Vec2::new(7.0, 0.0), false).unwrap();
+        // Same result as the EdgMod-ON case for this geometry; assert we
+        // got the trimmed left half.
+        if let Geom::Line(l) = &out[0] {
+            assert!(approx_eq(l.b.x, 5.0));
+        } else { panic!(); }
+    }
+
+    #[test]
+    fn extend_arc_lengthens_sweep_to_boundary() {
+        // Quarter-arc 0°→90° at radius 5. Boundary line at y=5 (already
+        // tangent-ish to top of arc at 90°). Pick a point past the 90°
+        // endpoint to extend forward; expect sweep grows past 90°.
+        // Simpler boundary: vertical line at x = -2 (cuts arc extension
+        // at angle just past 90°).
+        let arc = Geom::Arc(Arc {
+            center: Vec2::ZERO, radius: 5.0,
+            start_angle: 0.0, sweep_angle: std::f64::consts::FRAC_PI_2,
+        });
+        let boundary = Geom::Line(Line {
+            a: Vec2::new(-2.0, -10.0), b: Vec2::new(-2.0, 10.0),
+        });
+        // End of arc is at (0, 5). Click slightly past it (above and left).
+        let pick = Vec2::new(-0.5, 5.5);
+        let out = arc.extend_to(&[boundary], pick, true).unwrap();
+        if let Geom::Arc(a) = out {
+            // Sweep should be > original PI/2 but < PI (since x=-2 → angle ≈113°)
+            assert!(a.sweep_angle > std::f64::consts::FRAC_PI_2,
+                "sweep didn't grow: {}", a.sweep_angle);
+            assert!(a.sweep_angle < std::f64::consts::PI,
+                "sweep overshot: {}", a.sweep_angle);
+        } else { panic!(); }
+    }
+
+    #[test]
+    fn document_level_apply_trim_pick_shape() {
+        // Simulate what apply_trim_pick does in cad_app: trim target,
+        // remove it from the Document, push the surviving pieces. Confirms
+        // the index-shift logic produces a coherent Document.
+        use crate::Document;
+        let mut doc = Document::default();
+        // Cutter at index 0, target at index 1.
+        let cutter_i = doc.push(Line {
+            a: Vec2::new(5.0, -5.0), b: Vec2::new(5.0, 5.0),
+        }.into());
+        let target_i = doc.push(Line {
+            a: Vec2::ZERO, b: Vec2::new(10.0, 0.0),
+        }.into());
+        assert_eq!(cutter_i, 0);
+        assert_eq!(target_i, 1);
+
+        // Mirror apply_trim_pick:
+        let cutter_geom = doc.dobjects[cutter_i].geom.clone();
+        let target_style = doc.dobjects[target_i].style;
+        let pieces = doc.dobjects[target_i].geom
+            .trim_at(&[cutter_geom], Vec2::new(7.0, 0.0), true)
+            .unwrap();
+        doc.dobjects.remove(target_i);
+        for g in pieces {
+            let mut d = crate::DObject::new(g);
+            d.style = target_style;
+            doc.push(d);
+        }
+        // Now doc.dobjects = [cutter, piece]; total 2, both Lines.
+        assert_eq!(doc.dobjects.len(), 2);
+        // Cutter still at index 0 (unchanged).
+        if let Geom::Line(l) = &doc.dobjects[0].geom {
+            assert!(approx_eq(l.a.x, 5.0));
+        } else { panic!("cutter shifted or mutated"); }
+        // Piece is the original LEFT half (since pick was on the right at x=7).
+        if let Geom::Line(l) = &doc.dobjects[1].geom {
+            assert!(approx_eq(l.a.x, 0.0));
+            assert!(approx_eq(l.b.x, 5.0));
+        } else { panic!(); }
+    }
+
+    #[test]
     fn extend_line_grows_toward_boundary() {
         // Target line 0→4 at y=0. Boundary at x=10.
         let target = Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(4.0, 0.0) });
