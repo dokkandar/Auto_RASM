@@ -2313,12 +2313,20 @@ impl CadApp {
     fn apply_align(&mut self, s1: Vec2, s2: Vec2, t1: Vec2, t2: Vec2) {
         if self.selection.is_empty() { return; }
         let src_len = s1.dist(s2);
+        let tgt_len = t1.dist(t2);
         if src_len < EPS {
             self.history.push("  ! align: source points coincide".into());
             return;
         }
+        if tgt_len < EPS {
+            self.history.push("  ! align: target points coincide".into());
+            return;
+        }
         self.snapshot_doc();
-        // Translate: s1 → t1; then rotate around t1 so (s2 - s1) aligns with (t2 - t1).
+        // Three-stage affine: translate s1→t1, rotate around t1 so the
+        // (s1→s2) direction aligns with (t1→t2), then uniformly scale
+        // around t1 so the source segment maps onto the target segment.
+        // AutoCAD's ALIGN with two ref pairs does exactly this.
         let v = t1 - s1;
         let src_dir = (s2 - s1).angle();
         let tgt_dir = (t2 - t1).angle();
@@ -2326,16 +2334,18 @@ impl CadApp {
         let dtheta = if dtheta > std::f64::consts::PI {
             dtheta - std::f64::consts::TAU
         } else { dtheta };
+        let scale = tgt_len / src_len;
         let n = self.selection.len();
         for &i in &self.selection {
             if let Some(d) = self.doc.dobjects.get_mut(i) {
                 let translated = d.geom.translated(v);
-                d.geom = translated.rotated(t1, dtheta);
+                let rotated    = translated.rotated(t1, dtheta);
+                d.geom         = rotated.scaled(t1, scale);
             }
         }
         self.history.push(format!(
-            "  ⇲ align: {} dobject(s)  shifted ({:.2},{:.2})  rotated {:.2}° around ({:.2},{:.2})",
-            n, v.x, v.y, dtheta.to_degrees(), t1.x, t1.y));
+            "  ⇲ align: {} dobject(s)  shifted ({:.2},{:.2})  rotated {:.2}°  scaled ×{:.3}  around ({:.2},{:.2})",
+            n, v.x, v.y, dtheta.to_degrees(), scale, t1.x, t1.y));
         self.intersections.clear();
         self.index_dirty = true;
         self.gpu_dirty = true;
