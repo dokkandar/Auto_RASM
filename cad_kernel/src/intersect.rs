@@ -38,12 +38,16 @@ pub fn intersect(a: &Geom, b: &Geom) -> Vec<Vec2> {
                     intersect_ellipse_ellipse(ea1.ellipse, ea2.ellipse), ea1),
                 ea2),
 
-        // Point / Polyline: intersection math TBD (point ∩ anything degenerates
-        // to "is the point on the curve?", polyline ∩ X needs per-segment
-        // dispatch). Return empty for now — callers don't expect INT to fire
-        // on these types until the pairs are implemented.
+        // Polyline ∩ X — per-segment dispatch. Each Polyline segment is
+        // either a Line (bulge == 0) or an Arc (bulge != 0). Intersect each
+        // surviving segment vs the other geom and concatenate hits.
+        // Polyline ∩ Polyline — both sides iterate.
+        (Polyline(p), other) => intersect_polyline_other(p, other),
+        (other, Polyline(p)) => intersect_polyline_other(p, other),
+
+        // Point ∩ anything: degenerates to "is the point on the curve?" —
+        // not used by any tool today. Return empty until needed.
         (Point(_), _) | (_, Point(_)) => Vec::new(),
-        (Polyline(_), _) | (_, Polyline(_)) => Vec::new(),
     }
 }
 
@@ -60,6 +64,58 @@ fn filter_by_arc(hits: Vec<Vec2>, arc: &Arc) -> Vec<Vec2> {
     hits.into_iter()
         .filter(|p| arc.contains_angle((*p - arc.center).angle()))
         .collect()
+}
+
+/// Polyline ∩ any-other-Geom — iterate the polyline's segments, dispatch
+/// each as a Line (bulge == 0) or an Arc (bulge != 0), and concatenate
+/// every intersection. Closed polylines also test the closing segment
+/// between the last and first vertex.
+fn intersect_polyline_other(p: &Polyline, other: &Geom) -> Vec<Vec2> {
+    let n = p.vertices.len();
+    if n < 2 { return Vec::new(); }
+    let mut out: Vec<Vec2> = Vec::new();
+    let seg_count = if p.closed { n } else { n - 1 };
+    for i in 0..seg_count {
+        let v_i  = p.vertices[i];
+        let v_n  = p.vertices[(i + 1) % n];
+        // bulge of segment i lives on v_i per DXF convention.
+        if v_i.bulge.abs() < EPS {
+            let seg = Geom::Line(Line { a: v_i.pos, b: v_n.pos });
+            out.extend(intersect(&seg, other));
+        } else {
+            // Bulge → Arc. Math: chord length L, sagitta s = L·bulge/2,
+            // radius r = L·(1 + bulge²) / (4·|bulge|); sign(bulge) ⇒ CCW/CW.
+            let chord = v_n.pos - v_i.pos;
+            let l = chord.len();
+            if l < EPS { continue; }
+            let b = v_i.bulge;
+            let r = l * (1.0 + b * b) / (4.0 * b.abs());
+            // Center is perpendicular to chord midpoint, distance d from
+            // midpoint where d = r·(1 - bulge²)/(1 + bulge²) along the
+            // perpendicular. Sign: bulge > 0 → centre on the LEFT of the
+            // chord (CCW arc); bulge < 0 → centre on the RIGHT (CW).
+            let mid = (v_i.pos + v_n.pos) * 0.5;
+            let perp = chord.perp() / l;
+            let d = r * (1.0 - b * b) / (1.0 + b * b);
+            let center = mid + perp * (d * b.signum());
+            let start_angle = (v_i.pos - center).angle().rem_euclid(std::f64::consts::TAU);
+            let end_angle   = (v_n.pos - center).angle().rem_euclid(std::f64::consts::TAU);
+            // Sweep is always positive (CCW). For bulge < 0, the SHORTER
+            // path is CW from v_i to v_n; reparameterise so the Arc still
+            // represents the same swept curve in our CCW convention.
+            let raw_sweep = (end_angle - start_angle).rem_euclid(std::f64::consts::TAU);
+            let arc = if b > 0.0 {
+                Arc { center, radius: r, start_angle,
+                      sweep_angle: raw_sweep }
+            } else {
+                let rev_sweep = std::f64::consts::TAU - raw_sweep;
+                Arc { center, radius: r, start_angle: end_angle,
+                      sweep_angle: rev_sweep }
+            };
+            out.extend(intersect(&Geom::Arc(arc), other));
+        }
+    }
+    out
 }
 
 // ---------- Line–Line (both treated as segments) ----------------------------

@@ -599,8 +599,35 @@ impl Geom {
                 }
                 Ok(out)
             }
-            Geom::Polyline(_) =>
-                Err("trim: Polyline trim not implemented yet (per-segment dispatch TBD)"),
+            Geom::Polyline(p) => {
+                // v1 semantic: EXPLODE the polyline into independent Line
+                // / Arc segments, trim the one nearest the click, leave
+                // every other segment intact. The polyline structure
+                // dissolves — user can `join` them back if needed.
+                let segs = polyline_segments(p);
+                if segs.is_empty() {
+                    return Err("trim: polyline has no segments");
+                }
+                // Nearest-segment-to-pick.
+                let mut best_i = 0usize;
+                let mut best_d = f64::INFINITY;
+                for (i, s) in segs.iter().enumerate() {
+                    let d = s.distance_to_point(pick);
+                    if d < best_d { best_d = d; best_i = i; }
+                }
+                let mut out = Vec::new();
+                for (i, s) in segs.into_iter().enumerate() {
+                    if i == best_i {
+                        match s.trim_at(cutters, pick, edge_mode) {
+                            Ok(pieces) => out.extend(pieces),
+                            Err(_) => out.push(s),
+                        }
+                    } else {
+                        out.push(s);
+                    }
+                }
+                Ok(out)
+            }
             Geom::Point(_) =>
                 Err("trim: Point has nothing to trim"),
         }
@@ -1619,6 +1646,48 @@ impl EllipseArc {
 }
 
 // ---------------------------------------------------------------------------
+// Polyline segments — explode into independent Line / Arc geoms.
+//
+// Each vertex `i` owns the bulge for segment `i → (i+1)`. Straight when
+// bulge == 0; otherwise an Arc derived from chord + DXF bulge formula.
+// Closed polylines also produce the closing segment (last → first).
+// ---------------------------------------------------------------------------
+pub fn polyline_segments(p: &Polyline) -> Vec<Geom> {
+    let n = p.vertices.len();
+    if n < 2 { return Vec::new(); }
+    let seg_count = if p.closed { n } else { n - 1 };
+    let mut out = Vec::with_capacity(seg_count);
+    for i in 0..seg_count {
+        let v_i = p.vertices[i];
+        let v_n = p.vertices[(i + 1) % n];
+        if v_i.bulge.abs() < EPS {
+            out.push(Geom::Line(Line { a: v_i.pos, b: v_n.pos }));
+        } else {
+            let chord = v_n.pos - v_i.pos;
+            let l = chord.len();
+            if l < EPS { continue; }
+            let b = v_i.bulge;
+            let r = l * (1.0 + b * b) / (4.0 * b.abs());
+            let mid = (v_i.pos + v_n.pos) * 0.5;
+            let perp = chord.perp() / l;
+            let d = r * (1.0 - b * b) / (1.0 + b * b);
+            let center = mid + perp * (d * b.signum());
+            let start_angle = (v_i.pos - center).angle().rem_euclid(std::f64::consts::TAU);
+            let end_angle   = (v_n.pos - center).angle().rem_euclid(std::f64::consts::TAU);
+            let raw_sweep = (end_angle - start_angle).rem_euclid(std::f64::consts::TAU);
+            let arc = if b > 0.0 {
+                Arc { center, radius: r, start_angle, sweep_angle: raw_sweep }
+            } else {
+                let rev_sweep = std::f64::consts::TAU - raw_sweep;
+                Arc { center, radius: r, start_angle: end_angle, sweep_angle: rev_sweep }
+            };
+            out.push(Geom::Arc(arc));
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Ellipse offset helper.
 //
 // True parallel offset of an ellipse is a quartic, NOT an ellipse, so we
@@ -2337,6 +2406,51 @@ mod fillet_chamfer_join_tests {
     }
 
     // --- offset: ellipse / EllipseArc → Polyline approximation --------
+
+    // --- trim: Polyline (explode + trim) ---------------------------------
+
+    #[test]
+    fn trim_polyline_segment_drops_clicked_sub_segment() {
+        // Open polyline: (0,0) → (4,0) → (4,4). A vertical line at x=2
+        // crosses segment 0 (horizontal) at (2,0). Click between the cut
+        // and (4,0) → that sub-segment is dropped. Other segments survive.
+        let pl = Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(4.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(4.0, 4.0), bulge: 0.0 },
+            ],
+            closed: false,
+        };
+        let g = Geom::Polyline(pl);
+        let cutter = Geom::Line(Line {
+            a: Vec2::new(2.0, -1.0), b: Vec2::new(2.0, 5.0),
+        });
+        let pieces = g.trim_at(&[cutter], Vec2::new(3.0, 0.0), false).unwrap();
+        // Expected: (0,0)→(2,0) plus the vertical (4,0)→(4,4). Two Lines.
+        assert_eq!(pieces.len(), 2);
+        for p in &pieces { assert!(matches!(p, Geom::Line(_))); }
+    }
+
+    #[test]
+    fn intersect_line_polyline_returns_per_segment_hits() {
+        use crate::intersect::intersect;
+        let pl = Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(4.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(4.0, 4.0), bulge: 0.0 },
+            ],
+            closed: false,
+        };
+        let g = Geom::Polyline(pl);
+        // Diagonal line crosses both segments.
+        let line = Geom::Line(Line {
+            a: Vec2::new(-1.0, -1.0), b: Vec2::new(5.0, 5.0),
+        });
+        let hits = intersect(&g, &line);
+        assert_eq!(hits.len(), 2);
+    }
 
     #[test]
     fn offset_ellipse_outward_grows_bbox() {
