@@ -114,7 +114,7 @@ fn read_layer_table(pairs: &[(i32, String)], start: usize, doc: &mut Document) -
         if *c == 0 && v == "LAYER" {
             // Accumulate this layer's fields until the next 0-group.
             let mut name = String::new();
-            let mut color = Color::rgb(255, 255, 255);
+            let mut color = Color::Aci(7);   // ACI 7 = white default
             let mut lt_name = String::from("Continuous");
             let mut flags: i32 = 0;
             i += 1;

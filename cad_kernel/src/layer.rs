@@ -38,7 +38,7 @@ impl Layer {
     pub fn layer_zero() -> Self {
         Self {
             name:       "0".into(),
-            color:      Color::rgb(255, 255, 255),      // white
+            color:      Color::Aci(7),                  // white (ACI 7)
             linetype:   LinetypeTable::CONTINUOUS,
             lineweight: Lineweight::Default,
             visible:    true,

@@ -4,8 +4,55 @@
 // Two indirection sentinels (ByLayer / ByBlock) are first-class — a Dobject
 // can declare "use my layer's color" without storing a concrete RGB. The
 // renderer resolves the chain at draw time via `resolve_color`.
+//
+// Storage shape: the in-DObject `Color` enum stores at most a u16 index for
+// 24-bit truecolors — the actual 0x00RRGGBB lives in a shared
+// `TrueColorTable` on the Document (dedup'd). Cost per dobject color:
+// 4 bytes (was 8). Cost per UNIQUE truecolor: 4 bytes in the table.
+// Most dobjects use ByLayer / Aci so the table stays small.
 
 use crate::layer::LayerTable;
+use std::collections::HashMap;
+
+/// Dedup'd table of 24-bit colors. Lives on the Document. A
+/// `Color::TrueColorRef(idx)` stores only the u16 index; the table maps
+/// that to a packed 0x00RRGGBB u32.
+///
+/// Why: at 9 M dobjects, an inline `TrueColor(u32)` payload cost ~72 MB
+/// just for the color field. Indirection cuts that to ~36 MB even
+/// without dedup; with typical CAD color usage (handful of unique
+/// truecolors) it cuts to under 10 MB.
+#[derive(Clone, Debug, Default)]
+pub struct TrueColorTable {
+    rgbs:   Vec<u32>,                   // index → 0x00RRGGBB
+    by_rgb: HashMap<u32, u16>,          // 0x00RRGGBB → index (dedup)
+}
+
+impl TrueColorTable {
+    pub fn new() -> Self { Self::default() }
+
+    /// Intern an RGB. Identical RGBs share the same index — call any
+    /// number of times. Returns the index for `Color::TrueColorRef`.
+    pub fn intern(&mut self, rgb: u32) -> u16 {
+        let rgb = rgb & 0x00FFFFFF;
+        if let Some(&idx) = self.by_rgb.get(&rgb) { return idx; }
+        assert!(self.rgbs.len() < u16::MAX as usize,
+            "TrueColorTable overflow (>65 535 unique colors)");
+        let idx = self.rgbs.len() as u16;
+        self.rgbs.push(rgb);
+        self.by_rgb.insert(rgb, idx);
+        idx
+    }
+
+    /// Lookup an interned RGB by index. None if the index is out of
+    /// range (shouldn't happen with refs produced by `intern`).
+    pub fn get(&self, idx: u16) -> Option<u32> {
+        self.rgbs.get(idx as usize).copied()
+    }
+
+    pub fn len(&self) -> usize { self.rgbs.len() }
+    pub fn is_empty(&self) -> bool { self.rgbs.is_empty() }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Color {
@@ -18,8 +65,10 @@ pub enum Color {
     /// 0 reserved (ByBlock in DXF), 256 reserved (ByLayer in DXF);
     /// useful range is 1..=255.
     Aci(u8),
-    /// 24-bit true colour, packed as `0x00RRGGBB`.
-    TrueColor(u32),
+    /// Reference into the document's `TrueColorTable`. The renderer +
+    /// I/O dereference via `truecolors.get(idx)`. Replaces the previous
+    /// `TrueColor(u32)` variant — see TrueColorTable docs for rationale.
+    TrueColorRef(u16),
 }
 
 impl Default for Color {
@@ -27,20 +76,15 @@ impl Default for Color {
 }
 
 impl Color {
-    /// Convenience constructor from byte components.
-    pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
-        Color::TrueColor(((r as u32) << 16) | ((g as u32) << 8) | (b as u32))
-    }
-
-    /// Unpack a TrueColor into (r, g, b). For ByLayer / ByBlock / Aci,
-    /// returns None — callers must resolve first.
-    pub fn rgb_bytes(self) -> Option<(u8, u8, u8)> {
+    /// Resolve a TrueColorRef to RGB. None for non-ref variants.
+    pub fn rgb_bytes(self, tc: &TrueColorTable) -> Option<(u8, u8, u8)> {
         match self {
-            Color::TrueColor(v) => Some((
-                ((v >> 16) & 0xFF) as u8,
-                ((v >>  8) & 0xFF) as u8,
-                ( v        & 0xFF) as u8,
-            )),
+            Color::TrueColorRef(idx) => {
+                let v = tc.get(idx)?;
+                Some((((v >> 16) & 0xFF) as u8,
+                      ((v >>  8) & 0xFF) as u8,
+                      ( v        & 0xFF) as u8))
+            }
             _ => None,
         }
     }
@@ -48,20 +92,26 @@ impl Color {
 
 /// Resolve a Dobject's color through the ByLayer / ByBlock chain. Returns a
 /// concrete `(r, g, b)`. ByBlock falls back to ByLayer until block support
-/// lands. ACI indices are resolved through `aci_palette` (minimal 7-color
-/// table for now — covers the first row of AutoCAD's color picker).
-pub fn resolve_color(c: Color, layer_id: u32, layers: &LayerTable) -> (u8, u8, u8) {
+/// lands. ACI indices are resolved through `aci_palette`. TrueColorRef
+/// values are dereferenced via the document's `TrueColorTable`.
+pub fn resolve_color(c: Color, layer_id: u32, layers: &LayerTable, tc: &TrueColorTable) -> (u8, u8, u8) {
+    let to_rgb = |idx: u16| -> (u8, u8, u8) {
+        let v = tc.get(idx).unwrap_or(0xFFFFFF);
+        (((v >> 16) & 0xFF) as u8,
+         ((v >>  8) & 0xFF) as u8,
+         ( v        & 0xFF) as u8)
+    };
     match c {
-        Color::TrueColor(_) => c.rgb_bytes().unwrap_or((255, 255, 255)),
-        Color::Aci(idx)     => aci_palette(idx),
+        Color::TrueColorRef(idx) => to_rgb(idx),
+        Color::Aci(idx)          => aci_palette(idx),
         Color::ByLayer | Color::ByBlock => {
             let layer_color = layers.get(layer_id)
                 .map(|l| l.color)
-                .unwrap_or(Color::TrueColor(0xFFFFFF));
+                .unwrap_or(Color::Aci(7));  // white-ish fallback
             match layer_color {
-                Color::ByLayer | Color::ByBlock => (255, 255, 255), // safety: break loop
-                Color::TrueColor(_) => layer_color.rgb_bytes().unwrap(),
-                Color::Aci(i)       => aci_palette(i),
+                Color::ByLayer | Color::ByBlock => (255, 255, 255),  // safety: break loop
+                Color::TrueColorRef(idx)        => to_rgb(idx),
+                Color::Aci(i)                   => aci_palette(i),
             }
         }
     }
@@ -152,9 +202,14 @@ mod tests {
     use crate::layer::{Layer, LayerTable};
 
     #[test]
-    fn truecolor_pack_unpack() {
-        let c = Color::rgb(255, 128, 64);
-        assert_eq!(c.rgb_bytes(), Some((255, 128, 64)));
+    fn truecolor_intern_and_resolve() {
+        let mut tc = TrueColorTable::new();
+        let idx1 = tc.intern(0xFF8040);
+        let idx2 = tc.intern(0xFF8040);          // dedup
+        assert_eq!(idx1, idx2);
+        assert_eq!(tc.len(), 1);
+        let c = Color::TrueColorRef(idx1);
+        assert_eq!(c.rgb_bytes(&tc), Some((0xFF, 0x80, 0x40)));
     }
 
     #[test]
@@ -206,6 +261,7 @@ mod tests {
     #[test]
     fn resolve_bylayer_through_table() {
         let mut t = LayerTable::with_defaults();
+        let tc = TrueColorTable::new();
         let id = t.add(Layer {
             name:       "WALLS".into(),
             color:      Color::Aci(3),     // green
@@ -216,13 +272,14 @@ mod tests {
             frozen:     false,
             plottable:  true,
         });
-        assert_eq!(resolve_color(Color::ByLayer, id, &t), (0, 255, 0));
+        assert_eq!(resolve_color(Color::ByLayer, id, &t, &tc), (0, 255, 0));
     }
 
     #[test]
     fn resolve_truecolor_ignores_layer() {
         let t = LayerTable::with_defaults();
-        let c = Color::rgb(10, 20, 30);
-        assert_eq!(resolve_color(c, 0, &t), (10, 20, 30));
+        let mut tc = TrueColorTable::new();
+        let c = Color::TrueColorRef(tc.intern(0x0A141E));
+        assert_eq!(resolve_color(c, 0, &t, &tc), (10, 20, 30));
     }
 }

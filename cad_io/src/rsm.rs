@@ -73,9 +73,9 @@ pub fn write_rsm(doc: &Document) -> Vec<u8> {
     write_u16(&mut w, 0);
 
     write_linetype_table(&mut w, &doc.linetypes);
-    write_layer_table(&mut w, &doc.layers);
-    write_pen_table(&mut w, &doc.pens);
-    write_dobjects(&mut w, &doc.dobjects);
+    write_layer_table(&mut w, &doc.layers, &doc.truecolors);
+    write_pen_table(&mut w, &doc.pens, &doc.truecolors);
+    write_dobjects(&mut w, &doc.dobjects, &doc.truecolors);
 
     w
 }
@@ -95,14 +95,20 @@ fn write_vec2(w: &mut Vec<u8>, v: Vec2) {
     write_f64(w, v.y);
 }
 
-/// Color tag space:
-///   0 = ByLayer, 1 = ByBlock, 2 = Aci(u8), 3 = TrueColor(u32)
-fn write_color(w: &mut Vec<u8>, c: Color) {
+/// Color tag space (on-disk format is UNCHANGED for backward compat):
+///   0 = ByLayer, 1 = ByBlock, 2 = Aci(u8), 3 = TrueColor (RGB u32 inline)
+/// In-memory `Color::TrueColorRef(idx)` is dereferenced via `truecolors`
+/// at write time. Reader interns the RGB into the doc's table.
+fn write_color(w: &mut Vec<u8>, c: Color, tc: &cad_kernel::TrueColorTable) {
     match c {
-        Color::ByLayer       => write_u8(w, 0),
-        Color::ByBlock       => write_u8(w, 1),
-        Color::Aci(i)        => { write_u8(w, 2); write_u8(w, i); }
-        Color::TrueColor(v)  => { write_u8(w, 3); write_u32(w, v); }
+        Color::ByLayer            => write_u8(w, 0),
+        Color::ByBlock            => write_u8(w, 1),
+        Color::Aci(i)             => { write_u8(w, 2); write_u8(w, i); }
+        Color::TrueColorRef(idx)  => {
+            let rgb = tc.get(idx).unwrap_or(0xFFFFFF);
+            write_u8(w, 3);
+            write_u32(w, rgb);
+        }
     }
 }
 
@@ -127,12 +133,12 @@ fn write_linetype_table(w: &mut Vec<u8>, t: &LinetypeTable) {
     }
 }
 
-fn write_layer_table(w: &mut Vec<u8>, t: &LayerTable) {
+fn write_layer_table(w: &mut Vec<u8>, t: &LayerTable, tc: &cad_kernel::TrueColorTable) {
     write_u32(w, t.active);
     write_u32(w, t.layers.len() as u32);
     for l in &t.layers {
         write_str(w, &l.name);
-        write_color(w, l.color);
+        write_color(w, l.color, tc);
         write_u32(w, l.linetype);
         write_lineweight(w, l.lineweight);
         let mut flags = 0_u8;
@@ -144,23 +150,23 @@ fn write_layer_table(w: &mut Vec<u8>, t: &LayerTable) {
     }
 }
 
-fn write_pen_table(w: &mut Vec<u8>, t: &PenTable) {
+fn write_pen_table(w: &mut Vec<u8>, t: &PenTable, tc: &cad_kernel::TrueColorTable) {
     write_u32(w, t.pens.len() as u32);
     for p in &t.pens {
         write_str(w, &p.name);
-        write_color(w, p.color);
+        write_color(w, p.color, tc);
         write_u32(w, p.linetype);
         write_lineweight(w, p.lineweight);
     }
 }
 
-fn write_dobjects(w: &mut Vec<u8>, ds: &[DObject]) {
+fn write_dobjects(w: &mut Vec<u8>, ds: &[DObject], tc: &cad_kernel::TrueColorTable) {
     write_u32(w, ds.len() as u32);
     for d in ds {
         write_u64(w, d.handle);
         // Style block
         write_u32(w, d.style.layer);
-        write_color(w, d.style.color);
+        write_color(w, d.style.color, tc);
         write_u32(w, d.style.linetype);
         write_f32(w, d.style.linetype_scale);
         write_lineweight(w, d.style.lineweight);
@@ -284,20 +290,21 @@ pub fn read_rsm(bytes: &[u8]) -> Result<Document, String> {
         return Err(format!("RSM: unsupported version {} (this build only reads v{})", ver, VERSION));
     }
 
-    let linetypes = read_linetype_table(&mut r)?;
-    let layers    = read_layer_table(&mut r)?;
-    let pens      = read_pen_table(&mut r)?;
-    let dobjects  = read_dobjects(&mut r)?;
+    let linetypes  = read_linetype_table(&mut r)?;
+    let mut truecolors = cad_kernel::TrueColorTable::new();
+    let layers    = read_layer_table(&mut r, &mut truecolors)?;
+    let pens      = read_pen_table(&mut r, &mut truecolors)?;
+    let dobjects  = read_dobjects(&mut r, &mut truecolors)?;
 
-    Ok(Document { dobjects, layers, linetypes, pens })
+    Ok(Document { dobjects, layers, linetypes, pens, truecolors })
 }
 
-fn read_color(r: &mut R) -> Result<Color, String> {
+fn read_color(r: &mut R, tc: &mut cad_kernel::TrueColorTable) -> Result<Color, String> {
     Ok(match r.u8()? {
         0 => Color::ByLayer,
         1 => Color::ByBlock,
         2 => Color::Aci(r.u8()?),
-        3 => Color::TrueColor(r.u32()?),
+        3 => Color::TrueColorRef(tc.intern(r.u32()?)),
         t => return Err(format!("RSM: unknown color tag {}", t)),
     })
 }
@@ -326,13 +333,13 @@ fn read_linetype_table(r: &mut R) -> Result<LinetypeTable, String> {
     Ok(LinetypeTable { linetypes })
 }
 
-fn read_layer_table(r: &mut R) -> Result<LayerTable, String> {
+fn read_layer_table(r: &mut R, tc: &mut cad_kernel::TrueColorTable) -> Result<LayerTable, String> {
     let active = r.u32()?;
     let n = r.u32()? as usize;
     let mut layers = Vec::with_capacity(n);
     for _ in 0..n {
         let name       = r.str()?;
-        let color      = read_color(r)?;
+        let color      = read_color(r, tc)?;
         let linetype   = r.u32()?;
         let lineweight = read_lineweight(r)?;
         let flags      = r.u8()?;
@@ -347,12 +354,12 @@ fn read_layer_table(r: &mut R) -> Result<LayerTable, String> {
     Ok(LayerTable { layers, active })
 }
 
-fn read_pen_table(r: &mut R) -> Result<PenTable, String> {
+fn read_pen_table(r: &mut R, tc: &mut cad_kernel::TrueColorTable) -> Result<PenTable, String> {
     let n = r.u32()? as usize;
     let mut pens = Vec::with_capacity(n);
     for _ in 0..n {
         let name       = r.str()?;
-        let color      = read_color(r)?;
+        let color      = read_color(r, tc)?;
         let linetype   = r.u32()?;
         let lineweight = read_lineweight(r)?;
         pens.push(Pen { name, color, linetype, lineweight });
@@ -360,13 +367,13 @@ fn read_pen_table(r: &mut R) -> Result<PenTable, String> {
     Ok(PenTable { pens })
 }
 
-fn read_dobjects(r: &mut R) -> Result<Vec<DObject>, String> {
+fn read_dobjects(r: &mut R, tc: &mut cad_kernel::TrueColorTable) -> Result<Vec<DObject>, String> {
     let n = r.u32()? as usize;
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         let handle    = r.u64()?;
         let layer     = r.u32()?;
-        let color     = read_color(r)?;
+        let color     = read_color(r, tc)?;
         let linetype  = r.u32()?;
         let lt_scale  = r.f32()?;
         let lineweight= read_lineweight(r)?;

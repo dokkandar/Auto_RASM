@@ -30,15 +30,20 @@ impl Default for PenTable {
     /// at the ready: ByLayer (the no-op pen), three pure ACI colors with
     /// continuous lines, plus two dashed-line presets.
     fn default() -> Self {
+        // Default pens use ACI so they cost ZERO entries in the
+        // truecolor table. User can switch any pen to a TrueColor via
+        // the Pen panel (which interns via doc.truecolors). Matches
+        // memo `feedback_rust_cad_color_aci_primary`: ACI is the
+        // primary picker.
         Self {
             pens: vec![
-                Pen { name: "ByLayer".into(),    color: Color::ByLayer,         linetype: LinetypeTable::CONTINUOUS, lineweight: Lineweight::ByLayer },
-                Pen { name: "Red 0.25 mm".into(),  color: Color::rgb(220,  40,  40), linetype: LinetypeTable::CONTINUOUS, lineweight: Lineweight::Custom(0.25) },
-                Pen { name: "Green 0.25 mm".into(),color: Color::rgb( 60, 200,  60), linetype: LinetypeTable::CONTINUOUS, lineweight: Lineweight::Custom(0.25) },
-                Pen { name: "Blue 0.25 mm".into(), color: Color::rgb( 80, 120, 240), linetype: LinetypeTable::CONTINUOUS, lineweight: Lineweight::Custom(0.25) },
-                Pen { name: "Heavy black 0.7".into(), color: Color::rgb(20, 20, 20), linetype: LinetypeTable::CONTINUOUS, lineweight: Lineweight::Custom(0.7) },
-                Pen { name: "Dashed gray".into(), color: Color::rgb(140, 140, 150), linetype: 1, lineweight: Lineweight::Default },
-                Pen { name: "Dash-dot center".into(), color: Color::rgb(255, 180,  40), linetype: 2, lineweight: Lineweight::Default },
+                Pen { name: "ByLayer".into(),         color: Color::ByLayer,   linetype: LinetypeTable::CONTINUOUS, lineweight: Lineweight::ByLayer },
+                Pen { name: "Red 0.25 mm".into(),     color: Color::Aci(1),    linetype: LinetypeTable::CONTINUOUS, lineweight: Lineweight::Custom(0.25) },
+                Pen { name: "Green 0.25 mm".into(),   color: Color::Aci(3),    linetype: LinetypeTable::CONTINUOUS, lineweight: Lineweight::Custom(0.25) },
+                Pen { name: "Blue 0.25 mm".into(),    color: Color::Aci(5),    linetype: LinetypeTable::CONTINUOUS, lineweight: Lineweight::Custom(0.25) },
+                Pen { name: "Heavy black 0.7".into(), color: Color::Aci(250),  linetype: LinetypeTable::CONTINUOUS, lineweight: Lineweight::Custom(0.7) },
+                Pen { name: "Dashed gray".into(),     color: Color::Aci(8),    linetype: 1, lineweight: Lineweight::Default },
+                Pen { name: "Dash-dot center".into(), color: Color::Aci(40),   linetype: 2, lineweight: Lineweight::Default },
             ],
         }
     }

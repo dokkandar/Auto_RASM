@@ -561,13 +561,16 @@ impl Default for CadApp {
             trim_debug_open: false,
             trim_debug_frame: 0,
         };
-        // Demo layers so the Layer panel has visible content at first launch.
+        // Demo layers so the Layer panel has visible content at first
+        // launch. ACI palette colors keep these out of the truecolor
+        // table (per the "ACI is primary" memo + the storage refactor
+        // that made TrueColors a shared, dedup'd table).
         let walls = s.doc.layers.add(Layer {
-            name: "WALLS".into(), color: Color::rgb(255, 90, 90),
+            name: "WALLS".into(), color: Color::Aci(1),   // red
             ..Layer::layer_zero()
         });
         let _hidden = s.doc.layers.add(Layer {
-            name: "HIDDEN".into(), color: Color::rgb(120, 220, 160),
+            name: "HIDDEN".into(), color: Color::Aci(3),  // green
             visible: false,
             ..Layer::layer_zero()
         });
@@ -1503,6 +1506,10 @@ impl CadApp {
                 let mut new_active: Option<LayerId> = None;
                 let mut rename_commit: Option<(LayerId, String)> = None;
                 let mut rename_cancel = false;
+                // Color edits can't intern into self.doc.truecolors directly
+                // because the layer loop holds &mut self.doc.layers. Capture
+                // (layer_id, packed_rgb) here; intern + assign after the loop.
+                let mut color_change: Vec<(LayerId, u32)> = Vec::new();
                 let n = self.doc.layers.len();
 
                 egui::ScrollArea::vertical()
@@ -1514,6 +1521,21 @@ impl CadApp {
                             .striped(true)
                             .show(ui, |ui| {
                                 for id in 0..(n as LayerId) {
+                                    // Read-only first: pull the current
+                                    // display color while no &mut layer
+                                    // borrow exists, so we can dereference
+                                    // self.doc.truecolors freely.
+                                    let cur_color = self.doc.layers.get(id).map(|l| l.color);
+                                    let rgb = match cur_color {
+                                        Some(Color::TrueColorRef(idx)) => {
+                                            let v = self.doc.truecolors.get(idx).unwrap_or(0xFFFFFF);
+                                            (((v >> 16) & 0xFF) as u8,
+                                             ((v >>  8) & 0xFF) as u8,
+                                             ( v        & 0xFF) as u8)
+                                        }
+                                        Some(Color::Aci(i)) => aci_palette(i),
+                                        _ => (255, 255, 255),
+                                    };
                                     let layer = match self.doc.layers.get_mut(id) {
                                         Some(l) => l, None => continue,
                                     };
@@ -1554,16 +1576,13 @@ impl CadApp {
                                     }
 
                                     // ----- color swatch -------------------
-                                    let mut rgb = match layer.color {
-                                        Color::TrueColor(_) =>
-                                            layer.color.rgb_bytes().unwrap_or((255, 255, 255)),
-                                        Color::Aci(i) => aci_palette(i),
-                                        _ => (255, 255, 255),
-                                    };
                                     let mut arr = [rgb.0, rgb.1, rgb.2];
                                     if ui.color_edit_button_srgb(&mut arr).changed() {
-                                        rgb = (arr[0], arr[1], arr[2]);
-                                        layer.color = Color::rgb(rgb.0, rgb.1, rgb.2);
+                                        let packed =
+                                            ((arr[0] as u32) << 16)
+                                          | ((arr[1] as u32) << 8)
+                                          | (arr[2] as u32);
+                                        color_change.push((id, packed));
                                     }
 
                                     // ----- name (click to rename) ---------
@@ -1595,6 +1614,16 @@ impl CadApp {
                 if let Some(id) = new_active {
                     self.doc.layers.active = id;
                     self.history.push(format!("  active layer → #{}", id));
+                }
+                // Color edits captured during the layer loop — intern into
+                // the truecolor table, then assign the ref. Two stages
+                // because we couldn't borrow `doc.truecolors` mutably
+                // inside the &mut layer scope.
+                for (id, packed_rgb) in color_change.drain(..) {
+                    let idx = self.doc.truecolors.intern(packed_rgb);
+                    if let Some(l) = self.doc.layers.get_mut(id) {
+                        l.color = Color::TrueColorRef(idx);
+                    }
                 }
                 if let Some((id, new_name)) = rename_commit {
                     let trimmed = new_name.trim().to_string();
@@ -1653,8 +1682,12 @@ impl CadApp {
                             for (i, pen) in self.doc.pens.pens.iter().enumerate() {
                                 // ---- color swatch ----
                                 let (r, g, b) = match pen.color {
-                                    Color::TrueColor(_) =>
-                                        pen.color.rgb_bytes().unwrap_or((128, 128, 128)),
+                                    Color::TrueColorRef(idx) => {
+                                        let v = self.doc.truecolors.get(idx).unwrap_or(0x808080);
+                                        (((v >> 16) & 0xFF) as u8,
+                                         ((v >>  8) & 0xFF) as u8,
+                                         ( v        & 0xFF) as u8)
+                                    }
                                     Color::Aci(idx) => aci_palette(idx),
                                     Color::ByLayer | Color::ByBlock => (180, 180, 200),
                                 };
@@ -1818,7 +1851,8 @@ impl CadApp {
                 // `feedback_rust_cad_color_aci_primary`.
                 ui.label("Color");
                 let mut col = self.doc.dobjects[idx].style.color;
-                if aci_color_picker(ui, ("info_color", idx), &mut col) {
+                if aci_color_picker(ui, ("info_color", idx), &mut col,
+                                    &mut self.doc.truecolors) {
                     self.doc.dobjects[idx].style.color = col;
                     self.gpu_dirty = true;
                 }
@@ -3400,22 +3434,37 @@ fn describe(g: &Geom) -> String {
 
 /// Color picker UI — ACI palette as PRIMARY, TrueColor as secondary.
 /// Returns true if the value changed. See
-/// `feedback_rust_cad_color_aci_primary` memo.
-fn aci_color_picker(ui: &mut egui::Ui, id: impl std::hash::Hash, value: &mut Color) -> bool {
+/// `feedback_rust_cad_color_aci_primary` memo. TrueColor values are
+/// interned via the document's `TrueColorTable` (see Color storage
+/// refactor memo); the picker takes a &mut TrueColorTable for that.
+fn aci_color_picker(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash,
+    value: &mut Color,
+    truecolors: &mut TrueColorTable,
+) -> bool {
     let mut changed = false;
 
     // Current-value summary swatch + label
     let (r, g, b) = match *value {
-        Color::Aci(i)        => aci_palette(i),
-        Color::TrueColor(_)  => value.rgb_bytes().unwrap_or((255, 255, 255)),
+        Color::Aci(i)             => aci_palette(i),
+        Color::TrueColorRef(idx)  => {
+            let v = truecolors.get(idx).unwrap_or(0xFFFFFF);
+            (((v >> 16) & 0xFF) as u8,
+             ((v >>  8) & 0xFF) as u8,
+             ( v        & 0xFF) as u8)
+        }
         Color::ByLayer       => (180, 180, 200),
         Color::ByBlock       => (140, 140, 160),
     };
     let summary = match *value {
-        Color::ByLayer       => "ByLayer".to_string(),
-        Color::ByBlock       => "ByBlock".to_string(),
-        Color::Aci(i)        => format!("ACI {}", i),
-        Color::TrueColor(v)  => format!("RGB #{:06X}", v & 0x00FFFFFF),
+        Color::ByLayer            => "ByLayer".to_string(),
+        Color::ByBlock            => "ByBlock".to_string(),
+        Color::Aci(i)             => format!("ACI {}", i),
+        Color::TrueColorRef(idx)  => {
+            let v = truecolors.get(idx).unwrap_or(0xFFFFFF);
+            format!("RGB #{:06X}", v & 0x00FFFFFF)
+        }
     };
 
     ui.horizontal(|ui| {
@@ -3478,10 +3527,14 @@ fn aci_color_picker(ui: &mut egui::Ui, id: impl std::hash::Hash, value: &mut Col
             *value = Color::ByBlock;
             changed = true;
         }
-        // TrueColor fallback — opens egui's RGB picker; commits as TrueColor
+        // TrueColor fallback — opens egui's RGB picker. Commits by
+        // interning the RGB and storing only a small ref on `value`.
         let mut rgb = [r, g, b];
         if ui.color_edit_button_srgb(&mut rgb).changed() {
-            *value = Color::rgb(rgb[0], rgb[1], rgb[2]);
+            let packed = ((rgb[0] as u32) << 16)
+                       | ((rgb[1] as u32) << 8)
+                       | (rgb[2] as u32);
+            *value = Color::TrueColorRef(truecolors.intern(packed));
             changed = true;
         }
         ui.small("TrueColor…");
@@ -5515,6 +5568,7 @@ impl eframe::App for CadApp {
                             // "stop turning everything yellow" complaint).
                             let (r, g, b) = resolve_color(
                                 e.style.color, e.style.layer, &self.doc.layers,
+                                &self.doc.truecolors,
                             );
                             draw_dobject(&painter, rect, self, &e.geom,
                                 egui::Color32::from_rgb(r, g, b));
@@ -5550,6 +5604,7 @@ impl eframe::App for CadApp {
                             // Resolve through ByLayer / ByBlock to a concrete RGB.
                             let (r, g, b) = resolve_color(
                                 e.style.color, e.style.layer, &self.doc.layers,
+                                &self.doc.truecolors,
                             );
                             egui::Color32::from_rgb(r, g, b)
                         };

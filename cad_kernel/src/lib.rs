@@ -41,7 +41,7 @@ pub mod snap;
 pub use math::{approx_eq, approx_zero, norm_angle, Vec2, EPS};
 pub use geom::{Arc, Circle, Ellipse, EllipseArc, Geom, Line, Point, PolyVertex, Polyline};
 pub use geom::{ChamferOut, FilletOut, GripRole, JoinOut, chamfer_lines, fillet_lines, join_geoms};
-pub use color::{aci_palette, resolve_color, Color};
+pub use color::{aci_palette, resolve_color, Color, TrueColorTable};
 pub use lineweight::{resolve_lineweight, Lineweight, DEFAULT_LINEWEIGHT_MM};
 pub use linetype::{Linetype, LinetypeTable};
 pub use layer::{Layer, LayerId, LayerTable};

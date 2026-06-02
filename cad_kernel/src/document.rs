@@ -6,6 +6,7 @@
 // named_views) slot in as new fields without touching call sites that
 // already work with the current ones.
 
+use crate::color::TrueColorTable;
 use crate::dobject::DObject;
 use crate::layer::LayerTable;
 use crate::linetype::LinetypeTable;
@@ -13,10 +14,14 @@ use crate::pen::PenTable;
 
 #[derive(Clone)]
 pub struct Document {
-    pub dobjects:  Vec<DObject>,
-    pub layers:    LayerTable,
-    pub linetypes: LinetypeTable,
-    pub pens:      PenTable,
+    pub dobjects:   Vec<DObject>,
+    pub layers:     LayerTable,
+    pub linetypes:  LinetypeTable,
+    pub pens:       PenTable,
+    /// Shared 24-bit color table. Dobjects with `Color::TrueColorRef(idx)`
+    /// look up their RGB here. Dedup'd on `intern`, so a million dobjects
+    /// in the same color cost ~4 bytes once.
+    pub truecolors: TrueColorTable,
     // Reserved for future slices — leave the field list extensible:
     // pub blocks:      BlockTable,
     // pub text_styles: TextStyleTable,
@@ -29,10 +34,11 @@ pub struct Document {
 impl Default for Document {
     fn default() -> Self {
         Self {
-            dobjects:  Vec::new(),
-            layers:    LayerTable::with_defaults(),
-            linetypes: LinetypeTable::with_defaults(),
-            pens:      PenTable::default(),
+            dobjects:   Vec::new(),
+            layers:     LayerTable::with_defaults(),
+            linetypes:  LinetypeTable::with_defaults(),
+            pens:       PenTable::default(),
+            truecolors: TrueColorTable::new(),
         }
     }
 }
