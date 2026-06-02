@@ -826,8 +826,34 @@ impl Geom {
                     start_angle: a.start_angle, sweep_angle: a.sweep_angle,
                 }))
             }
-            Geom::Ellipse(_) | Geom::EllipseArc(_) =>
-                Err("offset on ellipse not implemented (true offset is not an ellipse)"),
+            Geom::Ellipse(el) => {
+                // True offset of an ellipse is a quartic, NOT an ellipse —
+                // so we return a Polyline approximation. Each sample point
+                // is offset along its local outward normal; `side` picks
+                // inside vs outside.
+                let pts = offset_ellipse_samples(*el, 0.0, std::f64::consts::TAU,
+                                                  dist, side, true);
+                if pts.len() < 3 { return Err("offset: ellipse degenerate"); }
+                Ok(Geom::Polyline(Polyline {
+                    vertices: pts.into_iter()
+                        .map(|p| PolyVertex { pos: p, bulge: 0.0 })
+                        .collect(),
+                    closed: true,
+                }))
+            }
+            Geom::EllipseArc(ea) => {
+                // Same polyline approximation, but only over the swept range.
+                let end_param = ea.start_param + ea.sweep_param;
+                let pts = offset_ellipse_samples(ea.ellipse, ea.start_param,
+                                                  end_param, dist, side, false);
+                if pts.len() < 2 { return Err("offset: ellipse arc degenerate"); }
+                Ok(Geom::Polyline(Polyline {
+                    vertices: pts.into_iter()
+                        .map(|p| PolyVertex { pos: p, bulge: 0.0 })
+                        .collect(),
+                    closed: false,
+                }))
+            }
             Geom::Polyline(_) =>
                 Err("offset on polyline not implemented yet (corner math TBD)"),
             Geom::Point(_) =>
@@ -1593,6 +1619,49 @@ impl EllipseArc {
 }
 
 // ---------------------------------------------------------------------------
+// Ellipse offset helper.
+//
+// True parallel offset of an ellipse is a quartic, NOT an ellipse, so we
+// approximate by sampling the curve and offsetting each sample along its
+// local outward normal. Sign chosen from `side` projected onto the normal
+// at the first sample.
+// ---------------------------------------------------------------------------
+fn offset_ellipse_samples(
+    el: Ellipse,
+    t_start: f64,
+    t_end: f64,
+    dist: f64,
+    side: Vec2,
+    closed: bool,
+) -> Vec<Vec2> {
+    let a = el.semi_major();
+    if a < EPS { return Vec::new(); }
+    // Sample density scales with size; minimum 64 for visual smoothness.
+    let n = (64.0_f64 + a.log10().max(0.0) * 32.0).round().max(48.0) as usize;
+    // Sign: compare `side` direction to the CCW-perp tangent at t_start.
+    let p0 = el.point_at(t_start);
+    let tg0 = el.tangent_at(t_start);
+    let nrm0 = tg0.perp();
+    let nl   = nrm0.len();
+    if nl < EPS { return Vec::new(); }
+    let n0u  = nrm0 / nl;
+    let sgn  = if (side - p0).dot(n0u) >= 0.0 { 1.0 } else { -1.0 };
+    let span = t_end - t_start;
+    let count = if closed { n } else { n + 1 };
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let t = t_start + (i as f64 / n as f64) * span;
+        let p = el.point_at(t);
+        let tg = el.tangent_at(t);
+        let nm = tg.perp();
+        let nl = nm.len();
+        if nl < EPS { continue; }
+        out.push(p + (nm / nl) * (dist.abs() * sgn));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Fillet / Chamfer — Slices M.3 + M.4.
 //
 // v1 supports LINE + LINE only. Other combinations return Err; line-arc and
@@ -2264,6 +2333,82 @@ mod fillet_chamfer_join_tests {
         assert_eq!(pieces.len(), 3);
         for p in &pieces {
             assert!(matches!(p, Geom::EllipseArc(_)));
+        }
+    }
+
+    // --- offset: ellipse / EllipseArc → Polyline approximation --------
+
+    #[test]
+    fn offset_ellipse_outward_grows_bbox() {
+        // Outward offset: pick `side` outside the ellipse. The resulting
+        // polyline should be a closed loop whose bbox is wider than the
+        // original.
+        let el = Ellipse {
+            center: Vec2::ZERO,
+            major:  Vec2::new(2.0, 0.0),
+            ratio:  0.5,
+        };
+        let g = Geom::Ellipse(el);
+        let out = g.offset(0.5, Vec2::new(10.0, 0.0)).unwrap();
+        if let Geom::Polyline(p) = out {
+            assert!(p.closed, "outward ellipse offset must be a closed polyline");
+            assert!(p.vertices.len() >= 48);
+            // Every offset vertex should sit outside the original ellipse —
+            // the parametric form satisfies x²/a² + y²/b² >= 1.
+            for v in &p.vertices {
+                let val = (v.pos.x / 2.0).powi(2) + (v.pos.y / 1.0).powi(2);
+                assert!(val > 1.0,
+                    "offset vertex {:?} lies inside original ellipse (val={})",
+                    v.pos, val);
+            }
+        } else {
+            panic!("expected Polyline, got {:?}", out);
+        }
+    }
+
+    #[test]
+    fn offset_ellipse_inward_shrinks_inside_bbox() {
+        // Inward offset: pick `side` inside. Every vertex sits inside the
+        // original ellipse.
+        let el = Ellipse {
+            center: Vec2::ZERO,
+            major:  Vec2::new(2.0, 0.0),
+            ratio:  0.5,
+        };
+        let g = Geom::Ellipse(el);
+        let out = g.offset(0.3, Vec2::new(0.0, 0.0)).unwrap();
+        if let Geom::Polyline(p) = out {
+            assert!(p.closed);
+            for v in &p.vertices {
+                let val = (v.pos.x / 2.0).powi(2) + (v.pos.y / 1.0).powi(2);
+                assert!(val < 1.0,
+                    "offset vertex {:?} lies outside original ellipse (val={})",
+                    v.pos, val);
+            }
+        } else {
+            panic!("expected Polyline, got {:?}", out);
+        }
+    }
+
+    #[test]
+    fn offset_ellipse_arc_returns_open_polyline() {
+        // Half-ellipse arc (top): start_param=0, sweep=π.
+        let ea = EllipseArc {
+            ellipse: Ellipse {
+                center: Vec2::ZERO,
+                major:  Vec2::new(2.0, 0.0),
+                ratio:  0.5,
+            },
+            start_param: 0.0,
+            sweep_param: std::f64::consts::PI,
+        };
+        let g = Geom::EllipseArc(ea);
+        let out = g.offset(0.2, Vec2::new(0.0, 5.0)).unwrap();
+        if let Geom::Polyline(p) = out {
+            assert!(!p.closed, "ellipse arc offset must be an OPEN polyline");
+            assert!(p.vertices.len() >= 49);  // n+1 samples
+        } else {
+            panic!("expected Polyline, got {:?}", out);
         }
     }
 
