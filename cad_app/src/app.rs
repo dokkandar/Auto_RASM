@@ -4675,18 +4675,20 @@ impl eframe::App for CadApp {
             // by (priority, distance). The first is the default; Tab cycles
             // through the rest. Cursor motion (> 4 px) resets the cycle.
             //
-            // Item 2 — snap is active during ANY editing/drafting/drawing
-            // phase, not just draw tools. A typed-in-cmd snap override
-            // (END / MID / PER / …) ALWAYS wins via find_all_snaps's
-            // `forced` parameter — see memo
+            // Snap fires ONLY for true point-pick phases — phases where the
+            // click commits a precise coordinate (draw, move base/dest,
+            // mirror axis pts, etc.). Pure hit-test phases (trim cutter
+            // pick, trim target click, fillet pick-line, matchprops source,
+            // …) suppress snap candidates because the click identifies a
+            // dobject, not a point — snap markers are visual noise there.
+            //
+            // The typed-in-cmd snap override (END / MID / …) ALWAYS wins
+            // via find_all_snaps's `forced` parameter and re-enables snap
+            // for one click even in hit-test phases. See memo
             // `feedback_rust_cad_inline_snap_override_supersedes`.
             let snap_phase_active =
                 self.tool != Tool::None
                 || self.snap_override.is_some()
-                || matches!(self.trim_state,
-                    TrimState::PickingTargets(_) | TrimState::PickingTargetsAll)
-                || matches!(self.extend_state,
-                    ExtendState::PickingTargets(_) | ExtendState::PickingTargetsAll)
                 || self.move_state       != MoveState::Off
                 || self.copy_state       != CopyState::Off
                 || self.rotate_state     != RotateState::Off
@@ -4694,11 +4696,7 @@ impl eframe::App for CadApp {
                 || self.mirror_state     != MirrorState::Off
                 || self.align_state      != AlignState::Off
                 || self.stretch_state    != StretchState::Off
-                || self.offset_state     != OffsetState::Off
-                || self.lengthen_state   != LengthenState::Off
-                || self.break_state      != BreakState::Off
-                || self.fillet_state     != FilletState::Off
-                || self.chamfer_state    != ChamferState::Off;
+                || self.break_state      != BreakState::Off;
             let snap_candidates: Vec<SnapHit> = if !self.doc.dobjects.is_empty()
                 && snap_phase_active
                 && !self.picking_source && !self.intersect_pending_click
