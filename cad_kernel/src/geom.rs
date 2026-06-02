@@ -567,8 +567,38 @@ impl Geom {
                 }
                 Ok(out)
             }
-            Geom::Ellipse(_) =>
-                Err("trim: Ellipse trim not implemented yet (closed-loop param math TBD)"),
+            Geom::Ellipse(el) => {
+                // Closed loop, same shape as the Circle case but in ellipse
+                // parameter space. Each intersection point maps to its t via
+                // `nearest_param` (exact for points on the curve).
+                if el.semi_major() < EPS {
+                    return Err("trim: degenerate ellipse");
+                }
+                let to_t = |p: Vec2| el.nearest_param(p).rem_euclid(std::f64::consts::TAU);
+                let pick_t = to_t(pick);
+                let mut params: Vec<f64> = hits.iter().map(|&p| to_t(p)).collect();
+                params.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                params.dedup_by(|a, b| (*a - *b).abs() < EPS);
+                if params.len() < 2 {
+                    return Err("trim: ellipse needs at least 2 intersections to break");
+                }
+                let mut out = Vec::new();
+                let n = params.len();
+                for i in 0..n {
+                    let t1 = params[i];
+                    let t2 = params[(i + 1) % n];
+                    let sweep = (t2 - t1).rem_euclid(std::f64::consts::TAU);
+                    let pick_offset = (pick_t - t1).rem_euclid(std::f64::consts::TAU);
+                    let click_inside = pick_offset > EPS && pick_offset < sweep - EPS;
+                    if click_inside { continue; }
+                    out.push(Geom::EllipseArc(EllipseArc {
+                        ellipse:     *el,
+                        start_param: t1,
+                        sweep_param: sweep,
+                    }));
+                }
+                Ok(out)
+            }
             Geom::Polyline(_) =>
                 Err("trim: Polyline trim not implemented yet (per-segment dispatch TBD)"),
             Geom::Point(_) =>
@@ -2184,5 +2214,74 @@ mod fillet_chamfer_join_tests {
         // The collinear / arc-group passes shouldn't fire (only 1 line
         // direction; 1 arc). Chain pass should produce a polyline.
         assert!(out.merged.iter().any(|g| matches!(g, Geom::Polyline(_))));
+    }
+
+    // --- trim: closed Ellipse -------------------------------------------
+
+    #[test]
+    fn trim_ellipse_horizontal_cut_keeps_lower_half() {
+        // a = 2, b = 1; cut by y = 0 → intersections at (±2, 0) (t = 0, π).
+        // Click on upper half → upper EllipseArc dropped; lower survives.
+        let el = Ellipse {
+            center: Vec2::ZERO,
+            major:  Vec2::new(2.0, 0.0),
+            ratio:  0.5,
+        };
+        let g      = Geom::Ellipse(el);
+        let cutter = Geom::Line(Line {
+            a: Vec2::new(-3.0, 0.0),
+            b: Vec2::new( 3.0, 0.0),
+        });
+        let pieces = g.trim_at(&[cutter], Vec2::new(0.0, 0.5), false).unwrap();
+        assert_eq!(pieces.len(), 1, "expected one surviving EllipseArc");
+        if let Geom::EllipseArc(ea) = &pieces[0] {
+            assert!((ea.start_param - std::f64::consts::PI).abs() < 1e-4);
+            assert!((ea.sweep_param - std::f64::consts::PI).abs() < 1e-4);
+        } else {
+            panic!("expected EllipseArc, got {:?}", pieces[0]);
+        }
+    }
+
+    #[test]
+    fn trim_ellipse_three_cuts_drops_clicked_arc() {
+        // Three cuts → 3 arcs. Click inside one → 2 survive.
+        let el = Ellipse {
+            center: Vec2::ZERO,
+            major:  Vec2::new(3.0, 0.0),
+            ratio:  0.5,
+        };
+        let g = Geom::Ellipse(el);
+        // Three horizontal/diagonal lines through the ellipse, picked so
+        // each crosses the curve twice; total 6 intersections, dedup'd by
+        // sort+dedup gives 6 distinct params → 6 arcs of small sweep,
+        // not 3. Adjust: pick lines that share a common pair of points.
+        // Easier: cut twice by parallel lines y=±0.4 — 4 intersections,
+        // four sub-arcs.
+        let c1 = Geom::Line(Line { a: Vec2::new(-4.0,  0.4), b: Vec2::new(4.0,  0.4) });
+        let c2 = Geom::Line(Line { a: Vec2::new(-4.0, -0.4), b: Vec2::new(4.0, -0.4) });
+        let pieces = g.trim_at(&[c1, c2], Vec2::new(0.0, 1.0), false).unwrap();
+        // Click is on the top arc (between y=0.4 cuts at the top); 3 survive.
+        assert_eq!(pieces.len(), 3);
+        for p in &pieces {
+            assert!(matches!(p, Geom::EllipseArc(_)));
+        }
+    }
+
+    #[test]
+    fn trim_ellipse_single_tangent_intersection_errs() {
+        let el = Ellipse {
+            center: Vec2::ZERO,
+            major:  Vec2::new(2.0, 0.0),
+            ratio:  0.5,
+        };
+        let g = Geom::Ellipse(el);
+        // Tangent at the top: y = 1. Touches at one point (0, 1).
+        let tangent = Geom::Line(Line {
+            a: Vec2::new(-3.0, 1.0),
+            b: Vec2::new( 3.0, 1.0),
+        });
+        let err = g.trim_at(&[tangent], Vec2::new(0.0, 0.5), false).unwrap_err();
+        assert!(err.contains("at least 2 intersections")
+             || err.contains("no intersection"));
     }
 }
