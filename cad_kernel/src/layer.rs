@@ -34,11 +34,18 @@ pub struct Layer {
 }
 
 impl Layer {
-    /// The mandatory built-in layer "0".
+    /// The mandatory built-in BASE layer. Default name "LAYER B"; default
+    /// color = ACI 7 (white). All freshly created Dobjects land on this
+    /// layer with `Color::ByLayer`, so the default visual is white.
+    ///
+    /// Kept under the historical `layer_zero` name for backward compat;
+    /// internally referenced via `LayerTable::LAYER_BASE` (alias for the
+    /// reserved id 0). DXF round-trip preserves whatever name the
+    /// imported file used at id 0.
     pub fn layer_zero() -> Self {
         Self {
-            name:       "0".into(),
-            color:      Color::Aci(7),                  // white (ACI 7)
+            name:       "LAYER B".into(),     // Base
+            color:      Color::Aci(7),         // white (ACI 7)
             linetype:   LinetypeTable::CONTINUOUS,
             lineweight: Lineweight::Default,
             visible:    true,
@@ -57,8 +64,13 @@ pub struct LayerTable {
 }
 
 impl LayerTable {
-    /// Reserved id of layer "0" — always present.
+    /// Reserved id of the BASE layer — always present, can't be deleted
+    /// or renamed (DXF / RSM round-trip would break). Default name
+    /// "LAYER B"; default color ACI 7 (white). Kept as
+    /// `LAYER_ZERO` for backward compat AND aliased as `LAYER_BASE`
+    /// for new code that prefers the descriptive name.
     pub const LAYER_ZERO: LayerId = 0;
+    pub const LAYER_BASE: LayerId = 0;
 
     /// Constructed with layer "0" only. Active layer = 0.
     pub fn with_defaults() -> Self {
@@ -132,10 +144,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_have_layer_zero() {
+    fn defaults_have_layer_base() {
         let t = LayerTable::with_defaults();
         assert_eq!(t.len(), 1);
-        assert_eq!(t.get(0).unwrap().name, "0");
+        assert_eq!(t.get(0).unwrap().name, "LAYER B");
         assert_eq!(t.active, 0);
     }
 
