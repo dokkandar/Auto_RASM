@@ -113,6 +113,24 @@ pub enum Command {
     /// Save the current document to disk (.dxf or .rsm). Extension
     /// determines the format.
     SaveAs(String),
+    /// Switch the active drawing tool — emitted when the user types a
+    /// drawing keyword (`line` / `circle` / `arc` / `ellipse` / …) with
+    /// NO coordinate arguments. The app sets self.tool to the matching
+    /// variant and the user proceeds with clicks.
+    SetTool(ToolKind),
+}
+
+/// Parser-level mirror of the app's `Tool` enum. The app maps each
+/// variant to its own `Tool` when dispatching `Command::SetTool`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ToolKind {
+    Line,
+    Circle,
+    Arc,
+    Ellipse,
+    EllipseArc,
+    Point,
+    Polyline,
 }
 
 pub fn parse(line: &str) -> Result<Command, String> {
@@ -131,7 +149,7 @@ pub fn parse(line: &str) -> Result<Command, String> {
 
     match head.as_str() {
         "line"   | "l"  => parse_line(&toks[1..]),
-        "circle" | "c"  => parse_circle(&toks[1..]),
+        "circle" | "ci" => parse_circle(&toks[1..]),
         "ellipse" | "el" => parse_ellipse(&toks[1..]),
         "point"   | "po" => parse_point(&toks[1..]),
         "polyline" | "pl" | "pline" => parse_polyline(&toks[1..]),
@@ -163,7 +181,7 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "crossing"       => Ok(Command::SelectCrossing),
         "last"           => Ok(Command::SelectLast),
         "move" | "m"      => Ok(Command::Move),
-        "copy" | "cp" | "co" => Ok(Command::Copy),
+        "copy" | "c" | "cp" | "co" => Ok(Command::Copy),
         "rotate" | "ro"   => Ok(Command::Rotate),
         "scale" | "sc"    => Ok(Command::Scale),
         "mirror" | "mi"   => Ok(Command::Mirror),
@@ -250,8 +268,12 @@ fn parse_pt(s: &str) -> Result<Vec2, String> {
 }
 
 fn parse_line(args: &[&str]) -> Result<Command, String> {
+    // Bare `line` → enter draw-line mode (interactive). With args, add now.
+    if args.is_empty() {
+        return Ok(Command::SetTool(ToolKind::Line));
+    }
     if args.len() != 2 {
-        return Err("usage: line x1,y1 x2,y2".into());
+        return Err("usage: line  OR  line x1,y1 x2,y2".into());
     }
     Ok(Command::Add(Geom::Line(Line {
         a: parse_pt(args[0])?,
@@ -288,8 +310,12 @@ fn parse_polyline(args: &[&str]) -> Result<Command, String> {
 }
 
 fn parse_circle(args: &[&str]) -> Result<Command, String> {
+    // Bare `circle` / `ci` → enter draw-circle mode. With args, add now.
+    if args.is_empty() {
+        return Ok(Command::SetTool(ToolKind::Circle));
+    }
     if args.len() != 2 {
-        return Err("usage: circle cx,cy r".into());
+        return Err("usage: circle  OR  circle cx,cy r".into());
     }
     let r: f64 = args[1].parse().map_err(|_| "bad radius".to_string())?;
     if r <= 0.0 {

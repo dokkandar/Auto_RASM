@@ -50,7 +50,7 @@ pub use pen::{Pen, PenTable};
 pub use dobject::{next_handle, DObject, Handle};
 pub use document::Document;
 pub use intersect::intersect;
-pub use parser::{parse, Command};
+pub use parser::{parse, Command, ToolKind};
 pub use construct::{
     arc_center_start_end, arc_chord_length, arc_chord_radius, arc_three_points,
     ellipse_center_major_minor,

@@ -699,6 +699,23 @@ impl CadApp {
                     self.history.push(format!("  {}", line));
                 }
             }
+            Ok(Command::SetTool(kind)) => {
+                // Bare drawing keywords (`line`, `circle`, `ci`, `arc`,
+                // `ellipse`, `polyline`, `point`) enter the matching draw
+                // tool. The user then clicks to place points. Pending
+                // points from any prior session are cleared.
+                self.tool = match kind {
+                    ToolKind::Line       => Tool::Line,
+                    ToolKind::Circle     => Tool::Circle,
+                    ToolKind::Arc        => Tool::Arc,
+                    ToolKind::Ellipse    => Tool::Ellipse,
+                    ToolKind::EllipseArc => Tool::EllipseArc,
+                    ToolKind::Point      => Tool::Point,
+                    ToolKind::Polyline   => Tool::Polyline,
+                };
+                self.pending.clear();
+                self.set_prompt(current_hint(self.tool, self.arc_method, 0));
+            }
             Ok(Command::SnapOverride(kind)) => {
                 // PER and TAN need an anchor point — the last clicked point
                 // of an in-progress draw. The other snap kinds (END, MID,
