@@ -1645,29 +1645,50 @@ impl EllipseArc {
     }
 }
 
+/// Characteristic role of a grip point — drives `Geom::with_grip_moved`.
+/// Two opposing quadrant/axis tips (e.g. circle +X and -X) share the same
+/// role because their drag semantic is symmetric (radius change / axis
+/// reflection); the renderer still draws all four squares.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GripRole {
+    LineEndA,
+    LineEndB,
+    LineMid,
+    CircleCenter,
+    CircleQuadrant,
+    ArcEndStart,
+    ArcEndEnd,
+    ArcMid,
+    ArcCenter,
+    EllipseCenter,
+    EllipseMajorTip,        // either +major or -major tip
+    EllipseMinorTip,        // either +minor or -minor tip
+    EllipseArcEndStart,
+    EllipseArcEndEnd,
+    EllipseArcCenter,
+    PolyVertex(usize),
+    PointLoc,
+}
+
 impl Geom {
-    /// Characteristic "grip" points the UI can render as drag handles.
-    /// v1 grip semantics: dragging any grip translates the whole dobject
-    /// by the cursor delta. Per-grip role behaviour (e.g. circle-quadrant
-    /// → change radius) is deferred to v2.
-    ///   - Line:       endpoints + midpoint
-    ///   - Arc:        endpoints + midpoint + center
-    ///   - Circle:     center + 4 quadrants
-    ///   - Ellipse:    center + 4 axis tips
-    ///   - EllipseArc: endpoints + center
-    ///   - Polyline:   every vertex
-    ///   - Point:      the point itself
-    pub fn grip_points(&self) -> Vec<Vec2> {
+    /// Characteristic grip points + their roles. Renderer draws a square
+    /// at each position; `with_grip_moved` knows how to edit the geometry
+    /// based on the role.
+    pub fn grip_points(&self) -> Vec<(Vec2, GripRole)> {
         match self {
-            Geom::Line(l) => vec![l.a, l.b, (l.a + l.b) * 0.5],
+            Geom::Line(l) => vec![
+                (l.a, GripRole::LineEndA),
+                (l.b, GripRole::LineEndB),
+                ((l.a + l.b) * 0.5, GripRole::LineMid),
+            ],
             Geom::Circle(c) => {
                 let r = c.radius;
                 vec![
-                    c.center,
-                    c.center + Vec2::new( r, 0.0),
-                    c.center + Vec2::new( 0.0,  r),
-                    c.center + Vec2::new(-r, 0.0),
-                    c.center + Vec2::new( 0.0, -r),
+                    (c.center, GripRole::CircleCenter),
+                    (c.center + Vec2::new( r, 0.0), GripRole::CircleQuadrant),
+                    (c.center + Vec2::new( 0.0,  r), GripRole::CircleQuadrant),
+                    (c.center + Vec2::new(-r, 0.0), GripRole::CircleQuadrant),
+                    (c.center + Vec2::new( 0.0, -r), GripRole::CircleQuadrant),
                 ]
             }
             Geom::Arc(a) => {
@@ -1677,24 +1698,193 @@ impl Geom {
                     a.radius * mid_t.cos(),
                     a.radius * mid_t.sin(),
                 );
-                vec![e1, e2, mid, a.center]
+                vec![
+                    (e1,        GripRole::ArcEndStart),
+                    (e2,        GripRole::ArcEndEnd),
+                    (mid,       GripRole::ArcMid),
+                    (a.center,  GripRole::ArcCenter),
+                ]
             }
             Geom::Ellipse(el) => {
                 let half = std::f64::consts::FRAC_PI_2;
                 vec![
-                    el.center,
-                    el.point_at(0.0),
-                    el.point_at(half),
-                    el.point_at(std::f64::consts::PI),
-                    el.point_at(std::f64::consts::PI + half),
+                    (el.center,                                GripRole::EllipseCenter),
+                    (el.point_at(0.0),                          GripRole::EllipseMajorTip),
+                    (el.point_at(half),                         GripRole::EllipseMinorTip),
+                    (el.point_at(std::f64::consts::PI),         GripRole::EllipseMajorTip),
+                    (el.point_at(std::f64::consts::PI + half),  GripRole::EllipseMinorTip),
                 ]
             }
             Geom::EllipseArc(ea) => {
                 let (e1, e2) = ea.endpoints();
-                vec![e1, e2, ea.ellipse.center]
+                vec![
+                    (e1, GripRole::EllipseArcEndStart),
+                    (e2, GripRole::EllipseArcEndEnd),
+                    (ea.ellipse.center, GripRole::EllipseArcCenter),
+                ]
             }
-            Geom::Polyline(p) => p.vertices.iter().map(|v| v.pos).collect(),
-            Geom::Point(p) => vec![p.location],
+            Geom::Polyline(p) => p.vertices.iter().enumerate()
+                .map(|(i, v)| (v.pos, GripRole::PolyVertex(i)))
+                .collect(),
+            Geom::Point(p) => vec![(p.location, GripRole::PointLoc)],
+        }
+    }
+
+    /// Produce a new geometry with the given grip moved to `new_pos`.
+    /// All math reuses kernel methods already in this file — this is
+    /// just per-role dispatch.
+    pub fn with_grip_moved(&self, role: GripRole, new_pos: Vec2) -> Geom {
+        match (self, role) {
+            // ---- Line --------------------------------------------------
+            (Geom::Line(l), GripRole::LineEndA) =>
+                Geom::Line(Line { a: new_pos, b: l.b }),
+            (Geom::Line(l), GripRole::LineEndB) =>
+                Geom::Line(Line { a: l.a, b: new_pos }),
+            (Geom::Line(l), GripRole::LineMid) => {
+                let delta = new_pos - (l.a + l.b) * 0.5;
+                Geom::Line(Line { a: l.a + delta, b: l.b + delta })
+            }
+            // ---- Circle ------------------------------------------------
+            (Geom::Circle(c), GripRole::CircleCenter) =>
+                Geom::Circle(Circle { center: new_pos, radius: c.radius }),
+            (Geom::Circle(c), GripRole::CircleQuadrant) => {
+                let new_r = (new_pos - c.center).len().max(EPS);
+                Geom::Circle(Circle { center: c.center, radius: new_r })
+            }
+            // ---- Arc ---------------------------------------------------
+            (Geom::Arc(a), GripRole::ArcCenter) => {
+                let delta = new_pos - a.center;
+                Geom::Arc(Arc {
+                    center: a.center + delta,
+                    radius: a.radius,
+                    start_angle: a.start_angle,
+                    sweep_angle: a.sweep_angle,
+                })
+            }
+            (Geom::Arc(a), GripRole::ArcEndStart) => {
+                // Slide start endpoint along the radial direction at the
+                // new angle; sweep adjusts so the END endpoint stays put.
+                let new_start = (new_pos - a.center).angle()
+                    .rem_euclid(std::f64::consts::TAU);
+                let old_end_abs = (a.start_angle + a.sweep_angle)
+                    .rem_euclid(std::f64::consts::TAU);
+                let new_sweep = (old_end_abs - new_start)
+                    .rem_euclid(std::f64::consts::TAU);
+                Geom::Arc(Arc {
+                    center: a.center,
+                    radius: a.radius,
+                    start_angle: new_start,
+                    sweep_angle: new_sweep.max(EPS),
+                })
+            }
+            (Geom::Arc(a), GripRole::ArcEndEnd) => {
+                let new_end_abs = (new_pos - a.center).angle()
+                    .rem_euclid(std::f64::consts::TAU);
+                let new_sweep = (new_end_abs - a.start_angle)
+                    .rem_euclid(std::f64::consts::TAU);
+                Geom::Arc(Arc {
+                    center: a.center,
+                    radius: a.radius,
+                    start_angle: a.start_angle,
+                    sweep_angle: new_sweep.max(EPS),
+                })
+            }
+            (Geom::Arc(a), GripRole::ArcMid) => {
+                // v1: translate whole arc so the midpoint lands at new_pos.
+                let mid_t = a.start_angle + a.sweep_angle * 0.5;
+                let mid = a.center + Vec2::new(
+                    a.radius * mid_t.cos(),
+                    a.radius * mid_t.sin(),
+                );
+                let delta = new_pos - mid;
+                Geom::Arc(Arc {
+                    center: a.center + delta,
+                    radius: a.radius,
+                    start_angle: a.start_angle,
+                    sweep_angle: a.sweep_angle,
+                })
+            }
+            // ---- Ellipse -----------------------------------------------
+            (Geom::Ellipse(el), GripRole::EllipseCenter) =>
+                Geom::Ellipse(Ellipse {
+                    center: new_pos,
+                    major:  el.major,
+                    ratio:  el.ratio,
+                }),
+            (Geom::Ellipse(el), GripRole::EllipseMajorTip) => {
+                // Major axis becomes (new_pos - center). Ratio (b/a) stays
+                // so b scales proportionally. Direction of the ellipse
+                // also rotates to match.
+                let new_major = new_pos - el.center;
+                if new_major.len() < EPS {
+                    return Geom::Ellipse(*el);
+                }
+                Geom::Ellipse(Ellipse {
+                    center: el.center,
+                    major:  new_major,
+                    ratio:  el.ratio,
+                })
+            }
+            (Geom::Ellipse(el), GripRole::EllipseMinorTip) => {
+                // Hold major direction + length; change ratio so the
+                // minor tip lands at the projection of new_pos onto v̂.
+                let new_b = (new_pos - el.center).dot(el.v_hat()).abs().max(EPS);
+                let new_ratio = (new_b / el.semi_major()).max(1e-6);
+                Geom::Ellipse(Ellipse {
+                    center: el.center,
+                    major:  el.major,
+                    ratio:  new_ratio,
+                })
+            }
+            // ---- EllipseArc --------------------------------------------
+            (Geom::EllipseArc(ea), GripRole::EllipseArcCenter) => {
+                let delta = new_pos - ea.ellipse.center;
+                Geom::EllipseArc(EllipseArc {
+                    ellipse: Ellipse {
+                        center: ea.ellipse.center + delta,
+                        ..ea.ellipse
+                    },
+                    start_param: ea.start_param,
+                    sweep_param: ea.sweep_param,
+                })
+            }
+            (Geom::EllipseArc(ea), GripRole::EllipseArcEndStart) => {
+                // Re-project new_pos to the ellipse parameter; new start_param
+                // = that t; sweep_param adjusts so the END endpoint stays.
+                let new_start = ea.ellipse.nearest_param(new_pos)
+                    .rem_euclid(std::f64::consts::TAU);
+                let old_end = (ea.start_param + ea.sweep_param)
+                    .rem_euclid(std::f64::consts::TAU);
+                let new_sweep = (old_end - new_start)
+                    .rem_euclid(std::f64::consts::TAU);
+                Geom::EllipseArc(EllipseArc {
+                    ellipse: ea.ellipse,
+                    start_param: new_start,
+                    sweep_param: new_sweep.max(EPS),
+                })
+            }
+            (Geom::EllipseArc(ea), GripRole::EllipseArcEndEnd) => {
+                let new_end = ea.ellipse.nearest_param(new_pos)
+                    .rem_euclid(std::f64::consts::TAU);
+                let new_sweep = (new_end - ea.start_param)
+                    .rem_euclid(std::f64::consts::TAU);
+                Geom::EllipseArc(EllipseArc {
+                    ellipse: ea.ellipse,
+                    start_param: ea.start_param,
+                    sweep_param: new_sweep.max(EPS),
+                })
+            }
+            // ---- Polyline ----------------------------------------------
+            (Geom::Polyline(p), GripRole::PolyVertex(i)) => {
+                let mut new_verts = p.vertices.clone();
+                if let Some(v) = new_verts.get_mut(i) { v.pos = new_pos; }
+                Geom::Polyline(Polyline { vertices: new_verts, closed: p.closed })
+            }
+            // ---- Point -------------------------------------------------
+            (Geom::Point(p), GripRole::PointLoc) =>
+                Geom::Point(Point { location: new_pos, style: p.style, size: p.size }),
+            // Mismatched (role, geom) — return unchanged.
+            (g, _) => g.clone(),
         }
     }
 }
@@ -2462,6 +2652,73 @@ mod fillet_chamfer_join_tests {
     // --- offset: ellipse / EllipseArc → Polyline approximation --------
 
     // --- trim: Polyline (explode + trim) ---------------------------------
+
+    // --- grips: per-role semantics ---------------------------------------
+
+    #[test]
+    fn grip_line_endpoint_moves_only_that_end() {
+        let g = Geom::Line(ln(0.0, 0.0, 10.0, 0.0));
+        let out = g.with_grip_moved(GripRole::LineEndA, Vec2::new(2.0, 5.0));
+        if let Geom::Line(l) = out {
+            assert!(approx_eq(l.a.x, 2.0)); assert!(approx_eq(l.a.y, 5.0));
+            assert!(approx_eq(l.b.x, 10.0)); assert!(approx_eq(l.b.y, 0.0));
+        } else { panic!(); }
+    }
+
+    #[test]
+    fn grip_line_midpoint_translates_whole_line() {
+        let g = Geom::Line(ln(0.0, 0.0, 10.0, 0.0));
+        // Original midpoint = (5,0). Move to (5,3) → delta (0,3).
+        let out = g.with_grip_moved(GripRole::LineMid, Vec2::new(5.0, 3.0));
+        if let Geom::Line(l) = out {
+            assert!(approx_eq(l.a.y, 3.0));
+            assert!(approx_eq(l.b.y, 3.0));
+            assert!(approx_eq(l.a.x, 0.0));
+            assert!(approx_eq(l.b.x, 10.0));
+        } else { panic!(); }
+    }
+
+    #[test]
+    fn grip_circle_quadrant_changes_radius() {
+        let g = Geom::Circle(Circle { center: Vec2::ZERO, radius: 1.0 });
+        // Drag a quadrant to (3, 4) → new radius = 5.
+        let out = g.with_grip_moved(GripRole::CircleQuadrant, Vec2::new(3.0, 4.0));
+        if let Geom::Circle(c) = out {
+            assert!(approx_eq(c.center.x, 0.0));
+            assert!(approx_eq(c.center.y, 0.0));
+            assert!(approx_eq(c.radius, 5.0));
+        } else { panic!(); }
+    }
+
+    #[test]
+    fn grip_circle_center_translates() {
+        let g = Geom::Circle(Circle { center: Vec2::ZERO, radius: 2.0 });
+        let out = g.with_grip_moved(GripRole::CircleCenter, Vec2::new(7.0, 8.0));
+        if let Geom::Circle(c) = out {
+            assert!(approx_eq(c.center.x, 7.0));
+            assert!(approx_eq(c.center.y, 8.0));
+            assert!(approx_eq(c.radius, 2.0));
+        } else { panic!(); }
+    }
+
+    #[test]
+    fn grip_polyline_vertex_moves_only_that_vertex() {
+        let pl = Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(4.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(4.0, 4.0), bulge: 0.0 },
+            ],
+            closed: false,
+        };
+        let g = Geom::Polyline(pl);
+        let out = g.with_grip_moved(GripRole::PolyVertex(1), Vec2::new(4.0, -2.0));
+        if let Geom::Polyline(p) = out {
+            assert!(approx_eq(p.vertices[0].pos.y, 0.0));
+            assert!(approx_eq(p.vertices[1].pos.y, -2.0));
+            assert!(approx_eq(p.vertices[2].pos.y, 4.0));
+        } else { panic!(); }
+    }
 
     #[test]
     fn trim_polyline_segment_drops_clicked_sub_segment() {

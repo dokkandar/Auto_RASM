@@ -403,12 +403,16 @@ pub enum LengthenState { Off, WaitingForSide(f64) }
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum BreakState    { Off, WaitingForPoint }
 
-/// Grip drag — recorded when the user presses-and-drags on a grip handle
-/// of a currently-selected dobject. v1: translate the dobject by the
-/// cursor delta from `grip_origin`.
+/// Grip drag — recorded when the user grabs a grip handle of a selected
+/// dobject (either by pressing+dragging OR clicking on it). v2: each grip
+/// has a role (`GripRole`) that decides what changes when the user moves
+/// it (e.g. line endpoint moves only that endpoint; circle quadrant
+/// changes radius; line midpoint translates the whole line). Math lives
+/// in `cad_kernel::Geom::with_grip_moved`.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct GripDrag {
     pub dobject_idx: usize,
+    pub role:        GripRole,
     pub grip_origin: Vec2,
 }
 
@@ -4815,54 +4819,72 @@ impl eframe::App for CadApp {
             // a real window-rubber-band drag isn't fired as a click.
             let drag_was_a_click = drag_stopped
                 && (in_click_only_phase || press_release_dist < 5.0);
-            // ---- Grip drag handling (v1: any-grip-drag translates) ---------
-            // When in pointer mode + GrpEnb + selection is non-empty, watch
-            // for a primary-button drag that starts close to one of the
-            // rendered grip squares. If hit, capture (dobject_idx, grip_pos)
-            // and suppress the normal click promotion below.
+            // ---- Grip drag handling (v2: per-grip role semantics) -----------
+            // Two ways to grab a grip in pointer mode + GrpEnb:
+            //   (a) press-and-drag (release = commit)
+            //   (b) click-to-grab → cursor moves → click again to place
+            // Both paths set self.grip_drag with the GripRole; the kernel's
+            // Geom::with_grip_moved() decides what changes (e.g. circle
+            // quadrant → radius; line midpoint → translate whole line).
             let pointer_mode_idle = !in_click_only_phase && self.select_mode == SelectMode::Off;
             let mut grip_drag_consumed_click = false;
             if pointer_mode_idle && self.env.GrpEnb {
                 let drag_started = resp.drag_started_by(egui::PointerButton::Primary);
-                if drag_started && self.grip_drag.is_none() {
+                // (a) Drag-grab: a primary-button drag begins near a grip.
+                // (b) Click-grab: a clicked() event lands near a grip AND
+                //     no grip is currently held.
+                let try_grab = drag_started
+                    || (click_now && self.grip_drag.is_none());
+                if try_grab && self.grip_drag.is_none() {
                     if let Some(pos) = resp.interact_pointer_pos() {
                         let cur_world = self.s2w(pos, rect);
                         let tol = (self.env.GrpSz as f64 + 4.0) / self.scale as f64;
-                        // Scan every selected dobject's grip points.
                         let mut targets: Vec<usize> = self.selection.clone();
                         if let Some(s) = self.selected { targets.push(s); }
                         targets.sort_unstable(); targets.dedup();
                         'outer: for &idx in &targets {
                             let Some(d) = self.doc.dobjects.get(idx) else { continue; };
-                            for gp in d.geom.grip_points() {
+                            for (gp, role) in d.geom.grip_points() {
                                 if cur_world.dist(gp) < tol {
                                     self.grip_drag = Some(GripDrag {
                                         dobject_idx: idx,
+                                        role,
                                         grip_origin: gp,
                                     });
+                                    // Don't treat this click as a "select-
+                                    // toggle click" — it's a grab.
+                                    grip_drag_consumed_click = true;
                                     break 'outer;
                                 }
                             }
                         }
                     }
                 }
-                // Commit grip drag on release.
+                // Commit on drag_stopped (path a) OR on a subsequent click
+                // anywhere on the canvas (path b).
                 if let Some(gd) = self.grip_drag {
-                    if resp.drag_stopped_by(egui::PointerButton::Primary) {
+                    let drag_release  = resp.drag_stopped_by(egui::PointerButton::Primary);
+                    let click_release = click_now && !grip_drag_consumed_click;
+                    if drag_release || click_release {
                         if let Some(pos) = resp.interact_pointer_pos() {
                             let drop_world = self.s2w(pos, rect);
                             let delta = drop_world - gd.grip_origin;
+                            // Suppress accidental no-op drags (tiny mouse
+                            // jitter). Click-grab pairs may legitimately
+                            // have zero motion if user clicks twice on the
+                            // same spot — that's a no-op, just clear state.
                             if delta.len() > 1e-9 {
                                 self.snapshot_doc();
                                 if let Some(d) = self.doc.dobjects.get_mut(gd.dobject_idx) {
-                                    d.geom = d.geom.translated(delta);
+                                    d.geom = d.geom.with_grip_moved(gd.role, drop_world);
                                 }
                                 self.intersections.clear();
                                 self.index_dirty = true;
                                 self.gpu_dirty = true;
                                 self.history.push(format!(
-                                    "  ⊕ grip: #{} moved by ({:.3}, {:.3})",
-                                    gd.dobject_idx, delta.x, delta.y));
+                                    "  ⊕ grip: #{} {:?} → ({:.3}, {:.3})",
+                                    gd.dobject_idx, gd.role,
+                                    drop_world.x, drop_world.y));
                             }
                         }
                         self.grip_drag = None;
@@ -5805,17 +5827,23 @@ impl eframe::App for CadApp {
                 for idx in &grip_targets {
                     let Some(d) = self.doc.dobjects.get(*idx) else { continue; };
                     // If this dobject is the active drag target, preview
-                    // it translated by delta.
-                    let preview_geom = if let (Some(delta), Some(gd)) = (drag_delta, self.grip_drag) {
-                        if gd.dobject_idx == *idx { Some(d.geom.translated(delta)) } else { None }
+                    // the role-specific edit at the cursor position.
+                    let preview_geom = if let Some(gd) = self.grip_drag {
+                        if gd.dobject_idx == *idx {
+                            if let Some(cur) = resp.hover_pos() {
+                                let w = self.s2w(cur, rect);
+                                Some(d.geom.with_grip_moved(gd.role, w))
+                            } else { None }
+                        } else { None }
                     } else { None };
+                    let _ = drag_delta;  // legacy; preview now uses with_grip_moved
                     let geom_ref = preview_geom.as_ref().unwrap_or(&d.geom);
                     // Ghost the dobject in dim white during the drag.
                     if preview_geom.is_some() {
                         draw_dobject(&painter, rect, self, geom_ref,
                             egui::Color32::from_rgba_unmultiplied(255, 255, 255, 160));
                     }
-                    for gp in geom_ref.grip_points() {
+                    for (gp, _role) in geom_ref.grip_points() {
                         let sp = self.w2s(gp, rect);
                         let r = egui::Rect::from_center_size(
                             sp, egui::vec2(gsz * 2.0, gsz * 2.0));
