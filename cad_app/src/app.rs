@@ -3451,6 +3451,63 @@ impl CadApp {
         )
     }
 
+    /// The "from" point that ortho (lock drafting orientation) constrains
+    /// the cursor against — the most recent locked-in point in whatever
+    /// command is active. None means ortho has no anchor and therefore
+    /// no effect this frame (e.g. waiting for the first endpoint of a
+    /// line, or no active command at all).
+    fn ortho_anchor(&self) -> Option<Vec2> {
+        if let MoveState::WaitingForDest(base) = self.move_state { return Some(base); }
+        if let CopyState::WaitingForDest(base) = self.copy_state { return Some(base); }
+        if let MirrorState::WaitingForB(a)    = self.mirror_state { return Some(a); }
+        if let StretchState::WaitingForDest(_, _, base) = self.stretch_state { return Some(base); }
+        // Polyline / Line / Arc draw tools: the last captured point is
+        // the ortho anchor for the next click.
+        if matches!(self.tool, Tool::Line | Tool::Polyline | Tool::Arc | Tool::Ellipse | Tool::EllipseArc) {
+            if let Some(p) = self.pending.last().copied() { return Some(p); }
+        }
+        None
+    }
+
+    /// Apply ortho + grid-snap constraints to a raw world position. Order:
+    ///   1. Ortho first if enabled AND an anchor exists — projects onto
+    ///      whichever axis from the anchor is closer (pure horizontal or
+    ///      vertical move).
+    ///   2. Grid-snap second if enabled — rounds to the nearest
+    ///      `GrdSpc` multiple in both axes.
+    /// Object-snap is NOT handled here; callers apply it BEFORE this so
+    /// osnap always wins over both ortho and grid (the AutoCAD priority).
+    fn apply_constraints(&self, raw: Vec2) -> Vec2 {
+        let mut p = raw;
+        if self.env.OrtEnb {
+            if let Some(a) = self.ortho_anchor() {
+                let dx = (p.x - a.x).abs();
+                let dy = (p.y - a.y).abs();
+                if dx >= dy { p.y = a.y; } else { p.x = a.x; }
+            }
+        }
+        if self.env.GrdSnp && self.env.GrdSpc > 0.0 {
+            let s = self.env.GrdSpc;
+            p.x = (p.x / s).round() * s;
+            p.y = (p.y / s).round() * s;
+        }
+        p
+    }
+
+    /// World position of the cursor with all current constraints applied
+    /// in AutoCAD priority: osnap > ortho > grid-snap > raw. Used both
+    /// for click-capture and for live-preview rendering so the user
+    /// sees exactly what the click will produce.
+    fn cursor_world_constrained(
+        &self,
+        screen_pos: Option<egui::Pos2>,
+        rect: egui::Rect,
+        snap_hit: Option<Vec2>,
+    ) -> Option<Vec2> {
+        if let Some(w) = snap_hit { return Some(w); }    // osnap wins
+        screen_pos.map(|p| self.apply_constraints(self.s2w(p, rect)))
+    }
+
     /// Find the dobject nearest to a world point, within `tol_world`. Uses the
     /// spatial index when available so it's cheap even at millions of dobjects.
     fn nearest_entity_under(&self, w: Vec2, tol_world: f64) -> Option<usize> {
@@ -4323,6 +4380,26 @@ impl eframe::App for CadApp {
             } else {
                 self.fps_smooth * 0.9 + instant * 0.1
             };
+        }
+
+        // global drafting-mode toggles (AutoCAD F-keys). Fire on key-press
+        // anywhere — they're modeless and don't interfere with text input
+        // since F-keys aren't typeable characters. Each one persists via
+        // env.save() so the state survives restart.
+        if ctx.input(|i| i.key_pressed(egui::Key::F7)) {
+            self.env.GrdEnb = !self.env.GrdEnb;
+            let _ = self.env.save();
+            self.history.push(format!("  GRID {}", if self.env.GrdEnb { "on" } else { "off" }));
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::F8)) {
+            self.env.OrtEnb = !self.env.OrtEnb;
+            let _ = self.env.save();
+            self.history.push(format!("  ORTHO {}", if self.env.OrtEnb { "on" } else { "off" }));
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::F9)) {
+            self.env.GrdSnp = !self.env.GrdSnp;
+            let _ = self.env.save();
+            self.history.push(format!("  SNAP {}", if self.env.GrdSnp { "on" } else { "off" }));
         }
 
         // global Esc: cancel any in-progress draw or pick / intersect / select mode
@@ -5341,6 +5418,38 @@ impl eframe::App for CadApp {
                             let _ = self.env.save();
                         }
                         ui.separator();
+                        // Drafting-mode toggles: GRID (F7), SNAP (F9), ORTHO (F8).
+                        // Clickable badges (same affordance as the osnap row).
+                        let drafting_badge = |ui: &mut egui::Ui, label: &str, on: bool, tip: &str| {
+                            let col = if on {
+                                egui::Color32::from_rgb(120, 240, 255)
+                            } else {
+                                egui::Color32::from_rgb(80, 90, 105)
+                            };
+                            let resp = ui.add(egui::Label::new(
+                                egui::RichText::new(label).monospace().small().color(col)
+                            ).sense(egui::Sense::click()));
+                            resp.on_hover_text(tip).clicked()
+                        };
+                        if drafting_badge(ui, "ORTHO", self.env.OrtEnb,
+                            "Lock drafting orientation (F8) — cursor pulled to horizontal or vertical from the anchor point.")
+                        {
+                            self.env.OrtEnb = !self.env.OrtEnb;
+                            let _ = self.env.save();
+                        }
+                        if drafting_badge(ui, "SNAP", self.env.GrdSnp,
+                            "Snap to grid (F9) — cursor rounds to the nearest GrdSpc multiple.")
+                        {
+                            self.env.GrdSnp = !self.env.GrdSnp;
+                            let _ = self.env.save();
+                        }
+                        if drafting_badge(ui, "GRID", self.env.GrdEnb,
+                            "Show grid (F7) — dots at GrdSpc world-unit intervals.")
+                        {
+                            self.env.GrdEnb = !self.env.GrdEnb;
+                            let _ = self.env.save();
+                        }
+                        ui.separator();
                         // Snap badges — click any letter to toggle.
                         for k in SnapKind::ALL {
                             let on = self.snap_enabled.is_enabled(k);
@@ -5483,6 +5592,39 @@ impl eframe::App for CadApp {
             let rect = resp.rect;
 
             painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(18, 22, 28));
+
+            // ---- Background grid (GrdEnb) ---------------------------------
+            //
+            // Renders a dot grid at GrdSpc world-unit intervals across the
+            // visible viewport. Skips entirely if disabled, if spacing is
+            // non-positive, or if the spacing would produce > 50 000 dots
+            // (zoomed too far out — would be a black smear anyway). Drawn
+            // BEFORE dobjects so they sit on top of it. The same GrdSpc
+            // value is what GrdSnp rounds to.
+            if self.env.GrdEnb && self.env.GrdSpc > 0.0 {
+                let s = self.env.GrdSpc;
+                let bl = self.s2w(rect.left_bottom(), rect);
+                let tr = self.s2w(rect.right_top(),   rect);
+                let x0 = (bl.x / s).floor() * s;
+                let y0 = (bl.y / s).floor() * s;
+                let x1 = (tr.x / s).ceil()  * s;
+                let y1 = (tr.y / s).ceil()  * s;
+                let cols = ((x1 - x0) / s).round() as i64 + 1;
+                let rows = ((y1 - y0) / s).round() as i64 + 1;
+                if cols > 0 && rows > 0 && (cols * rows) < 50_000 {
+                    let dot_col = egui::Color32::from_rgb(60, 70, 85);
+                    let mut y = y0;
+                    while y <= y1 + s * 0.5 {
+                        let mut x = x0;
+                        while x <= x1 + s * 0.5 {
+                            let p = self.w2s(Vec2::new(x, y), rect);
+                            painter.circle_filled(p, 0.9, dot_col);
+                            x += s;
+                        }
+                        y += s;
+                    }
+                }
+            }
 
             // pan with middle/right drag
             if resp.dragged_by(egui::PointerButton::Middle)
@@ -5806,11 +5948,15 @@ impl eframe::App for CadApp {
             }
             if click_fired {
                 if let Some(pos) = resp.interact_pointer_pos() {
+                    // `world` keeps its old meaning (raw cursor world pos)
+                    // for downstream branches that need it unconstrained
+                    // (selection hit-test, intersect-click, etc.).
                     let world = self.s2w(pos, rect);
-                    // Use the snap point if one is active — same convention
-                    // as the draw tools, so move base / destination can land
-                    // on END / MID / CEN / etc.
-                    let click_world = snap_hit.map(|h| h.point).unwrap_or(world);
+                    // AutoCAD priority for the captured POINT: osnap > ortho
+                    // > grid-snap > raw. Used wherever a click commits a
+                    // point (line endpoint, move base/dest, …).
+                    let click_world = snap_hit.map(|h| h.point)
+                        .unwrap_or_else(|| self.apply_constraints(world));
 
                     if self.move_state != MoveState::Off {
                         match self.move_state {
@@ -7185,8 +7331,8 @@ impl eframe::App for CadApp {
                 );
 
                 if let MoveState::WaitingForDest(base) = self.move_state {
-                    let cur_world = snap_hit.map(|h| h.point)
-                        .or_else(|| resp.hover_pos().map(|p| self.s2w(p, rect)));
+                    let cur_world = self.cursor_world_constrained(
+                        resp.hover_pos(), rect, snap_hit.map(|h| h.point));
                     if let Some(cw) = cur_world {
                         let v = cw - base;
                         let base_s = self.w2s(base, rect);
@@ -7232,8 +7378,8 @@ impl eframe::App for CadApp {
                 );
 
                 if let CopyState::WaitingForDest(base) = self.copy_state {
-                    let cur_world = snap_hit.map(|h| h.point)
-                        .or_else(|| resp.hover_pos().map(|p| self.s2w(p, rect)));
+                    let cur_world = self.cursor_world_constrained(
+                        resp.hover_pos(), rect, snap_hit.map(|h| h.point));
                     if let Some(cw) = cur_world {
                         let v = cw - base;
                         let base_s = self.w2s(base, rect);
@@ -7322,18 +7468,23 @@ impl eframe::App for CadApp {
             // a cross through it at the hover position. Same visual cue
             // AutoCAD uses to tell the user "I'm in command, click to
             // place a point". This is also when press-fires-click is in
-            // effect — see the click pipeline override above. Drawn
+            // effect — see the click pipeline override above.
+            //
+            // The cross sits at the CONSTRAINED position (after osnap /
+            // ortho / grid-snap) so the user sees exactly where the
+            // click will land, not where their raw cursor is. Drawn
             // last so it sits on top of dobjects and previews.
             if in_click_only_phase {
-                if let Some(p) = resp.hover_pos() {
+                if let Some(raw_p) = resp.hover_pos() {
+                    let constrained_world = snap_hit.map(|h| h.point)
+                        .unwrap_or_else(|| self.apply_constraints(self.s2w(raw_p, rect)));
+                    let p = self.w2s(constrained_world, rect);
                     let half  = 7.0_f32;     // pickbox half-edge in px
                     let arm   = 14.0_f32;    // crosshair arm half-length
                     let col   = egui::Color32::from_rgb(235, 235, 245);
                     let stroke= egui::Stroke::new(1.0, col);
-                    // square
                     let sq = egui::Rect::from_center_size(p, egui::vec2(half*2.0, half*2.0));
                     painter.rect_stroke(sq, 0.0, stroke);
-                    // cross arms (extend a bit past the square edges)
                     painter.line_segment(
                         [egui::pos2(p.x - arm, p.y), egui::pos2(p.x + arm, p.y)], stroke);
                     painter.line_segment(

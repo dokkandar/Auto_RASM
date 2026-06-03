@@ -89,6 +89,25 @@ pub struct UserEnv {
     /// Grip size in pixels.
     pub GrpSz:  u8,
 
+    // ---- grid + ortho ----
+    /// Background grid display (AutoCAD GRIDMODE). ON = render the grid
+    /// overlay; OFF = clean canvas. F7 toggles.
+    pub GrdEnb: bool,
+    /// Snap cursor to grid intersections (AutoCAD SNAPMODE). When ON and
+    /// the cursor is in drafting mode, world coords are rounded to the
+    /// nearest `GrdSpc` multiple before being used for click capture
+    /// or live preview. F9 toggles. Osnap (object snap) wins over this.
+    pub GrdSnp: bool,
+    /// Grid spacing in world units (AutoCAD GRIDUNIT). Same value used
+    /// for the display grid AND for snap-to-grid rounding.
+    pub GrdSpc: f64,
+    /// Lock drafting orientation — AutoCAD's ORTHO mode. When ON and a
+    /// "from" point exists (line's first endpoint, move base, copy
+    /// base, …), the cursor's world position is projected onto whichever
+    /// of the two axes from that anchor is closer, so the result is a
+    /// pure horizontal or vertical move. F8 toggles.
+    pub OrtEnb: bool,
+
     // ---- external references ----
     /// External-reference demand-loading mode.
     /// 0 = off, 1 = on, 2 = on with copy (work on a temp duplicate).
@@ -123,6 +142,10 @@ impl Default for UserEnv {
             GrClrU: 0x4099FF,    // light blue
             GrClrS: 0xFF6464,    // red-pink
             GrpSz:  4,
+            GrdEnb: true,
+            GrdSnp: false,
+            GrdSpc: 10.0,
+            OrtEnb: false,
             XrLdMd: 2,
             XrTmpP: String::new(),
         }
@@ -191,6 +214,10 @@ impl UserEnv {
         push_u32(&mut s, "GrClrU", self.GrClrU);
         push_u32(&mut s, "GrClrS", self.GrClrS);
         push_u8(&mut s, "GrpSz",  self.GrpSz);
+        push_bool(&mut s, "GrdEnb", self.GrdEnb);
+        push_bool(&mut s, "GrdSnp", self.GrdSnp);
+        push_f64(&mut s, "GrdSpc", self.GrdSpc);
+        push_bool(&mut s, "OrtEnb", self.OrtEnb);
         push_u8(&mut s, "XrLdMd", self.XrLdMd);
         push_str(&mut s, "XrTmpP", &self.XrTmpP);
         fs::write(&path, s)
@@ -238,6 +265,10 @@ impl UserEnv {
             "GrClrU" => if let Some(v) = parse_u32(val) { self.GrClrU = v; }
             "GrClrS" => if let Some(v) = parse_u32(val) { self.GrClrS = v; }
             "GrpSz"  => if let Ok(v) = val.parse() { self.GrpSz = v; }
+            "GrdEnb" => if let Some(v) = parse_bool(val) { self.GrdEnb = v; }
+            "GrdSnp" => if let Some(v) = parse_bool(val) { self.GrdSnp = v; }
+            "GrdSpc" => if let Ok(v) = val.parse() { self.GrdSpc = v; }
+            "OrtEnb" => if let Some(v) = parse_bool(val) { self.OrtEnb = v; }
             "XrLdMd" => if let Ok(v) = val.parse() { self.XrLdMd = v; }
             "XrTmpP" => self.XrTmpP = val.to_string(),
             _ => {}     // unknown — forward-compatible
