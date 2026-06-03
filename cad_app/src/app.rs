@@ -32,6 +32,12 @@ fn aci_mapping_path() -> std::path::PathBuf {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tool { None, Line, Circle, Arc, Ellipse, EllipseArc, Point, Polyline }
 
+/// Sub-mode for the polyline draw tool — mirrors AutoCAD PLINE's Line /
+/// Arc toggle. `a` (or `arc`) switches Line→Arc; `l` (or `line`)
+/// switches Arc→Line. Independent from `Tool::Arc` (a separate draw tool).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PlineMode { Line, Arc }
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ArcMethod {
     ThreePoints,
@@ -169,6 +175,16 @@ pub struct CadApp {
     arc_method:    ArcMethod,
     arc_picker_open: bool,
     pending:       Vec<Vec2>,
+    /// Per-segment bulge for the polyline tool. `pending_bulges[i]` is the
+    /// AutoCAD bulge (tan(theta/4)) of the segment from `pending[i]` to
+    /// `pending[i+1]`, so it's always one shorter than `pending` while
+    /// drawing. `0.0` = straight segment. Maintained only by the polyline
+    /// tool — other tools leave it empty.
+    pending_bulges: Vec<f64>,
+    /// Polyline draw sub-mode (AutoCAD PLINE's Line / Arc toggle).
+    /// Toggled inline by typing `a` (Arc) or `l` (Line) while pline is
+    /// active. Each captured vertex inherits this mode's segment kind.
+    pline_mode:    PlineMode,
 
     scale:        f32,
     world_offset: egui::Vec2,
@@ -581,6 +597,8 @@ impl Default for CadApp {
             arc_method:    ArcMethod::ThreePoints,
             arc_picker_open: false,
             pending:       Vec::new(),
+            pending_bulges: Vec::new(),
+            pline_mode:    PlineMode::Line,
             scale:         6.0,
             world_offset:  egui::Vec2::ZERO,
             array_open:     false,
@@ -741,6 +759,60 @@ impl CadApp {
         let trimmed = raw.trim();
         // Any non-empty input cancels the 2-stage-Enter notice.
         self.empty_enter_count_in_select = 0;
+
+        // ---- PLINE sub-command intercept (AutoCAD PLINE Line/Arc flow) ----
+        //
+        // While the polyline tool is active, single-letter inputs are
+        // PLINE SUB-COMMANDS, not the same-letter global commands.
+        // Phase 1 wires the most-used three; the remaining options
+        // (W/H/Length/Center/Direction/Radius/Second-pt/Angle) print
+        // "not yet wired" so the user knows they're recognised but
+        // queued. The prompt mentions all of them.
+        if self.tool == Tool::Polyline {
+            let lc = trimmed.to_ascii_lowercase();
+            match lc.as_str() {
+                "a" | "arc" => {
+                    self.pline_mode = PlineMode::Arc;
+                    self.update_pline_prompt();
+                    return;
+                }
+                "l" | "line" if self.pline_mode == PlineMode::Arc => {
+                    self.pline_mode = PlineMode::Line;
+                    self.update_pline_prompt();
+                    return;
+                }
+                "u" | "undo" => {
+                    if let Some(last) = self.pending.pop() {
+                        self.pending_bulges.pop();
+                        self.history.push(format!(
+                            "  pline: removed vertex ({:.3},{:.3})",
+                            last.x, last.y));
+                        self.update_pline_prompt();
+                    } else {
+                        self.history.push("  ! pline: nothing to undo".into());
+                    }
+                    return;
+                }
+                // Recognised-but-not-wired sub-options: tell the user
+                // they're known so they don't keep retyping. Wire-up
+                // lands in the Phase 2 slice.
+                "w" | "width"
+                | "h" | "halfwidth"
+                | "len" | "length"
+                | "ce" | "center"
+                | "d" | "direction"
+                | "r" | "radius"
+                | "s" | "second"
+                | "ang" | "angle" => {
+                    self.history.push(format!(
+                        "  pline: sub-option '{}' recognised but not yet wired (Phase 2)",
+                        trimmed));
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         // ---- Rotate sub-command intercept (AutoCAD ROTATE flow) -----
         // During WaitingForAngle: typing a NUMBER applies that rotation
         // (degrees, CCW positive); typing `r` switches to reference
@@ -3513,6 +3585,162 @@ impl CadApp {
         )
     }
 
+    /// Live PLINE prompt — reflects current Line/Arc sub-mode + vertex
+    /// count. AutoCAD bracket-list of options matches the spec the user
+    /// provided. Phase-2 sub-options appear in the prompt so the user
+    /// knows they're recognised even though they print "not yet wired"
+    /// when typed.
+    fn update_pline_prompt(&mut self) {
+        let n = self.pending.len();
+        let prompt = match (self.pline_mode, n) {
+            (PlineMode::Line, 0) =>
+                "pline: click FIRST vertex  [Esc=cancel]".to_string(),
+            (PlineMode::Line, _) => format!(
+                "pline ({} vert): click next  \
+                [Arc / Halfwidth / Length / Undo / Width  |  Enter=finish, 'c' Enter=close]",
+                n),
+            (PlineMode::Arc,  _) => format!(
+                "pline·ARC ({} vert): click endpoint  \
+                [Angle / CEnter / Direction / Halfwidth / Line / Radius / Second / Undo / Width  |  Enter=finish, 'c' Enter=close]",
+                n),
+        };
+        self.set_prompt(prompt);
+    }
+
+    /// PLINE arc-mode helper: the exit tangent of the most recently
+    /// captured segment, used to make the next arc tangent-continuous.
+    /// Returns None if there's no previous segment (just the very first
+    /// vertex captured) — callers fall back to a default direction.
+    fn pline_previous_exit_tangent(&self) -> Option<Vec2> {
+        let n = self.pending.len();
+        if n < 2 { return None; }
+        let a = self.pending[n - 2];
+        let b = self.pending[n - 1];
+        let chord = b - a;
+        if chord.len() < EPS { return None; }
+        // Bulge of the segment ENDING at the previous vertex.
+        let bulge = self.pending_bulges.get(n - 2).copied().unwrap_or(0.0);
+        let alpha = 2.0 * bulge.atan();
+        // Rotate the chord by -alpha (CW by alpha) to get the exit
+        // tangent at the end of the segment. For a straight segment
+        // (bulge = 0) this is the chord direction unchanged.
+        let c = (-alpha).cos();
+        let s = (-alpha).sin();
+        let rotated = Vec2::new(
+            chord.x * c - chord.y * s,
+            chord.x * s + chord.y * c,
+        );
+        let len = rotated.len();
+        if len < EPS { None } else { Some(rotated / len) }
+    }
+
+    /// Pack the in-progress pline positions + per-segment bulges into a
+    /// `Vec<PolyVertex>` ready for the kernel, and reset all transient
+    /// pline state. `closed` selects whether the last bulge slot
+    /// (segment from final vertex back to first) is set; it stays 0 in
+    /// the MVP since `c`/close was a Line-mode action.
+    fn drain_pline_pending(&mut self, closed: bool) -> Vec<PolyVertex> {
+        let n = self.pending.len();
+        let mut verts = Vec::with_capacity(n);
+        for (i, p) in self.pending.drain(..).enumerate() {
+            // bulge[i] is the segment from vertex i to vertex i+1. For
+            // an open polyline only i < n-1 are meaningful; for closed
+            // the (n-1)-th slot is the closing segment, defaulting to 0.
+            let bulge = if i + 1 < n {
+                self.pending_bulges.get(i).copied().unwrap_or(0.0)
+            } else if closed {
+                0.0   // closing segment — Line mode for now
+            } else {
+                0.0
+            };
+            verts.push(PolyVertex { pos: p, bulge });
+        }
+        self.pending_bulges.clear();
+        self.pline_mode = PlineMode::Line;
+        verts
+    }
+
+    /// Tessellate one polyline-preview segment from `a` to `b` with the
+    /// given bulge and paint it. Straight segment (bulge ≈ 0) renders as
+    /// a single line_segment; non-zero bulge tessellates the arc into
+    /// short chords. Used both for committed-segment preview and for
+    /// the rubber-band to the cursor while in Arc mode.
+    fn draw_pline_preview_segment(
+        &self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        a: Vec2, b: Vec2, bulge: f64,
+        stroke: egui::Stroke,
+    ) {
+        if bulge.abs() < 1e-9 {
+            painter.line_segment([self.w2s(a, rect), self.w2s(b, rect)], stroke);
+            return;
+        }
+        let chord = b - a;
+        let chord_len = chord.len();
+        if chord_len < EPS {
+            painter.line_segment([self.w2s(a, rect), self.w2s(b, rect)], stroke);
+            return;
+        }
+        // theta = 4 * atan(bulge) is the (signed) included angle.
+        let theta = 4.0 * bulge.atan();
+        let half = theta * 0.5;
+        // radius r = chord / (2 * sin(half)); sin(half) shares sign with bulge.
+        let r = chord_len / (2.0 * half.sin().abs());
+        // Centre offset from chord midpoint along the chord's perpendicular.
+        // The sagitta (mid-deviation) is r - r*cos(half) = r * (1 - cos(half)),
+        // signed by bulge so positive-bulge arcs sit on the LEFT of the chord
+        // when travelling from a to b.
+        let chord_hat = chord / chord_len;
+        let perp = Vec2::new(-chord_hat.y, chord_hat.x);   // CCW perp
+        let mid  = (a + b) * 0.5;
+        let centre_off = r * half.cos();
+        // half positive (bulge > 0): centre is to the LEFT of the chord
+        //                            (in the +perp direction)
+        // half negative (bulge < 0): centre is to the RIGHT (-perp)
+        let centre = mid + perp * (if bulge > 0.0 { centre_off } else { -centre_off });
+        // Angles from centre to a, b. CCW sweep selected by sign of bulge.
+        let start_ang = (a - centre).angle();
+        let end_ang   = (b - centre).angle();
+        let sweep = if bulge > 0.0 {
+            (end_ang - start_ang).rem_euclid(std::f64::consts::TAU)
+        } else {
+            -((start_ang - end_ang).rem_euclid(std::f64::consts::TAU))
+        };
+        // Tessellation density grows with screen size of the arc.
+        let arc_len_px = (r as f32 * self.scale) * sweep.abs() as f32;
+        let n = (arc_len_px * 0.4).clamp(6.0, 256.0) as usize;
+        let mut pts = Vec::with_capacity(n + 1);
+        for i in 0..=n {
+            let t = i as f64 / n as f64;
+            let ang = start_ang + sweep * t;
+            let p = centre + Vec2::new(r * ang.cos(), r * ang.sin());
+            pts.push(self.w2s(p, rect));
+        }
+        painter.add(egui::Shape::line(pts, stroke));
+    }
+
+    /// AutoCAD bulge for a tangent-continuous arc from the current last
+    /// pending vertex to `end`. `bulge = tan(alpha / 2)` where alpha is
+    /// the signed (CCW positive) angle from the chord direction to the
+    /// start tangent.
+    fn pline_arc_bulge_to(&self, end: Vec2) -> f64 {
+        let n = self.pending.len();
+        if n == 0 { return 0.0; }
+        let start = self.pending[n - 1];
+        let chord = end - start;
+        if chord.len() < EPS { return 0.0; }
+        // Default tangent: previous-segment exit; fall back to horizontal
+        // (X+) when there's only the start vertex.
+        let tangent = self.pline_previous_exit_tangent()
+            .unwrap_or(Vec2::new(1.0, 0.0));
+        // Signed angle from chord to tangent, CCW positive.
+        let cross = chord.x * tangent.y - chord.y * tangent.x;
+        let dot   = chord.x * tangent.x + chord.y * tangent.y;
+        let alpha = cross.atan2(dot);
+        (alpha / 2.0).tan()
+    }
+
     /// The "from" point that ortho (lock drafting orientation) constrains
     /// the cursor against — the most recent locked-in point in whatever
     /// command is active. None means ortho has no anchor and therefore
@@ -4472,6 +4700,8 @@ impl eframe::App for CadApp {
         // global Esc: cancel any in-progress draw or pick / intersect / select mode
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.pending.clear();
+            self.pending_bulges.clear();
+            self.pline_mode = PlineMode::Line;
             self.tool = Tool::None;
             self.picking_source = false;
             self.intersect_pending_click = false;
@@ -4623,9 +4853,7 @@ impl eframe::App for CadApp {
                 self.extend_state = ExtendState::Off;
                 self.clear_prompt();
             } else if self.tool == Tool::Polyline && self.pending.len() >= 2 {
-                let verts = self.pending.drain(..).map(|p| PolyVertex {
-                    pos: p, bulge: 0.0,
-                }).collect();
+                let verts = self.drain_pline_pending(false);
                 self.add_dobject(Geom::Polyline(Polyline {
                     vertices: verts, closed: false,
                 }), "canvas");
@@ -4647,9 +4875,7 @@ impl eframe::App for CadApp {
             let trimmed = self.cmd.trim().to_ascii_lowercase();
             if trimmed == "c" || trimmed == "close" || trimmed == "closed" {
                 if self.pending.len() >= 2 {
-                    let verts = self.pending.drain(..).map(|p| PolyVertex {
-                        pos: p, bulge: 0.0,
-                    }).collect();
+                    let verts = self.drain_pline_pending(true);
                     self.add_dobject(Geom::Polyline(Polyline {
                         vertices: verts, closed: true,
                     }), "canvas (closed)");
@@ -4657,6 +4883,8 @@ impl eframe::App for CadApp {
                 } else {
                     self.history.push("  ! polyline needs at least 2 vertices".into());
                     self.pending.clear();
+                    self.pending_bulges.clear();
+                    self.pline_mode = PlineMode::Line;
                 }
             }
         }
@@ -6485,7 +6713,23 @@ impl eframe::App for CadApp {
                         if self.snap_override.is_some() {
                             self.snap_override = None;
                         }
+                        // Polyline maintains a parallel bulge per segment:
+                        // bulge[i] is the segment from pending[i] to
+                        // pending[i+1]. In Arc sub-mode the just-clicked
+                        // segment gets a tangent-continuous arc bulge;
+                        // in Line sub-mode (or any other tool) it stays 0.
+                        if self.tool == Tool::Polyline && !self.pending.is_empty() {
+                            let new_bulge = if self.pline_mode == PlineMode::Arc {
+                                self.pline_arc_bulge_to(click_world)
+                            } else {
+                                0.0
+                            };
+                            self.pending_bulges.push(new_bulge);
+                        }
                         self.pending.push(click_world);
+                        if self.tool == Tool::Polyline {
+                            self.update_pline_prompt();
+                        }
                         self.try_finalise();
                         // canvas click steals focus away from the command box;
                         // restore it so typing keeps working without a manual
@@ -7202,26 +7446,39 @@ impl eframe::App for CadApp {
                             painter.circle_stroke(self.w2s(*c, rect), r_px, dash);
                             painter.line_segment([self.w2s(*c, rect), cursor], hint);
                         }
-                        // Polyline live preview — show every captured
-                        // segment (solid hint) PLUS a rubber-band dashed
-                        // segment from the last vertex to the cursor.
-                        // Bug fix: previously nothing was drawn between
-                        // clicks, so it looked like only dots existed.
-                        // Each captured vertex gets a small filled dot
-                        // so the user can see where they've already clicked.
+                        // Polyline live preview — every captured segment
+                        // (solid hint) plus a rubber-band from the last
+                        // vertex to the cursor. Arc-mode segments
+                        // tessellate from their bulge so the user sees
+                        // the actual arc, not its chord. Each captured
+                        // vertex gets a small filled dot.
                         (Tool::Polyline, verts) if !verts.is_empty() => {
+                            let solid = egui::Stroke::new(
+                                1.0, preview_col.gamma_multiply(0.7));
                             for w in verts.iter() {
                                 painter.circle_filled(self.w2s(*w, rect), 3.0, preview_col);
                             }
-                            for pair in verts.windows(2) {
-                                painter.line_segment(
-                                    [self.w2s(pair[0], rect), self.w2s(pair[1], rect)],
-                                    egui::Stroke::new(1.0, preview_col.gamma_multiply(0.7)));
+                            for i in 0..verts.len().saturating_sub(1) {
+                                let a = verts[i];
+                                let b = verts[i + 1];
+                                let bulge = self.pending_bulges
+                                    .get(i).copied().unwrap_or(0.0);
+                                self.draw_pline_preview_segment(
+                                    &painter, rect, a, b, bulge, solid);
                             }
-                            // rubber-band from last captured to cursor
+                            // Rubber-band from last captured to cursor.
+                            // In Arc mode this is also a tessellated
+                            // arc so the user sees the actual curvature
+                            // the click will commit.
                             if let Some(last) = verts.last() {
-                                painter.line_segment(
-                                    [self.w2s(*last, rect), cursor], dash);
+                                if self.pline_mode == PlineMode::Arc {
+                                    let bulge = self.pline_arc_bulge_to(cw);
+                                    self.draw_pline_preview_segment(
+                                        &painter, rect, *last, cw, bulge, dash);
+                                } else {
+                                    painter.line_segment(
+                                        [self.w2s(*last, rect), cursor], dash);
+                                }
                             }
                         }
                         // Ellipse 3-click flow.
