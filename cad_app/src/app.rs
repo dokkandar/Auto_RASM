@@ -371,9 +371,12 @@ pub enum CopyState {
 ///      atan2(click − pivot); OR type a number in degrees; OR type `R`
 ///      to switch to reference mode; OR type `C` to toggle copy mode
 ///      (rotate produces a copy instead of moving the original).
-///   3. Reference sub-states (4 clicks total): WaitingForRefSrc1 …
-///      WaitingForRefTgt2. Source angle defined by 2 clicks; target
-///      angle by 2 clicks; rotation = (tgt direction − src direction).
+///   3. Reference sub-states (3 picks total): RefSrc1 → RefSrc2 defines
+///      the source direction (= atan2(s2 − s1)); RefTgt is ONE pick
+///      anchored at the PIVOT (target direction = atan2(click − pivot)).
+///      Matches scale's reference shape — after the 2 source picks,
+///      the next click / typed value is measured from the pivot.
+///      Rotation = target − source.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum RotateState {
     Off,
@@ -381,8 +384,7 @@ pub enum RotateState {
     WaitingForAngle(Vec2),                                  // pivot
     WaitingForRefSrc1(Vec2),                                // pivot
     WaitingForRefSrc2(Vec2, Vec2),                          // pivot, src1
-    WaitingForRefTgt1(Vec2, Vec2, Vec2),                    // pivot, src1, src2
-    WaitingForRefTgt2(Vec2, Vec2, Vec2, Vec2),              // pivot, src1, src2, tgt1
+    WaitingForRefTgt(Vec2, f64),                            // pivot, src_angle
 }
 
 /// State machine for the interactive scale tool — AutoCAD SCALE flow:
@@ -754,6 +756,22 @@ impl CadApp {
                 }
                 self.scale_state = ScaleState::Off;
                 self.scale_copy  = false;
+                self.clear_prompt();
+                return;
+            }
+        }
+        // Rotate-R target step also accepts a typed angle (degrees).
+        // dtheta = typed - src_angle.
+        if let RotateState::WaitingForRefTgt(pivot, src_angle) = self.rotate_state {
+            if let Ok(deg) = trimmed.parse::<f64>() {
+                let tgt = deg.to_radians();
+                let mut dtheta = (tgt - src_angle).rem_euclid(std::f64::consts::TAU);
+                if dtheta > std::f64::consts::PI {
+                    dtheta -= std::f64::consts::TAU;
+                }
+                self.apply_rotate_or_copy(pivot, dtheta);
+                self.rotate_state = RotateState::Off;
+                self.rotate_copy  = false;
                 self.clear_prompt();
                 return;
             }
@@ -5295,23 +5313,24 @@ impl eframe::App for CadApp {
                                 self.rotate_copy = false;
                                 self.clear_prompt();
                             }
-                            // ---- Reference sub-command (4 clicks) -------
+                            // ---- Reference sub-command (3 picks) -------
+                            // Mirrors scale-R: 2 picks define the source
+                            // direction (anywhere), then ONE click anchored
+                            // at the pivot defines the new direction.
                             RotateState::WaitingForRefSrc1(pivot) => {
                                 self.rotate_state = RotateState::WaitingForRefSrc2(pivot, click_world);
                                 self.set_prompt("rotate-R: click SOURCE point 2 (defines current direction)");
                             }
                             RotateState::WaitingForRefSrc2(pivot, s1) => {
-                                self.rotate_state = RotateState::WaitingForRefTgt1(pivot, s1, click_world);
-                                self.set_prompt("rotate-R: click TARGET point 1 (defines new direction)");
+                                let src_angle = (click_world - s1).angle();
+                                self.rotate_state = RotateState::WaitingForRefTgt(pivot, src_angle);
+                                self.set_prompt(format!(
+                                    "rotate-R: click NEW direction (anchored at pivot) OR type angle [src={:.2}°]",
+                                    src_angle.to_degrees()));
                             }
-                            RotateState::WaitingForRefTgt1(pivot, s1, s2) => {
-                                self.rotate_state = RotateState::WaitingForRefTgt2(pivot, s1, s2, click_world);
-                                self.set_prompt("rotate-R: click TARGET point 2 to apply");
-                            }
-                            RotateState::WaitingForRefTgt2(pivot, s1, s2, t1) => {
-                                let src = (s2 - s1).angle();
-                                let tgt = (click_world - t1).angle();
-                                let mut dtheta = (tgt - src).rem_euclid(std::f64::consts::TAU);
+                            RotateState::WaitingForRefTgt(pivot, src_angle) => {
+                                let tgt = (click_world - pivot).angle();
+                                let mut dtheta = (tgt - src_angle).rem_euclid(std::f64::consts::TAU);
                                 if dtheta > std::f64::consts::PI {
                                     dtheta -= std::f64::consts::TAU;
                                 }
@@ -6277,22 +6296,56 @@ impl eframe::App for CadApp {
                             egui::FontId::monospace(12.0), mark);
                     }
                 }
-                RotateState::WaitingForRefSrc2(_, s1)
-                | RotateState::WaitingForRefTgt1(_, s1, _)
-                | RotateState::WaitingForRefTgt2(_, s1, _, _) => {
+                RotateState::WaitingForRefSrc2(_, s1) => {
+                    // First source point captured; show it + a cursor
+                    // baseline indicating the in-progress source direction.
                     let mark = egui::Color32::from_rgb(180, 220, 120);
                     painter.circle_filled(self.w2s(s1, rect), 3.0, mark);
-                    if let RotateState::WaitingForRefTgt1(_, _, s2)
-                         | RotateState::WaitingForRefTgt2(_, _, s2, _) = self.rotate_state {
-                        let s2s = self.w2s(s2, rect);
-                        painter.circle_filled(s2s, 3.0, mark);
+                    if let Some(cur) = resp.hover_pos() {
                         painter.line_segment(
-                            [self.w2s(s1, rect), s2s],
-                            egui::Stroke::new(1.0, mark));
+                            [self.w2s(s1, rect), cur],
+                            egui::Stroke::new(1.0,
+                                egui::Color32::from_rgba_unmultiplied(180, 220, 120, 180)));
                     }
-                    if let RotateState::WaitingForRefTgt2(_, _, _, t1) = self.rotate_state {
-                        let mark2 = egui::Color32::from_rgb(120, 180, 255);
-                        painter.circle_filled(self.w2s(t1, rect), 3.0, mark2);
+                }
+                RotateState::WaitingForRefTgt(pivot, src_angle) => {
+                    // Source direction captured; the NEW direction is
+                    // anchored at the pivot. Pivot mark + live baseline
+                    // pivot→cursor + ghost-rendered selection rotated to
+                    // (cursor angle − src_angle).
+                    let pivot_s = self.w2s(pivot, rect);
+                    let mark    = egui::Color32::from_rgb(255, 200, 80);
+                    painter.circle_stroke(pivot_s, 5.0, egui::Stroke::new(1.4, mark));
+                    painter.line_segment(
+                        [pivot_s + egui::vec2(-9.0, 0.0), pivot_s + egui::vec2(9.0, 0.0)],
+                        egui::Stroke::new(0.8, mark));
+                    painter.line_segment(
+                        [pivot_s + egui::vec2(0.0, -9.0), pivot_s + egui::vec2(0.0, 9.0)],
+                        egui::Stroke::new(0.8, mark));
+                    if let Some(cur) = resp.hover_pos() {
+                        let cur_world = self.s2w(cur, rect);
+                        let tgt   = (cur_world - pivot).angle();
+                        let dtheta = {
+                            let mut d = (tgt - src_angle).rem_euclid(std::f64::consts::TAU);
+                            if d > std::f64::consts::PI { d -= std::f64::consts::TAU; }
+                            d
+                        };
+                        painter.line_segment(
+                            [pivot_s, cur],
+                            egui::Stroke::new(1.0,
+                                egui::Color32::from_rgba_unmultiplied(255, 200, 80, 180)));
+                        let ghost = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 130);
+                        for &i in &self.selection {
+                            let Some(d) = self.doc.dobjects.get(i) else { continue; };
+                            let g = d.geom.rotated(pivot, dtheta);
+                            draw_dobject(&painter, rect, self, &g, ghost);
+                        }
+                        painter.text(
+                            cur + egui::vec2(12.0, -12.0),
+                            egui::Align2::LEFT_BOTTOM,
+                            format!("{:.1}°{}", dtheta.to_degrees(),
+                                if self.rotate_copy { "  (copy)" } else { "" }),
+                            egui::FontId::monospace(12.0), mark);
                     }
                 }
                 _ => {}
