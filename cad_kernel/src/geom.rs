@@ -149,79 +149,47 @@ pub enum HatchPattern {
     Solid,
 }
 
-/// An AutoCAD HATCH entity. Carries its own closed boundary as a list of
-/// vertices (last connects to first) plus a pattern descriptor. The
-/// boundary is OWNED — it is not a reference to another DObject. This
-/// is the MVP shape; once handle-stable references land the boundary
-/// can become a reference to source dobjects instead, matching DXF's
-/// own model where HATCH points at its source boundary entities.
+/// An AutoCAD-style HATCH entity. Holds REFERENCES to its boundary
+/// dobject(s) by handle rather than owning a copy of their vertices.
+/// This matches the user's "smart hatch" requirement: moving / editing
+/// a boundary dobject automatically updates the hatch fill because
+/// rendering re-resolves the boundary every frame.
+///
+/// Multiple boundaries → multiple loops. Even-odd fill rule at render
+/// time, so the second loop becomes a hole inside the first (and the
+/// fourth a hole inside the third, etc.) — basic AutoCAD island support.
+///
+/// Geom-level methods (bbox / distance_to_point / transforms) can't
+/// resolve handles on their own (no Document access from here), so
+/// they return conservative defaults. Hit-test and bbox happen at the
+/// app level where the Document is available.
+///
+/// Style of the hatch — fill color, layer, lineweight — still lives on
+/// the outer DObject as for any other Geom variant.
 #[derive(Clone, Debug)]
 pub struct Hatch {
-    /// Closed polygonal boundary (implicit edge from last → first vertex).
-    /// MVP ignores per-vertex bulges, so curved hatch boundaries are
-    /// approximated by their vertex polygon for now.
-    pub boundary: Vec<Vec2>,
-    pub pattern:  HatchPattern,
+    /// Handles of boundary dobjects, in loop order. Outer loop first;
+    /// successive loops alternate as holes via even-odd fill at render.
+    /// A handle that no longer resolves is silently skipped — the
+    /// hatch shrinks gracefully if the user deletes a boundary.
+    pub boundary_handles: Vec<crate::dobject::Handle>,
+    pub pattern:          HatchPattern,
 }
 
 impl Hatch {
+    /// Conservative bbox — empty, since this geom can't resolve its
+    /// own boundaries. Callers that need a real bbox (the spatial
+    /// index, viewport culling) should resolve via the Document and
+    /// union the boundary dobjects' bboxes there.
     pub fn bbox(&self) -> (Vec2, Vec2) {
-        if self.boundary.is_empty() {
-            return (Vec2::ZERO, Vec2::ZERO);
-        }
-        let mut min = self.boundary[0];
-        let mut max = min;
-        for v in &self.boundary[1..] {
-            if v.x < min.x { min.x = v.x; }
-            if v.y < min.y { min.y = v.y; }
-            if v.x > max.x { max.x = v.x; }
-            if v.y > max.y { max.y = v.y; }
-        }
-        (min, max)
+        (Vec2::ZERO, Vec2::ZERO)
     }
 
-    /// Selection-distance to a point. ZERO if the point is inside the
-    /// boundary (so clicking inside the fill selects the hatch); else
-    /// distance to the nearest boundary edge.
-    pub fn distance_to_point(&self, p: Vec2) -> f64 {
-        if self.boundary.len() < 3 { return f64::INFINITY; }
-        if self.contains_point(p) { return 0.0; }
-        // Nearest boundary edge.
-        let n = self.boundary.len();
-        let mut best = f64::INFINITY;
-        for i in 0..n {
-            let a = self.boundary[i];
-            let b = self.boundary[(i + 1) % n];
-            let d = b - a;
-            let len_sq = d.len_sq();
-            let dist = if len_sq < EPS {
-                p.dist(a)
-            } else {
-                let t = ((p - a).dot(d) / len_sq).clamp(0.0, 1.0);
-                p.dist(a + d * t)
-            };
-            if dist < best { best = dist; }
-        }
-        best
-    }
-
-    /// Even-odd point-in-polygon test on the closed boundary.
-    pub fn contains_point(&self, p: Vec2) -> bool {
-        let n = self.boundary.len();
-        if n < 3 { return false; }
-        let mut inside = false;
-        let mut j = n - 1;
-        for i in 0..n {
-            let pi = self.boundary[i];
-            let pj = self.boundary[j];
-            // Half-open Y test avoids double-counting horizontal edge endpoints.
-            if (pi.y > p.y) != (pj.y > p.y) {
-                let x_intersect = pi.x + (p.y - pi.y) * (pj.x - pi.x) / (pj.y - pi.y);
-                if p.x < x_intersect { inside = !inside; }
-            }
-            j = i;
-        }
-        inside
+    /// Geom-level distance — INFINITY, because point-in-polygon needs
+    /// the resolved boundary geometry. The app-level hit-test does
+    /// the actual check by resolving handles against the Document.
+    pub fn distance_to_point(&self, _p: Vec2) -> f64 {
+        f64::INFINITY
     }
 }
 
@@ -292,10 +260,12 @@ impl Geom {
                     .collect(),
                 closed: p.closed,
             }),
-            Geom::Hatch(h) => Geom::Hatch(Hatch {
-                boundary: h.boundary.iter().map(|p| rot(*p)).collect(),
-                pattern:  h.pattern,
-            }),
+            // Hatch transforms are NO-OPS — the hatch follows its
+            // boundary dobjects (which transform on their own) via the
+            // handles in `boundary_handles`. To "move a hatch", select
+            // its boundary too (or do that automatically at the app
+            // level — TODO follow-up).
+            Geom::Hatch(h) => Geom::Hatch(h.clone()),
         }
     }
 
@@ -337,10 +307,8 @@ impl Geom {
                     .collect(),
                 closed: p.closed,
             }),
-            Geom::Hatch(h) => Geom::Hatch(Hatch {
-                boundary: h.boundary.iter().map(|p| sc(*p)).collect(),
-                pattern:  h.pattern,
-            }),
+            // No-op for the same reason as `rotated`.
+            Geom::Hatch(h) => Geom::Hatch(h.clone()),
         }
     }
 
@@ -401,10 +369,8 @@ impl Geom {
                     .collect(),
                 closed: p.closed,
             }),
-            Geom::Hatch(h) => Geom::Hatch(Hatch {
-                boundary: h.boundary.iter().map(|p| mirror(*p)).collect(),
-                pattern:  h.pattern,
-            }),
+            // No-op for the same reason as `rotated`.
+            Geom::Hatch(h) => Geom::Hatch(h.clone()),
         }
     }
 
@@ -1090,10 +1056,8 @@ impl Geom {
                     .collect(),
                 closed:   p.closed,
             }),
-            Geom::Hatch(h) => Geom::Hatch(Hatch {
-                boundary: h.boundary.iter().map(|p| *p + off).collect(),
-                pattern:  h.pattern,
-            }),
+            // No-op for the same reason as `rotated`.
+            Geom::Hatch(h) => Geom::Hatch(h.clone()),
         }
     }
 

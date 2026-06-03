@@ -148,7 +148,7 @@ fn describe(g: &Geom) -> String {
             if p.closed { " (closed)" } else { "" },
             p.length()),
         Geom::Hatch(h) => format!(
-            "hatch ({} boundary verts, {:?})",
-            h.boundary.len(), h.pattern),
+            "hatch ({} boundary loops, {:?})",
+            h.boundary_handles.len(), h.pattern),
     }
 }

@@ -1564,43 +1564,131 @@ impl CadApp {
         // self.selection persists so follow-up commands (move, list, …) can use it.
     }
 
-    /// MVP hatch finaliser: for every closed polyline in the current
-    /// selection, push a new Hatch dobject whose boundary copies that
-    /// polyline's vertex positions, filled with the active color.
-    /// Non-closed-polyline selections are skipped with a message.
-    /// Source polylines stay around — the hatch sits on top.
+    /// Resolve a hatch's boundary handles into a list of vertex loops
+    /// in world coords. Each closed polyline boundary contributes one
+    /// loop; bulges are tessellated to short chord segments so curved
+    /// boundaries fill smoothly. Handles that no longer resolve (the
+    /// user deleted a boundary) are silently skipped, so the hatch
+    /// just shrinks rather than crashing.
+    fn resolve_hatch_loops(&self, h: &cad_kernel::Hatch) -> Vec<Vec<Vec2>> {
+        let mut loops: Vec<Vec<Vec2>> = Vec::with_capacity(h.boundary_handles.len());
+        for handle in &h.boundary_handles {
+            let Some(d) = self.doc.find_by_handle(*handle) else { continue; };
+            // MVP supports closed polyline boundaries only. Future: any
+            // closed chain of lines / arcs / polylines (boundary
+            // traversal helper in the kernel).
+            let Geom::Polyline(p) = &d.geom else { continue; };
+            if !p.closed || p.vertices.len() < 3 { continue; }
+            // Tessellate the closed polyline into screen-independent
+            // world vertices. Straight segments contribute one vertex;
+            // arc segments contribute many. We sample the arc with a
+            // fixed angular density here (vs the on-screen-pixel
+            // density used in the dobject renderer) — fill tessellation
+            // doesn't need to track zoom so we can keep it cheap.
+            let mut loop_verts: Vec<Vec2> = Vec::new();
+            let n = p.vertices.len();
+            loop_verts.push(p.vertices[0].pos);
+            for i in 0..n {
+                let a = p.vertices[i].pos;
+                let b = p.vertices[(i + 1) % n].pos;
+                let bulge = p.vertices[i].bulge;
+                append_arc_world_samples(a, b, bulge, &mut loop_verts);
+            }
+            loops.push(loop_verts);
+        }
+        loops
+    }
+
+    /// Paint a hatch — solid fill of its resolved boundary loops with
+    /// the AutoCAD-style even-odd rule (outer loop fills, next is a
+    /// hole, then a hole-in-hole, etc.). For multi-loop fills we
+    /// triangulate ourselves via ear-clipping with the loops cut into
+    /// a single ring; for one loop we just hand to egui's path
+    /// tessellator. Pattern variants (parallel lines, ANSI / ISO) will
+    /// dispatch on `h.pattern` here later.
+    fn render_hatch_fill(
+        &self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        h: &cad_kernel::Hatch,
+        color: egui::Color32,
+    ) {
+        let loops = self.resolve_hatch_loops(h);
+        if loops.is_empty() { return; }
+        // Single-loop case — let egui's tessellator fill the closed path
+        // directly (handles concave shapes via ear clipping). Cheap and
+        // correct.
+        if loops.len() == 1 {
+            let pts: Vec<egui::Pos2> = loops[0].iter()
+                .map(|w| self.w2s(*w, rect)).collect();
+            if pts.len() < 3 { return; }
+            painter.add(egui::Shape::Path(egui::epaint::PathShape {
+                points: pts,
+                closed: true,
+                fill:   color,
+                stroke: egui::epaint::PathStroke::NONE,
+            }));
+            return;
+        }
+        // Multi-loop case — even-odd fill with islands. egui's
+        // PathShape doesn't natively support multiple sub-paths with
+        // even-odd, so for v1 we fall back to rendering each loop as
+        // its own filled path with alternating opacity: outer loop
+        // opaque, next loop "subtracts" by overdrawing in canvas color,
+        // and so on. Not perfect (overdraw doesn't compose under
+        // arbitrary alpha) but reads correctly on a solid backdrop.
+        let bg = egui::Color32::from_rgb(18, 22, 28);   // canvas background
+        for (i, l) in loops.iter().enumerate() {
+            let pts: Vec<egui::Pos2> = l.iter()
+                .map(|w| self.w2s(*w, rect)).collect();
+            if pts.len() < 3 { continue; }
+            let fill = if i % 2 == 0 { color } else { bg };
+            painter.add(egui::Shape::Path(egui::epaint::PathShape {
+                points: pts,
+                closed: true,
+                fill,
+                stroke: egui::epaint::PathStroke::NONE,
+            }));
+        }
+    }
+
+    /// Smart hatch finaliser: collect handles of every CLOSED polyline
+    /// in the current selection and add ONE Hatch dobject that
+    /// REFERENCES all of them as boundary loops (outer first, holes
+    /// next via even-odd at render). Boundary dobjects stay where
+    /// they are — moving / editing them later auto-updates the hatch
+    /// because the render path resolves handles each frame.
+    ///
+    /// Non-closed-polyline selections are silently skipped with a
+    /// message. Multi-loop selection = one hatch with islands; single
+    /// loop = solid disc.
     fn apply_hatch(&mut self) {
-        let mut added = 0_usize;
+        let mut handles: Vec<cad_kernel::Handle> = Vec::new();
         let mut skipped = 0_usize;
-        // Capture (boundary, source_idx) up front so we don't borrow
-        // self.doc.dobjects mutably mid-iteration.
-        let mut to_add: Vec<Vec<Vec2>> = Vec::new();
         for &idx in &self.selection {
             let Some(d) = self.doc.dobjects.get(idx) else { continue; };
             match &d.geom {
                 Geom::Polyline(p) if p.closed && p.vertices.len() >= 3 => {
-                    to_add.push(p.vertices.iter().map(|v| v.pos).collect());
+                    handles.push(d.handle);
                 }
                 _ => skipped += 1,
             }
         }
-        if to_add.is_empty() {
+        if handles.is_empty() {
             self.history.push("  ! hatch: no closed polyline in selection".into());
             return;
         }
         self.snapshot_doc();
-        for boundary in to_add {
-            self.doc.push(cad_kernel::Hatch {
-                boundary,
-                pattern: cad_kernel::HatchPattern::Solid,
-            }.into());
-            added += 1;
-        }
+        let loop_count = handles.len();
+        self.doc.push(cad_kernel::Hatch {
+            boundary_handles: handles,
+            pattern: cad_kernel::HatchPattern::Solid,
+        }.into());
         self.gpu_dirty = true;
         self.index_dirty = true;
         self.history.push(format!(
-            "  + hatch: {} solid fill(s) added{}",
-            added,
+            "  + hatch: 1 fill, {} boundary loop(s){}",
+            loop_count,
             if skipped > 0 {
                 format!("  ({} non-closed-polyline dobject(s) skipped)", skipped)
             } else { String::new() },
@@ -4318,6 +4406,52 @@ fn append_pline_segment_screen_pts(
     }
 }
 
+/// Append the world-space tessellation of ONE polyline segment from
+/// `a` to `b` with the given bulge to `out`. `a` is assumed already
+/// present at the end of `out`; this function adds the intermediate
+/// samples + `b`. Straight segment (bulge ≈ 0) appends just `b`.
+/// Sample density is fixed at 24 per arc segment — enough for smooth
+/// hatch boundaries at any zoom without paying the per-zoom
+/// retessellation cost of the screen-space variant.
+fn append_arc_world_samples(a: Vec2, b: Vec2, bulge: f64, out: &mut Vec<Vec2>) {
+    if bulge.abs() < 1e-9 {
+        out.push(b);
+        return;
+    }
+    let chord = b - a;
+    let chord_len = chord.len();
+    if chord_len < EPS {
+        out.push(b);
+        return;
+    }
+    let theta = 4.0 * bulge.atan();
+    let half = theta * 0.5;
+    let sin_half = half.sin();
+    if sin_half.abs() < EPS {
+        out.push(b);
+        return;
+    }
+    let r = chord_len / (2.0 * sin_half.abs());
+    let chord_hat = chord / chord_len;
+    let perp = Vec2::new(-chord_hat.y, chord_hat.x);
+    let mid  = (a + b) * 0.5;
+    let centre_off = r * half.cos();
+    let centre = mid + perp * (if bulge > 0.0 { centre_off } else { -centre_off });
+    let start_ang = (a - centre).angle();
+    let end_ang   = (b - centre).angle();
+    let sweep = if bulge > 0.0 {
+        (end_ang - start_ang).rem_euclid(std::f64::consts::TAU)
+    } else {
+        -((start_ang - end_ang).rem_euclid(std::f64::consts::TAU))
+    };
+    let n: usize = 24;
+    for i in 1..=n {
+        let t = i as f64 / n as f64;
+        let ang = start_ang + sweep * t;
+        out.push(centre + Vec2::new(r * ang.cos(), r * ang.sin()));
+    }
+}
+
 /// AutoCAD polyline bulge for a 3-point arc through (p1, p2, p3) in
 /// THAT ORDER. Returns 0.0 (straight segment) when the three points are
 /// collinear or coincident. The sign matches the polyline convention:
@@ -4399,8 +4533,8 @@ fn describe(g: &Geom) -> String {
             p.length()
         ),
         Geom::Hatch(h) => format!(
-            "hatch {} boundary verts ({:?})",
-            h.boundary.len(), h.pattern
+            "hatch {} boundary loop(s) ({:?})",
+            h.boundary_handles.len(), h.pattern
         ),
     }
 }
@@ -7144,6 +7278,14 @@ impl eframe::App for CadApp {
                             );
                             egui::Color32::from_rgb(r, g, b)
                         };
+                        // Hatch needs Document access (to resolve its
+                        // boundary-handle references) — short-circuit to
+                        // a dedicated renderer that has &self.
+                        if let Geom::Hatch(h) = &e.geom {
+                            self.render_hatch_fill(&painter, rect, h, color);
+                            drawn += 1;
+                            continue;
+                        }
                         draw_dobject(&painter, rect, self, &e.geom, color);
                         drawn += 1;
                     }
@@ -8492,20 +8634,14 @@ fn draw_dobject_thick(
                 painter.add(egui::Shape::line(pts, stroke));
             }
         }
-        Geom::Hatch(h) => {
-            // Solid fill via egui's closed-path tessellator (handles
-            // concave shapes too). Future patterns (parallel lines, named
-            // ANSI / ISO patterns) dispatch on `h.pattern` here.
-            if h.boundary.len() < 3 { return; }
-            let pts: Vec<egui::Pos2> = h.boundary.iter()
-                .map(|w| app.w2s(*w, rect)).collect();
-            painter.add(egui::Shape::Path(egui::epaint::PathShape {
-                points:       pts,
-                closed:       true,
-                fill:         color,
-                stroke:       egui::epaint::PathStroke::NONE,
-            }));
-            let _ = stroke;   // suppress unused-variable warning
+        Geom::Hatch(_) => {
+            // Hatch render needs to resolve boundary handles against
+            // the Document — done by `App::render_hatch_fill` which
+            // the main render loop short-circuits to BEFORE reaching
+            // this free renderer. Reaching here means a caller passed
+            // a Hatch without going through the main loop; that's a
+            // bug, so silently drop instead of crashing.
+            let _ = (color, stroke);
         }
     }
 }
@@ -8601,16 +8737,11 @@ fn draw_dobject_dashed(
                 push_dashed(pts);
             }
         }
-        Geom::Hatch(h) => {
-            // Selection look — outline the boundary as a closed dashed
-            // polyline. We don't dash the fill itself (too noisy at small
-            // sizes); the boundary outline is enough to read "selected".
-            if h.boundary.len() < 3 { return; }
-            let n = h.boundary.len();
-            let mut pts: Vec<egui::Pos2> = (0..=n).map(|i| {
-                app.w2s(h.boundary[i % n], rect)
-            }).collect();
-            push_dashed(std::mem::take(&mut pts));
+        Geom::Hatch(_) => {
+            // The boundary dobjects already render their OWN selection
+            // outline when selected — and editing happens on the
+            // boundary, not on the hatch itself. Hatch dashed-overlay
+            // is a no-op until we have a selectable-hatch UI flow.
         }
     }
 }

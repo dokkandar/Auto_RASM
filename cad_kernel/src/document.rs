@@ -72,6 +72,21 @@ impl Document {
         if !d.style.visible { return false; }
         self.layers.selectable(d.style.layer)
     }
+
+    /// Find a Dobject by its handle. Linear scan — fine at thousands;
+    /// add a `HashMap<Handle, usize>` cache when the count climbs.
+    /// Used today by the Hatch render path to resolve its boundary
+    /// references each frame so moving the boundary auto-updates the
+    /// hatch fill.
+    pub fn find_by_handle(&self, h: crate::dobject::Handle) -> Option<&DObject> {
+        self.dobjects.iter().find(|d| d.handle == h)
+    }
+
+    /// Index lookup by handle. Same scan as `find_by_handle`; returned
+    /// index is valid only until the next mutation of `self.dobjects`.
+    pub fn index_of_handle(&self, h: crate::dobject::Handle) -> Option<usize> {
+        self.dobjects.iter().position(|d| d.handle == h)
+    }
 }
 
 #[cfg(test)]
