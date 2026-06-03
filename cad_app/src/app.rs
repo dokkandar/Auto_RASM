@@ -4285,6 +4285,169 @@ impl eframe::App for CadApp {
             }
         }
 
+        // ---- UI.2: MENUBAR (very top) -----------------------------------
+        // Declared BEFORE the toolbar so it sits at the absolute top.
+        // Every menu item dispatches via `run_command` so its behaviour
+        // matches typing the same cmd — keeps one source of truth.
+        egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button("File", |ui| {
+                    if ui.button("New").clicked() {
+                        self.run_command("clear");
+                        ui.close_menu();
+                    }
+                    if ui.button("Open .dxf / .rsm…").clicked() {
+                        self.run_command("open /tmp/in.dxf");
+                        ui.close_menu();
+                    }
+                    if ui.button("Save As .dxf").clicked() {
+                        self.run_command("saveas /tmp/out.dxf");
+                        ui.close_menu();
+                    }
+                    if ui.button("Save As .rsm").clicked() {
+                        self.run_command("saveas /tmp/out.rsm");
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Exit").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+                ui.menu_button("Edit", |ui| {
+                    if ui.button("Undo").clicked() {
+                        self.run_command("undo");
+                        ui.close_menu();
+                    }
+                    if ui.button("Redo").clicked() {
+                        self.run_command("redo");
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Select All").clicked() {
+                        self.run_command("select");
+                        self.run_command("all");
+                        ui.close_menu();
+                    }
+                    if ui.button("Deselect All").clicked() {
+                        self.selection.clear();
+                        self.selected = None;
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Erase selection").clicked() {
+                        self.run_command("erase");
+                        ui.close_menu();
+                    }
+                    if ui.button("Match Properties").clicked() {
+                        self.run_command("matchprop");
+                        ui.close_menu();
+                    }
+                });
+                ui.menu_button("View", |ui| {
+                    if ui.button("Zoom Extents (fit all)").clicked() {
+                        if !self.doc.dobjects.is_empty() {
+                            let mut min = self.doc.dobjects[0].bbox().0;
+                            let mut max = self.doc.dobjects[0].bbox().1;
+                            for d in &self.doc.dobjects {
+                                let (a, b) = d.bbox();
+                                if a.x < min.x { min.x = a.x; }
+                                if a.y < min.y { min.y = a.y; }
+                                if b.x > max.x { max.x = b.x; }
+                                if b.y > max.y { max.y = b.y; }
+                            }
+                            let center = (min + max) * 0.5;
+                            let w = (max.x - min.x).max(max.y - min.y).max(1.0);
+                            let r = ctx.screen_rect();
+                            let target_px = (r.width().min(r.height()) * 0.85) as f64;
+                            self.scale = (target_px / w) as f32;
+                            self.world_offset = egui::vec2(
+                                -center.x as f32, -center.y as f32);
+                        }
+                        ui.close_menu();
+                    }
+                    if ui.button("Reset View").clicked() {
+                        self.scale = 20.0;
+                        self.world_offset = egui::vec2(0.0, 0.0);
+                        ui.close_menu();
+                    }
+                });
+                ui.menu_button("Draw", |ui| {
+                    for (label, cmd) in [
+                        ("Line",      "line"),
+                        ("Circle",    "circle"),
+                        ("Arc",       "arc"),
+                        ("Ellipse",   "ellipse"),
+                        ("Polyline",  "polyline"),
+                        ("Point",     "point"),
+                    ] {
+                        if ui.button(label).clicked() {
+                            self.run_command(cmd);
+                            ui.close_menu();
+                        }
+                    }
+                });
+                ui.menu_button("Modify", |ui| {
+                    for (label, cmd) in [
+                        ("Move",     "move"),
+                        ("Copy",     "copy"),
+                        ("Rotate",   "rotate"),
+                        ("Scale",    "scale"),
+                        ("Mirror",   "mirror"),
+                    ] {
+                        if ui.button(label).clicked() {
+                            self.run_command(cmd);
+                            ui.close_menu();
+                        }
+                    }
+                    ui.separator();
+                    for (label, cmd) in [
+                        ("Trim",     "trim"),
+                        ("Extend",   "extend"),
+                        ("Fillet",   "fillet"),
+                        ("Chamfer",  "chamfer"),
+                        ("Offset…",  "offset 1.0"),
+                        ("Join",     "join"),
+                        ("Break",    "break"),
+                        ("Align",    "align"),
+                        ("Stretch",  "stretch"),
+                    ] {
+                        if ui.button(label).clicked() {
+                            self.run_command(cmd);
+                            ui.close_menu();
+                        }
+                    }
+                });
+                ui.menu_button("Tools", |ui| {
+                    if ui.button("Snap window").clicked() {
+                        self.snap_window_open = !self.snap_window_open;
+                        ui.close_menu();
+                    }
+                    if ui.button("Trim Debug Log").clicked() {
+                        self.trim_debug_open = !self.trim_debug_open;
+                        ui.close_menu();
+                    }
+                    if ui.button("Toggle Grips").clicked() {
+                        self.env.GrpEnb = !self.env.GrpEnb;
+                        let _ = self.env.save();
+                        ui.close_menu();
+                    }
+                });
+                ui.menu_button("Help", |ui| {
+                    if ui.button("Command help").clicked() {
+                        self.run_command("help");
+                        ui.close_menu();
+                    }
+                    if ui.button("About RUST_CAD").clicked() {
+                        self.history.push(
+                            "  RUST_CAD — pure-Rust 2-D CAD math workbench".into());
+                        self.history.push(
+                            "  github.com/HSI-Lighting/RUST-AutoRASM".into());
+                        ui.close_menu();
+                    }
+                });
+            });
+        });
+
         // ---- top toolbar ------------------------------------------------
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(4.0);
@@ -4841,6 +5004,111 @@ impl eframe::App for CadApp {
                 }
             });
         });
+
+        // ---- UI.1: STATUS BAR (very bottom) -----------------------------
+        // Declared BEFORE the cmd panel so it sits at the absolute bottom
+        // edge; cmd panel ends up above it (egui stacks bottoms inward).
+        egui::TopBottomPanel::bottom("status_bar")
+            .exact_height(22.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    // ---- LEFT: cursor world coords -----------------------
+                    let cursor_world = ctx.input(|i| i.pointer.hover_pos())
+                        .and_then(|p| {
+                            // Translate from screen to world via the same
+                            // formula as self.s2w (we don't have `rect`
+                            // here, so reproduce it from ctx).
+                            let r = ctx.screen_rect();
+                            let c = r.center();
+                            Some(Vec2::new(
+                                ((p.x - c.x) / self.scale - self.world_offset.x) as f64,
+                                (-(p.y - c.y) / self.scale - self.world_offset.y) as f64,
+                            ))
+                        });
+                    let coord_text = match cursor_world {
+                        Some(w) => format!("{:>11.4}, {:>11.4}", w.x, w.y),
+                        None    => format!("{:>11}, {:>11}", "—", "—"),
+                    };
+                    ui.label(egui::RichText::new(coord_text)
+                        .monospace()
+                        .color(egui::Color32::from_rgb(160, 200, 240)));
+
+                    ui.separator();
+
+                    // ---- ACTIVE LAYER ------------------------------------
+                    let active_layer_name = self.doc.layers.get(self.doc.layers.active)
+                        .map(|l| l.name.as_str()).unwrap_or("?").to_string();
+                    let active_layer_col = self.doc.layers.get(self.doc.layers.active)
+                        .map(|l| {
+                            let (r, g, b) = resolve_color(
+                                l.color, self.doc.layers.active,
+                                &self.doc.layers, &self.doc.truecolors);
+                            egui::Color32::from_rgb(r, g, b)
+                        })
+                        .unwrap_or(egui::Color32::WHITE);
+                    let (swatch_rect, _) = ui.allocate_exact_size(
+                        egui::vec2(12.0, 12.0), egui::Sense::hover());
+                    ui.painter().rect_filled(swatch_rect, 1.0, active_layer_col);
+                    ui.painter().rect_stroke(swatch_rect, 1.0,
+                        egui::Stroke::new(0.6, egui::Color32::from_rgb(60, 70, 85)));
+                    ui.label(egui::RichText::new(format!("Layer: {}", active_layer_name))
+                        .monospace().small());
+
+                    ui.separator();
+
+                    // ---- SELECTION COUNT ---------------------------------
+                    let sel_n = self.selection.len();
+                    if sel_n > 0 {
+                        ui.label(egui::RichText::new(format!("{} sel", sel_n))
+                            .monospace().small()
+                            .color(egui::Color32::from_rgb(180, 220, 100)));
+                        ui.separator();
+                    }
+
+                    // ---- RIGHT-aligned controls --------------------------
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Zoom level (rightmost)
+                        ui.label(egui::RichText::new(
+                            format!("zoom {:.2}× ({:.2} px/u)",
+                                self.scale, self.scale)
+                        ).monospace().small().color(egui::Color32::from_rgb(150, 165, 185)));
+                        ui.separator();
+                        // EdgMod toggle
+                        let mut em = self.env.EdgMod;
+                        if ui.checkbox(&mut em, "EdgMod").changed() {
+                            self.env.EdgMod = em;
+                            let _ = self.env.save();
+                        }
+                        ui.separator();
+                        // GrpEnb toggle
+                        let mut ge = self.env.GrpEnb;
+                        if ui.checkbox(&mut ge, "Grips").changed() {
+                            self.env.GrpEnb = ge;
+                            let _ = self.env.save();
+                        }
+                        ui.separator();
+                        // Snap badges — click any letter to toggle.
+                        for k in SnapKind::ALL {
+                            let on = self.snap_enabled.is_enabled(k);
+                            let label = k.name();   // "END", "MID", …
+                            let col = if on {
+                                egui::Color32::from_rgb(120, 240, 255)
+                            } else {
+                                egui::Color32::from_rgb(80, 90, 105)
+                            };
+                            let resp = ui.add(egui::Label::new(
+                                egui::RichText::new(label).monospace().small().color(col),
+                            ).sense(egui::Sense::click()));
+                            if resp.clicked() {
+                                self.snap_enabled.set(k, !on);
+                            }
+                            if resp.hovered() {
+                                resp.on_hover_text(snap_blurb(k));
+                            }
+                        }
+                    });
+                });
+            });
 
         // ---- bottom: command input + history ----------------------------
         egui::TopBottomPanel::bottom("cmd")
