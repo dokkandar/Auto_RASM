@@ -4241,6 +4241,83 @@ fn snap_blurb(k: SnapKind) -> &'static str {
     }
 }
 
+/// Tessellate a polyline (vertex chain + per-vertex bulges) into
+/// connected screen-space points. Straight segments add just the
+/// endpoint; arc segments add intermediate samples whose density
+/// scales with the on-screen arc length so the curve stays smooth at
+/// any zoom. Used by every polyline render path (normal / thick /
+/// dashed) so a committed pline with arc segments shows the actual
+/// arcs, not their chords.
+fn polyline_tessellated_screen_pts(
+    p: &Polyline,
+    app: &CadApp,
+    rect: egui::Rect,
+) -> Vec<egui::Pos2> {
+    if p.vertices.len() < 2 { return Vec::new(); }
+    let n = p.vertices.len();
+    let pairs = if p.closed { n } else { n - 1 };
+    let mut out: Vec<egui::Pos2> = Vec::with_capacity(n);
+    out.push(app.w2s(p.vertices[0].pos, rect));
+    for i in 0..pairs {
+        let a = p.vertices[i].pos;
+        let b = p.vertices[(i + 1) % n].pos;
+        let bulge = p.vertices[i].bulge;
+        append_pline_segment_screen_pts(a, b, bulge, app, rect, &mut out);
+    }
+    out
+}
+
+/// Append the tessellation of ONE polyline segment from `a` to `b` with
+/// the given bulge to `out`. `a` is assumed already present at the end
+/// of `out`; this function adds the intermediate samples + `b`.
+/// Straight segment (bulge ≈ 0) appends just `b`.
+fn append_pline_segment_screen_pts(
+    a: Vec2, b: Vec2, bulge: f64,
+    app: &CadApp,
+    rect: egui::Rect,
+    out: &mut Vec<egui::Pos2>,
+) {
+    if bulge.abs() < 1e-9 {
+        out.push(app.w2s(b, rect));
+        return;
+    }
+    let chord = b - a;
+    let chord_len = chord.len();
+    if chord_len < EPS {
+        out.push(app.w2s(b, rect));
+        return;
+    }
+    let theta = 4.0 * bulge.atan();
+    let half = theta * 0.5;
+    let sin_half = half.sin();
+    if sin_half.abs() < EPS {
+        out.push(app.w2s(b, rect));
+        return;
+    }
+    let r = chord_len / (2.0 * sin_half.abs());
+    let chord_hat = chord / chord_len;
+    let perp = Vec2::new(-chord_hat.y, chord_hat.x);   // CCW perp
+    let mid  = (a + b) * 0.5;
+    let centre_off = r * half.cos();
+    let centre = mid + perp * (if bulge > 0.0 { centre_off } else { -centre_off });
+    let start_ang = (a - centre).angle();
+    let end_ang   = (b - centre).angle();
+    let sweep = if bulge > 0.0 {
+        (end_ang - start_ang).rem_euclid(std::f64::consts::TAU)
+    } else {
+        -((start_ang - end_ang).rem_euclid(std::f64::consts::TAU))
+    };
+    let arc_len_px = (r as f32 * app.scale) * sweep.abs() as f32;
+    let n = (arc_len_px * 0.4).clamp(6.0, 256.0) as usize;
+    // Skip i=0 (== a, already in `out`); end with i=n (== b).
+    for i in 1..=n {
+        let t = i as f64 / n as f64;
+        let ang = start_ang + sweep * t;
+        let p = centre + Vec2::new(r * ang.cos(), r * ang.sin());
+        out.push(app.w2s(p, rect));
+    }
+}
+
 /// AutoCAD polyline bulge for a 3-point arc through (p1, p2, p3) in
 /// THAT ORDER. Returns 0.0 (straight segment) when the three points are
 /// collinear or coincident. The sign matches the polyline convention:
@@ -8408,18 +8485,12 @@ fn draw_dobject_thick(
                 [egui::pos2(sp.x, sp.y - s), egui::pos2(sp.x, sp.y + s)], stroke);
         }
         Geom::Polyline(p) => {
-            // Polyline = piecewise lines. Bulges deferred — straight only
-            // for now (matches the kernel's distance/bbox approximations).
-            if p.vertices.len() < 2 { return; }
-            let n = p.vertices.len();
-            let count = if p.closed { n + 1 } else { n };
-            let mut pts: Vec<egui::Pos2> = (0..count).map(|i| {
-                app.w2s(p.vertices[i % n].pos, rect)
-            }).collect();
-            // Tidy: if not closed, the +1 above never executed, but the
-            // length stayed = n. Just pass to Shape::line.
-            if !p.closed { pts.truncate(n); }
-            painter.add(egui::Shape::line(pts, stroke));
+            // Bulge-aware tessellation so arc segments inside a polyline
+            // render as actual arcs, not chords.
+            let pts = polyline_tessellated_screen_pts(p, app, rect);
+            if !pts.is_empty() {
+                painter.add(egui::Shape::line(pts, stroke));
+            }
         }
         Geom::Hatch(h) => {
             // Solid fill via egui's closed-path tessellator (handles
@@ -8522,14 +8593,13 @@ fn draw_dobject_dashed(
                 [egui::pos2(sp.x, sp.y - s), egui::pos2(sp.x, sp.y + s)], stroke);
         }
         Geom::Polyline(p) => {
-            if p.vertices.len() < 2 { return; }
-            let n = p.vertices.len();
-            let count = if p.closed { n + 1 } else { n };
-            let mut pts: Vec<egui::Pos2> = (0..count).map(|i| {
-                app.w2s(p.vertices[i % n].pos, rect)
-            }).collect();
-            if !p.closed { pts.truncate(n); }
-            push_dashed(pts);
+            // Same bulge-aware tessellation as the solid render — when
+            // the user dash-highlights a polyline with arc segments
+            // the dashes follow the arcs, not the chords.
+            let pts = polyline_tessellated_screen_pts(p, app, rect);
+            if !pts.is_empty() {
+                push_dashed(pts);
+            }
         }
         Geom::Hatch(h) => {
             // Selection look — outline the boundary as a closed dashed
