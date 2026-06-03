@@ -678,12 +678,7 @@ impl CadApp {
 
     fn run_command(&mut self, raw: &str) {
         self.history.push(format!("> {}", raw));
-        // Remember the full raw line as the "last command" for AutoCAD-style
-        // Enter-on-empty repeat. Only persist non-empty input.
         let trimmed = raw.trim();
-        if !trimmed.is_empty() {
-            self.last_command = Some(trimmed.to_string());
-        }
         // Any non-empty input cancels the 2-stage-Enter notice.
         self.empty_enter_count_in_select = 0;
         // ---- Rotate sub-command intercept (AutoCAD ROTATE flow) -----
@@ -762,6 +757,16 @@ impl CadApp {
                 self.clear_prompt();
                 return;
             }
+        }
+        // Remember the line as the "last command" for Enter-on-empty
+        // repeat — but only NOW, AFTER the rotate/scale/etc sub-command
+        // intercepts have had their shot. Numbers / R / C typed inside
+        // a rotate or scale session are sub-command input, not top-level
+        // commands; they must not overwrite last_command. (Bug from
+        // 2026-06-03 screenshot: typing `2` mid-scale stored "2", so
+        // the next Enter tried to parse "2" as a global command.)
+        if !trimmed.is_empty() {
+            self.last_command = Some(trimmed.to_string());
         }
         // ---- Selection-mode shortcut intercept ----
         //
@@ -4872,9 +4877,22 @@ impl eframe::App for CadApp {
                     // returns false for them).
                     let space_pressed = text_resp.has_focus()
                         && ui.input(|i| i.key_pressed(egui::Key::Space));
+                    // Space submits a single-token global command (already
+                    // there) AND also any input typed during a numeric
+                    // sub-command phase (rotate angle, scale factor, scale
+                    // new-length). In those phases the user's input is
+                    // always a single token — space is a faster Enter and
+                    // shouldn't be a literal char.
+                    let in_numeric_subcmd =
+                        matches!(self.rotate_state, RotateState::WaitingForAngle(_))
+                        || matches!(self.scale_state,
+                              ScaleState::WaitingForFactor(_)
+                            | ScaleState::WaitingForNewLength(_, _));
                     let submit_via_space = space_pressed && {
                         let candidate = self.cmd.trim_end_matches(' ');
-                        is_complete_single_token_command(candidate)
+                        !candidate.is_empty()
+                            && (is_complete_single_token_command(candidate)
+                                || in_numeric_subcmd)
                     };
                     if submit_via_space {
                         // Strip the trailing space we just consumed.
