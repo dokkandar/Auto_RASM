@@ -1,0 +1,545 @@
+//! BPOLY-style boundary tracing for the Hatch pick-point flow.
+//!
+//! The classical AutoCAD BPOLY/BHATCH algorithm:
+//!  1. Gather every visible dobject that could form a boundary.
+//!  2. Cast a horizontal ray from the seed point. Sort intersections by t.
+//!  3. The first hit lies on the outer boundary.
+//!  4. Walk along the geometry, always picking the next edge that keeps
+//!     the seed on the same side (smallest CCW turn → inside on the left).
+//!  5. Trace returns to the start → closed loop. Repeat from hits 3, 5, …
+//!     to find islands.
+//!  6. Materialise as a polyline / region.
+//!
+//! Implementation strategy here:
+//!  * Tessellate every dobject into short straight segments tagged with
+//!    the source dobject index. Curves all become polylines, so the
+//!    algorithm works uniformly across Line / Arc / Circle / Ellipse /
+//!    EllipseArc / Polyline (bulge-aware) / Spline.
+//!  * Cluster segment endpoints within `JOIN_EPS` so segments meeting at
+//!    a shared corner share a graph node.
+//!  * Build the adjacency: cluster → list of (segment, other_cluster,
+//!    leaving angle).
+//!  * Ray cast in +X: only consider segments whose endpoints straddle
+//!    the seed's Y. Sort by x-intercept.
+//!  * Trace each candidate loop with the smallest-CCW-turn rule. Cap
+//!    walk length to avoid runaway on broken geometry.
+//!  * Classify all traced loops: the outer is the largest one containing
+//!    the seed; islands are the smaller ones inside the outer's bbox
+//!    that do NOT contain the seed.
+//!
+//! Limitations of this v1 slice:
+//!  * Pairwise intersections between drawn dobjects are NOT split — two
+//!    crossing lines won't form a face at their crossing. The common
+//!    "shapes connected at endpoints" case (rectangles, polygons with
+//!    arc corners) works; "lens between two overlapping circles" does
+//!    not. Splitting at intersections is a v2c follow-up.
+
+use cad_kernel::{DObject, Document, Geom, Vec2, EPS};
+
+/// Tolerance for treating two segment endpoints as the same graph node.
+/// Tessellation noise + user-drawn corners typically fall well within
+/// 1e-4 world units; raise if your project's typical units are extreme.
+pub const JOIN_EPS: f64 = 1e-4;
+
+/// Cap on a single boundary walk's length, in segments. Prevents runaway
+/// on broken or self-intersecting geometry. A real CAD drawing's
+/// boundary should never need this many segments at our tessellation
+/// density (32-64 per curve), so hitting the cap = malformed input.
+const MAX_TRACE_STEPS: usize = 8192;
+
+/// One short straight segment from the doc-wide tessellation. Carries
+/// the source dobject's index so future refinements (intersection-
+/// splitting, reuse-existing-boundary mode) can attribute each segment
+/// back to the dobject it came from.
+#[derive(Clone, Copy, Debug)]
+pub struct TessSeg {
+    pub a:   Vec2,
+    pub b:   Vec2,
+    #[allow(dead_code)]
+    pub src: usize,
+}
+
+/// Per-cluster adjacency: list of (segment_index, other_cluster_id,
+/// outgoing_angle). `outgoing_angle` is the direction vector pointing
+/// from THIS cluster toward the OTHER cluster (i.e. the direction along
+/// the segment when leaving this cluster).
+type AdjEntry = (usize, usize, f64);
+
+/// Tessellate every visible, non-hatch dobject into short straight
+/// segments. Closed geometries (Circle / Ellipse / closed Polyline)
+/// produce closed segment chains; open geometries produce open chains.
+/// Hatch dobjects are skipped — they're an output of this pipeline, not
+/// an input.
+pub fn tessellate_doc(doc: &Document) -> Vec<TessSeg> {
+    let mut out = Vec::new();
+    for (i, d) in doc.dobjects.iter().enumerate() {
+        if !d.style.visible { continue; }
+        if matches!(d.geom, Geom::Hatch(_) | Geom::Point(_)) { continue; }
+        tessellate_one(d, i, &mut out);
+    }
+    out
+}
+
+fn tessellate_one(d: &DObject, src: usize, out: &mut Vec<TessSeg>) {
+    match &d.geom {
+        Geom::Line(l) => {
+            out.push(TessSeg { a: l.a, b: l.b, src });
+        }
+        Geom::Arc(a) => {
+            push_arc(a.center, a.radius, a.start_angle, a.sweep_angle, 32, src, out);
+        }
+        Geom::Circle(c) => {
+            push_arc(c.center, c.radius, 0.0, std::f64::consts::TAU, 64, src, out);
+        }
+        Geom::Ellipse(e) => {
+            let mut last = e.point_at(0.0);
+            let n = 64;
+            for k in 1..=n {
+                let t = (k as f64) / (n as f64) * std::f64::consts::TAU;
+                let p = e.point_at(t);
+                out.push(TessSeg { a: last, b: p, src });
+                last = p;
+            }
+        }
+        Geom::EllipseArc(ea) => {
+            let n = 32;
+            let mut last = ea.ellipse.point_at(ea.start_param);
+            for k in 1..=n {
+                let t = (k as f64) / (n as f64);
+                let p = ea.ellipse.point_at(ea.start_param + ea.sweep_param * t);
+                out.push(TessSeg { a: last, b: p, src });
+                last = p;
+            }
+        }
+        Geom::Polyline(p) => {
+            let n = p.vertices.len();
+            if n < 2 { return; }
+            let end = if p.closed { n } else { n - 1 };
+            for k in 0..end {
+                let a = p.vertices[k].pos;
+                let b = p.vertices[(k + 1) % n].pos;
+                push_bulged(a, b, p.vertices[k].bulge, src, out);
+            }
+        }
+        Geom::Spline(s) => {
+            let samples = s.tessellate(64);
+            for w in samples.windows(2) {
+                out.push(TessSeg { a: w[0], b: w[1], src });
+            }
+        }
+        Geom::Point(_) | Geom::Hatch(_) => {}
+    }
+}
+
+fn push_arc(centre: Vec2, r: f64, start: f64, sweep: f64,
+            n: usize, src: usize, out: &mut Vec<TessSeg>)
+{
+    let mut last = Vec2::new(
+        centre.x + r * start.cos(),
+        centre.y + r * start.sin());
+    for k in 1..=n {
+        let t = (k as f64) / (n as f64);
+        let ang = start + sweep * t;
+        let p = Vec2::new(centre.x + r * ang.cos(), centre.y + r * ang.sin());
+        out.push(TessSeg { a: last, b: p, src });
+        last = p;
+    }
+}
+
+fn push_bulged(a: Vec2, b: Vec2, bulge: f64, src: usize, out: &mut Vec<TessSeg>) {
+    if bulge.abs() < 1e-9 {
+        out.push(TessSeg { a, b, src });
+        return;
+    }
+    let chord = b - a;
+    let chord_len = chord.len();
+    if chord_len < EPS {
+        out.push(TessSeg { a, b, src });
+        return;
+    }
+    let theta = 4.0 * bulge.atan();
+    let half = theta * 0.5;
+    let sin_half = half.sin();
+    if sin_half.abs() < EPS {
+        out.push(TessSeg { a, b, src });
+        return;
+    }
+    let r = chord_len / (2.0 * sin_half.abs());
+    let chord_hat = chord / chord_len;
+    let perp = Vec2::new(-chord_hat.y, chord_hat.x);
+    let mid  = (a + b) * 0.5;
+    let centre_off = r * half.cos();
+    let centre = mid + perp * (if bulge > 0.0 { centre_off } else { -centre_off });
+    let start_ang = (a - centre).angle();
+    let end_ang   = (b - centre).angle();
+    let sweep = if bulge > 0.0 {
+        (end_ang - start_ang).rem_euclid(std::f64::consts::TAU)
+    } else {
+        -((start_ang - end_ang).rem_euclid(std::f64::consts::TAU))
+    };
+    let n = 24_usize;
+    let mut last = a;
+    for k in 1..=n {
+        let t = (k as f64) / (n as f64);
+        let ang = start_ang + sweep * t;
+        let p = centre + Vec2::new(r * ang.cos(), r * ang.sin());
+        out.push(TessSeg { a: last, b: p, src });
+        last = p;
+    }
+}
+
+/// Cluster segment endpoints within `JOIN_EPS`. Returns
+///   * `endpoint_clusters[i] = (cluster_a, cluster_b)` for each segment
+///   * `cluster_pos[k]` = representative position of cluster `k`
+///
+/// Naive O(N·C) — fine for typical doc sizes; swap for a grid hash when
+/// profiling shows it matters.
+pub fn cluster_endpoints(segs: &[TessSeg])
+    -> (Vec<(usize, usize)>, Vec<Vec2>)
+{
+    let mut centres: Vec<Vec2> = Vec::new();
+    let mut endpoints: Vec<(usize, usize)> = Vec::with_capacity(segs.len());
+    let find_or_add = |p: Vec2, centres: &mut Vec<Vec2>| -> usize {
+        for (i, c) in centres.iter().enumerate() {
+            if (*c - p).len() < JOIN_EPS { return i; }
+        }
+        centres.push(p);
+        centres.len() - 1
+    };
+    for s in segs {
+        let a_id = find_or_add(s.a, &mut centres);
+        let b_id = find_or_add(s.b, &mut centres);
+        endpoints.push((a_id, b_id));
+    }
+    (endpoints, centres)
+}
+
+/// Build the adjacency table: for each cluster, list every segment that
+/// has it as an endpoint, along with the OTHER cluster the segment
+/// connects to and the outgoing angle (direction LEAVING this cluster).
+pub fn build_adjacency(
+    segs: &[TessSeg],
+    endpoints: &[(usize, usize)],
+    n_clusters: usize,
+) -> Vec<Vec<AdjEntry>> {
+    let mut adj: Vec<Vec<AdjEntry>> = vec![Vec::new(); n_clusters];
+    for (i, s) in segs.iter().enumerate() {
+        let (a_id, b_id) = endpoints[i];
+        if a_id == b_id { continue; }       // degenerate, skip
+        let dir_from_a = (s.b - s.a).angle();
+        let dir_from_b = (s.a - s.b).angle();
+        adj[a_id].push((i, b_id, dir_from_a));
+        adj[b_id].push((i, a_id, dir_from_b));
+    }
+    adj
+}
+
+/// Cast a +X horizontal ray from `seed` against every segment. Returns
+/// `(t, seg_idx, hit_pos)` sorted by `t`, with `t > 0` (strictly east of
+/// the seed). Horizontal segments are ignored — they lie ALONG the ray
+/// and contribute no clean crossing.
+pub fn ray_cast_horiz(seed: Vec2, segs: &[TessSeg])
+    -> Vec<(f64, usize, Vec2)>
+{
+    let mut hits = Vec::new();
+    for (i, s) in segs.iter().enumerate() {
+        let ay = s.a.y - seed.y;
+        let by = s.b.y - seed.y;
+        // Skip horizontal-ish segments (both endpoints near the ray).
+        if ay.abs() < EPS && by.abs() < EPS { continue; }
+        // Half-open Y-test — one endpoint above, one below.
+        let above_a = ay > 0.0;
+        let above_b = by > 0.0;
+        if above_a == above_b { continue; }
+        // Solve y = seed.y → a + u*(b - a), u ∈ [0,1].
+        let u = -ay / (by - ay);
+        if !(u >= 0.0 && u <= 1.0) { continue; }
+        let x = s.a.x + u * (s.b.x - s.a.x);
+        let t = x - seed.x;
+        if t > EPS {
+            hits.push((t, i, Vec2::new(x, seed.y)));
+        }
+    }
+    hits.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    hits
+}
+
+/// Trace a closed loop starting from segment `start_seg`, leaving
+/// `start_cluster`. At each junction, picks the smallest CCW turn —
+/// which traces the face on the LEFT of the walk direction.
+///
+/// Returns vertex positions including the closing repeat of the start;
+/// `None` if the walk hits a dead-end (cluster with no other edge) or
+/// the trace exceeds `MAX_TRACE_STEPS`.
+pub fn trace_loop(
+    start_seg: usize,
+    start_cluster: usize,
+    segs: &[TessSeg],
+    endpoints: &[(usize, usize)],
+    adj: &[Vec<AdjEntry>],
+    cluster_pos: &[Vec2],
+) -> Option<Vec<Vec2>> {
+    let _ = segs; // unused — kept for future intersection-split refinement
+    let mut verts: Vec<Vec2> = Vec::new();
+    let mut cur_seg = start_seg;
+    let mut cur_cluster = start_cluster;
+    verts.push(cluster_pos[cur_cluster]);
+    for _step in 0..MAX_TRACE_STEPS {
+        let (a_id, b_id) = endpoints[cur_seg];
+        let next_cluster = if cur_cluster == a_id { b_id } else if cur_cluster == b_id { a_id }
+            else { return None };
+        verts.push(cluster_pos[next_cluster]);
+        if next_cluster == start_cluster {
+            return Some(verts);
+        }
+        // Direction we ARRIVED at next_cluster, then reverse it — the
+        // "looking back" direction. The CCW turn from that to each
+        // outgoing edge's direction tells us how sharp a left turn it
+        // would be. Smallest positive CCW turn = sharpest left =
+        // boundary of the face on our LEFT.
+        let in_dir = (cluster_pos[next_cluster] - cluster_pos[cur_cluster]).angle();
+        let arrive_back = (in_dir + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU);
+        let mut best: Option<(usize, f64)> = None;
+        for &(sidx, _other, out_dir) in &adj[next_cluster] {
+            if sidx == cur_seg { continue; }
+            let turn = (out_dir - arrive_back).rem_euclid(std::f64::consts::TAU);
+            // Reject zero (would mean a coincident reverse edge, which
+            // is the back-edge anyway).
+            if turn < 1e-9 { continue; }
+            if best.map_or(true, |(_, t)| turn < t) {
+                best = Some((sidx, turn));
+            }
+        }
+        let (next_seg, _) = best?;
+        cur_seg = next_seg;
+        cur_cluster = next_cluster;
+    }
+    None
+}
+
+/// Polygon area, signed. Positive = CCW, negative = CW.
+fn polygon_signed_area(verts: &[Vec2]) -> f64 {
+    let n = verts.len();
+    if n < 3 { return 0.0; }
+    let mut a = 0.0;
+    for i in 0..n {
+        let p = verts[i];
+        let q = verts[(i + 1) % n];
+        a += p.x * q.y - q.x * p.y;
+    }
+    a * 0.5
+}
+
+/// Standard even-odd ray-cast PIP — duplicated here so the module has
+/// no dependency on app-level helpers.
+fn point_in_polygon(p: Vec2, verts: &[Vec2]) -> bool {
+    let n = verts.len();
+    if n < 3 { return false; }
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let pi = verts[i];
+        let pj = verts[j];
+        if (pi.y > p.y) != (pj.y > p.y) {
+            let x_int = pi.x + (p.y - pi.y) * (pj.x - pi.x) / (pj.y - pi.y);
+            if p.x < x_int { inside = !inside; }
+        }
+        j = i;
+    }
+    inside
+}
+
+fn polygon_bbox(verts: &[Vec2]) -> (Vec2, Vec2) {
+    let mut min = Vec2::new(f64::INFINITY, f64::INFINITY);
+    let mut max = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for v in verts {
+        if v.x < min.x { min.x = v.x; }
+        if v.y < min.y { min.y = v.y; }
+        if v.x > max.x { max.x = v.x; }
+        if v.y > max.y { max.y = v.y; }
+    }
+    (min, max)
+}
+
+/// Two polygons "the same" if their bbox centres and absolute areas
+/// match within tolerance. Cheap dedup — robust enough for the
+/// "different hits, same traced loop" case.
+fn polygons_equivalent(a: &[Vec2], b: &[Vec2]) -> bool {
+    let area_a = polygon_signed_area(a).abs();
+    let area_b = polygon_signed_area(b).abs();
+    if (area_a - area_b).abs() > area_a.max(area_b) * 1e-3 + 1e-6 { return false; }
+    let (amin, amax) = polygon_bbox(a);
+    let (bmin, bmax) = polygon_bbox(b);
+    let acx = (amin.x + amax.x) * 0.5;
+    let acy = (amin.y + amax.y) * 0.5;
+    let bcx = (bmin.x + bmax.x) * 0.5;
+    let bcy = (bmin.y + bmax.y) * 0.5;
+    ((acx - bcx).abs() + (acy - bcy).abs()) < 1e-4 * (area_a.sqrt() + 1.0)
+}
+
+/// Result of a successful boundary trace.
+#[derive(Debug)]
+pub struct TracedBoundary {
+    /// Outer loop, CCW orientation, last vertex repeats the first.
+    pub outer: Vec<Vec2>,
+    /// Island loops, contained inside `outer`. Each closed (first == last).
+    pub islands: Vec<Vec<Vec2>>,
+}
+
+/// Full BPOLY pipeline. Returns `None` if no closed boundary surrounds
+/// the seed, or if every trace attempt failed.
+pub fn trace_boundary_at(doc: &Document, seed: Vec2) -> Option<TracedBoundary> {
+    let segs = tessellate_doc(doc);
+    if segs.is_empty() { return None; }
+    let (endpoints, cluster_pos) = cluster_endpoints(&segs);
+    let n_clusters = cluster_pos.len();
+    let adj = build_adjacency(&segs, &endpoints, n_clusters);
+    let hits = ray_cast_horiz(seed, &segs);
+    if hits.is_empty() { return None; }
+
+    // Try to trace a loop from EACH hit. Each starting hit is a
+    // segment that crosses the +X ray. We start the walk at the SOUTH
+    // endpoint of that segment so the walk direction is northward,
+    // which puts the WEST side (where the seed is) on our LEFT.
+    let mut traced: Vec<Vec<Vec2>> = Vec::new();
+    for &(_, seg_idx, _) in &hits {
+        let (a_id, b_id) = endpoints[seg_idx];
+        let pa = cluster_pos[a_id];
+        let pb = cluster_pos[b_id];
+        let start_cluster = if pa.y < pb.y { a_id } else { b_id };
+        let Some(loop_verts) = trace_loop(
+            seg_idx, start_cluster, &segs, &endpoints, &adj, &cluster_pos)
+        else { continue; };
+        if loop_verts.len() < 3 { continue; }
+        if traced.iter().any(|t| polygons_equivalent(t, &loop_verts)) { continue; }
+        traced.push(loop_verts);
+    }
+    if traced.is_empty() { return None; }
+
+    // Classify: outer = SMALLEST loop containing the seed (AutoCAD
+    // BPOLY semantics — click in a nested region, hatch the innermost
+    // bounded one). Islands = strictly-smaller loops inside the outer
+    // that do NOT contain the seed.
+    let mut outer_idx: Option<usize> = None;
+    let mut outer_area = f64::INFINITY;
+    for (i, t) in traced.iter().enumerate() {
+        if !point_in_polygon(seed, t) { continue; }
+        let area = polygon_signed_area(t).abs();
+        if area < outer_area {
+            outer_area = area;
+            outer_idx = Some(i);
+        }
+    }
+    let outer_idx = outer_idx?;
+    let outer = traced[outer_idx].clone();
+    let (omin, omax) = polygon_bbox(&outer);
+    let mut islands: Vec<Vec<Vec2>> = Vec::new();
+    for (i, t) in traced.iter().enumerate() {
+        if i == outer_idx { continue; }
+        let (tmin, tmax) = polygon_bbox(t);
+        let inside_bbox = tmin.x >= omin.x - JOIN_EPS && tmin.y >= omin.y - JOIN_EPS
+                       && tmax.x <= omax.x + JOIN_EPS && tmax.y <= omax.y + JOIN_EPS;
+        if !inside_bbox { continue; }
+        if point_in_polygon(seed, t) { continue; }   // would not be an island
+        // Need at least one vertex of the candidate inside `outer` to
+        // count as a real island (filters out unrelated loops far away).
+        if !t.iter().any(|v| point_in_polygon(*v, &outer)) { continue; }
+        if islands.iter().any(|x| polygons_equivalent(x, t)) { continue; }
+        islands.push(t.clone());
+    }
+    Some(TracedBoundary { outer, islands })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cad_kernel::{Circle, DObject, Document, Line, Polyline, PolyVertex};
+
+    fn doc_from(dobjects: Vec<DObject>) -> Document {
+        let mut doc = Document::default();
+        for d in dobjects {
+            doc.push(d);
+        }
+        doc
+    }
+
+    /// 4 lines forming a 10×10 square at the origin — no closed
+    /// polyline involved. Click at (5,5) should trace the square.
+    #[test]
+    fn square_from_four_lines() {
+        let doc = doc_from(vec![
+            Line { a: Vec2::new(0.0, 0.0), b: Vec2::new(10.0, 0.0) }.into(),
+            Line { a: Vec2::new(10.0, 0.0), b: Vec2::new(10.0, 10.0) }.into(),
+            Line { a: Vec2::new(10.0, 10.0), b: Vec2::new(0.0, 10.0) }.into(),
+            Line { a: Vec2::new(0.0, 10.0), b: Vec2::new(0.0, 0.0) }.into(),
+        ]);
+        let tb = trace_boundary_at(&doc, Vec2::new(5.0, 5.0))
+            .expect("must trace 4-line square");
+        let area = polygon_signed_area(&tb.outer).abs();
+        assert!((area - 100.0).abs() < 1e-3, "expected ~100, got {}", area);
+        assert!(tb.islands.is_empty());
+    }
+
+    /// Outer square + inner circle island. Click inside square but
+    /// outside circle. Expected: outer = square, islands = [circle].
+    #[test]
+    fn square_with_circle_island() {
+        let doc = doc_from(vec![
+            // Outer closed polyline rectangle
+            Polyline {
+                vertices: vec![
+                    PolyVertex { pos: Vec2::new(0.0, 0.0),  bulge: 0.0 },
+                    PolyVertex { pos: Vec2::new(20.0, 0.0), bulge: 0.0 },
+                    PolyVertex { pos: Vec2::new(20.0, 20.0),bulge: 0.0 },
+                    PolyVertex { pos: Vec2::new(0.0, 20.0), bulge: 0.0 },
+                ],
+                closed: true,
+            }.into(),
+            // Inner circle
+            Circle { center: Vec2::new(10.0, 10.0), radius: 3.0 }.into(),
+        ]);
+        // Seed inside square but to the LEFT of the circle
+        let tb = trace_boundary_at(&doc, Vec2::new(3.0, 10.0))
+            .expect("must trace outer + island");
+        let outer_area = polygon_signed_area(&tb.outer).abs();
+        assert!((outer_area - 400.0).abs() < 1e-2,
+            "expected ~400, got {}", outer_area);
+        assert_eq!(tb.islands.len(), 1, "expected exactly one island");
+    }
+
+    /// Click inside the circle, NOT the square: outer should be the
+    /// circle (the smallest containing loop).
+    #[test]
+    fn click_inside_island_makes_island_the_outer() {
+        let doc = doc_from(vec![
+            Polyline {
+                vertices: vec![
+                    PolyVertex { pos: Vec2::new(0.0, 0.0),  bulge: 0.0 },
+                    PolyVertex { pos: Vec2::new(20.0, 0.0), bulge: 0.0 },
+                    PolyVertex { pos: Vec2::new(20.0, 20.0),bulge: 0.0 },
+                    PolyVertex { pos: Vec2::new(0.0, 20.0), bulge: 0.0 },
+                ],
+                closed: true,
+            }.into(),
+            Circle { center: Vec2::new(10.0, 10.0), radius: 3.0 }.into(),
+        ]);
+        // Seed at circle centre
+        let tb = trace_boundary_at(&doc, Vec2::new(10.0, 10.0))
+            .expect("must trace circle as outer");
+        let area = polygon_signed_area(&tb.outer).abs();
+        let circle_area_approx = std::f64::consts::PI * 3.0 * 3.0;
+        let rel = (area - circle_area_approx).abs() / circle_area_approx;
+        // 64-segment polygon → < 0.5% area error vs analytic
+        assert!(rel < 0.01,
+            "expected ~{}, got {} (rel err {})", circle_area_approx, area, rel);
+    }
+
+    /// Seed in empty space → ray finds no hits → None.
+    #[test]
+    fn no_boundary_returns_none() {
+        let doc = doc_from(vec![
+            Line { a: Vec2::new(0.0, 0.0), b: Vec2::new(10.0, 0.0) }.into(),
+        ]);
+        assert!(trace_boundary_at(&doc, Vec2::new(5.0, 100.0)).is_none());
+    }
+}

@@ -1862,7 +1862,20 @@ impl CadApp {
         for (i, d) in self.doc.dobjects.iter().enumerate() {
             let contains = match &d.geom {
                 Geom::Polyline(p) if p.closed && p.vertices.len() >= 3 => {
-                    point_in_polygon(world, p.vertices.iter().map(|v| v.pos))
+                    // Tessellate bulges first so the PIP polygon matches
+                    // what the user sees (and what resolve_hatch_loops
+                    // would use). Without this, clicks inside a bulge
+                    // crescent report "outside" — render and hit-test
+                    // disagree on the shape.
+                    let mut verts: Vec<Vec2> = Vec::with_capacity(p.vertices.len() * 4);
+                    let n = p.vertices.len();
+                    verts.push(p.vertices[0].pos);
+                    for k in 0..n {
+                        let a = p.vertices[k].pos;
+                        let b = p.vertices[(k + 1) % n].pos;
+                        append_arc_world_samples(a, b, p.vertices[k].bulge, &mut verts);
+                    }
+                    point_in_polygon(world, verts)
                 }
                 Geom::Circle(c) => {
                     (world - c.center).len() < c.radius
@@ -1983,6 +1996,111 @@ impl CadApp {
         // press the button. Only logs when the debug window is open
         // (no-op otherwise via hatch_dbg).
         self.dump_hatch_state();
+    }
+
+    /// Pick-point hatch: BPOLY-style flow. First tries the cheap
+    /// "self-closed dobject containing the seed" path; if that fails,
+    /// runs the full trace pipeline (tessellate doc + endpoint graph
+    /// + horizontal ray cast + CCW-turn loop walk + island classify)
+    /// to discover a closed boundary surrounding the seed even when
+    /// it's formed by a chain of separate line/arc/polyline dobjects.
+    ///
+    /// On trace success, materialises every loop (outer + islands) as
+    /// a new closed Polyline dobject on the current layer, then pushes
+    /// a Hatch referencing those new dobjects' handles. Materialised
+    /// polylines are normal dobjects — the user can grip-edit them
+    /// later (the hatch updates because it's handle-referenced).
+    fn apply_pick_point_hatch(&mut self, seed: Vec2) -> bool {
+        // Cheap path first: hits the typical "click inside one closed
+        // shape" workflow without paying for the trace.
+        if let Some(idx) = self.find_smallest_containing_closed(seed) {
+            let kind = self.doc.dobjects.get(idx)
+                .map(|d| dobject_kind_name(&d.geom))
+                .unwrap_or("?");
+            self.hatch_dbg(format!(
+                "  → smallest containing dobject #{} ({})", idx, kind));
+            self.selection = vec![idx];
+            self.apply_hatch();
+            self.selection.clear();
+            return true;
+        }
+        // Full trace path — handles arbitrary chains.
+        let tb = match crate::hatch_trace::trace_boundary_at(&self.doc, seed) {
+            Some(tb) => tb,
+            None => {
+                self.hatch_dbg(
+                    "  → trace found no closed boundary around the click");
+                self.history.push(
+                    "  ! hatch pick-point: no closed boundary contains the click".into());
+                return false;
+            }
+        };
+        self.hatch_dbg(format!(
+            "  → traced boundary: outer {} verts, {} island(s)",
+            tb.outer.len(), tb.islands.len()));
+        self.snapshot_doc();
+        let active_layer = self.doc.layers.active;
+        let mut handles: Vec<cad_kernel::Handle> = Vec::new();
+        // Outer first, then islands — preserves the even-odd ordering
+        // the hatch render expects.
+        let mut loops_to_push: Vec<Vec<Vec2>> = Vec::with_capacity(1 + tb.islands.len());
+        loops_to_push.push(tb.outer);
+        loops_to_push.extend(tb.islands);
+        for loop_verts in loops_to_push {
+            let mut verts: Vec<cad_kernel::PolyVertex> = loop_verts.iter()
+                .map(|v| cad_kernel::PolyVertex { pos: *v, bulge: 0.0 })
+                .collect();
+            // Drop the closing repeat if present — closed polylines
+            // imply the last→first edge automatically.
+            if verts.len() >= 2 {
+                let first = verts[0].pos;
+                let last  = verts[verts.len() - 1].pos;
+                if (last - first).len() < crate::hatch_trace::JOIN_EPS {
+                    verts.pop();
+                }
+            }
+            if verts.len() < 3 { continue; }
+            let pl = cad_kernel::Polyline { vertices: verts, closed: true };
+            let mut d = cad_kernel::DObject::from(pl);
+            d.style = cad_kernel::Style::on_layer(active_layer);
+            let idx = self.doc.push(d);
+            handles.push(self.doc.dobjects[idx].handle);
+        }
+        if handles.is_empty() {
+            self.hatch_dbg("  → trace produced no usable polylines");
+            return false;
+        }
+        // Consume pending pattern args (same logic as apply_hatch).
+        let (pat_name, pat_scale, pat_angle) =
+            std::mem::replace(&mut self.pending_hatch_pattern, (None, 1.0, 0.0));
+        let pattern = match pat_name {
+            None       => cad_kernel::HatchPattern::Solid,
+            Some(name) => cad_kernel::HatchPattern::Pattern {
+                name: name.to_ascii_uppercase(),
+                scale: pat_scale,
+                angle_deg: pat_angle,
+            },
+        };
+        let pattern_label = match &pattern {
+            cad_kernel::HatchPattern::Solid => "SOLID".to_string(),
+            cad_kernel::HatchPattern::Pattern { name, .. } => name.clone(),
+        };
+        let loop_count = handles.len();
+        self.hatch_dbg(format!(
+            "  pushing Hatch (traced): pattern={}, scale={:.3}, angle={:.2}, {} loop(s)",
+            pattern_label, pat_scale, pat_angle, loop_count));
+        let mut d = cad_kernel::DObject::from(cad_kernel::Hatch {
+            boundary_handles: handles,
+            pattern,
+        });
+        d.style = cad_kernel::Style::on_layer(active_layer);
+        self.doc.push(d);
+        self.gpu_dirty = true;
+        self.index_dirty = true;
+        self.history.push(format!(
+            "  + hatch ({}): traced boundary, {} loop(s) materialised",
+            pattern_label, loop_count));
+        true
     }
 
     /// Click on a dobject during a selection session. Plain click = ADD
@@ -7458,34 +7576,17 @@ impl eframe::App for CadApp {
                         .unwrap_or_else(|| self.apply_constraints(world));
 
                     // Hatch pick-point — consumes the click before any
-                    // other handler. Finds the smallest closed dobject
-                    // containing the click and hatches it with the
-                    // pre-stashed pattern settings. Misses → message.
+                    // other handler. BPOLY-style pipeline: tries a
+                    // self-closed containing dobject first; falls
+                    // through to ray-cast + boundary trace + island
+                    // detect + materialise if needed.
                     if self.hatch_pick_point_armed {
                         self.hatch_pick_point_armed = false;
                         self.clear_prompt();
                         self.hatch_dbg(format!(
                             "pick-point click at world ({:.3}, {:.3})",
                             world.x, world.y));
-                        match self.find_smallest_containing_closed(world) {
-                            Some(handle_idx) => {
-                                let kind = self.doc.dobjects.get(handle_idx)
-                                    .map(|d| dobject_kind_name(&d.geom))
-                                    .unwrap_or("?");
-                                self.hatch_dbg(format!(
-                                    "  → smallest containing dobject #{} ({})",
-                                    handle_idx, kind));
-                                self.selection = vec![handle_idx];
-                                self.apply_hatch();
-                                self.selection.clear();
-                            }
-                            None => {
-                                self.hatch_dbg(
-                                    "  → no closed dobject contains the click".to_string());
-                                self.history.push(
-                                    "  ! hatch pick-point: no closed dobject contains the click".into());
-                            }
-                        }
+                        self.apply_pick_point_hatch(world);
                         return;
                     }
 
