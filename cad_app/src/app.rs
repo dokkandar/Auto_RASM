@@ -195,9 +195,18 @@ pub struct CadApp {
     hatch_dialog_angle: f64,
     /// "Click inside a region to hatch it" mode — armed by the
     /// dialog's "Pick Point" button. Next pointer-mode click runs the
-    /// smallest-containing-closed-dobject search, hatches it, and
-    /// disarms. Esc disarms manually.
+    /// smallest-containing-closed-dobject search, hatches it, and —
+    /// per user request — stays armed for additional picks until
+    /// Enter or Esc ends the session. Pattern args are remembered
+    /// across clicks via `hatch_pick_point_session`.
     hatch_pick_point_armed: bool,
+    /// Pattern args for the active pick-point SESSION (the period
+    /// from "Pick Point button clicked" through "Enter / Esc ends
+    /// it"). Restored into `pending_hatch_pattern` before each
+    /// click's apply, since `apply_hatch` consumes that field —
+    /// without snapshotting, the second click would render SOLID
+    /// instead of the originally-chosen pattern.
+    hatch_pick_point_session: Option<(Option<String>, f64, f64)>,
     /// ACI polar-wheel picker — shared state for the floating picker
     /// window. The same window serves every call site; `pick_request`
     /// names who asked for the pick so the chosen ACI flows back to
@@ -684,6 +693,7 @@ impl Default for CadApp {
             hatch_dialog_scale: 1.0,
             hatch_dialog_angle: 0.0,
             hatch_pick_point_armed: false,
+            hatch_pick_point_session: None,
             fps_smooth: 0.0,
             index:       None,
             index_dirty: true,
@@ -2767,10 +2777,18 @@ impl CadApp {
                 }
             } else {
                 self.hatch_pick_point_armed = true;
+                // Remember the pattern for the whole pick-point session
+                // so successive clicks all use it (apply_hatch consumes
+                // pending_hatch_pattern; we re-fill it after each click).
+                self.hatch_pick_point_session = Some((
+                    pattern.clone(),
+                    self.hatch_dialog_scale,
+                    self.hatch_dialog_angle,
+                ));
                 self.hatch_dbg(
-                    "  Pick Point button — armed canvas click".to_string());
+                    "  Pick Point button — armed canvas click (persistent until Enter)".to_string());
                 self.set_prompt(format!(
-                    "hatch ({}): click inside a closed region  [Esc=cancel]",
+                    "hatch ({}): click inside closed region(s); Enter to finish  [Esc=cancel]",
                     style));
             }
         }
@@ -6554,6 +6572,8 @@ impl eframe::App for CadApp {
             self.tool = Tool::None;
             self.picking_source = false;
             self.hatch_pick_point_armed = false;
+            self.hatch_pick_point_session = None;
+            self.pending_hatch_pattern = (None, 1.0, 0.0);
             self.hatch_dialog_open = false;
             self.intersect_pending_click = false;
             self.intersect_view_pending  = false;
@@ -6664,6 +6684,20 @@ impl eframe::App for CadApp {
         // also see the space (harmless: cmd stays "trim-empty"), then
         // strip any leading whitespace at the end of this block.
         let trigger = enter_now || (space_now && cmd_is_empty);
+        // Persistent hatch pick-point — Enter ends the session.
+        // Sits at the top of the cascade so it consumes Enter before
+        // any of the other handlers (which might re-run the last
+        // command, etc.).
+        if trigger && cmd_is_empty && self.hatch_pick_point_armed {
+            self.hatch_pick_point_armed = false;
+            self.hatch_pick_point_session = None;
+            self.pending_hatch_pattern = (None, 1.0, 0.0);
+            self.clear_prompt();
+            self.hatch_dbg("pick-point session ended via Enter");
+            self.history.push("  hatch pick-point session ended".into());
+            if space_now { self.cmd.clear(); }
+            return;
+        }
         if trigger && cmd_is_empty {
             if self.select_mode != SelectMode::Off {
                 // Item 4 — 2-stage cancel for a select-mode wait with an
@@ -8182,13 +8216,29 @@ impl eframe::App for CadApp {
                     // self-closed containing dobject first; falls
                     // through to ray-cast + boundary trace + island
                     // detect + materialise if needed.
+                    //
+                    // Session stays ARMED across clicks: each pick
+                    // creates one hatch, then we re-fill
+                    // pending_hatch_pattern from the session snapshot
+                    // and update the prompt for the next pick.
+                    // Enter / Esc ends the session.
                     if self.hatch_pick_point_armed {
-                        self.hatch_pick_point_armed = false;
-                        self.clear_prompt();
                         self.hatch_dbg(format!(
                             "pick-point click at world ({:.3}, {:.3})",
                             world.x, world.y));
                         self.apply_pick_point_hatch(world);
+                        // Restore the pattern for the next click in
+                        // this session; refresh the prompt so the user
+                        // knows we're still waiting for picks.
+                        if let Some(pat) = self.hatch_pick_point_session.clone() {
+                            self.pending_hatch_pattern = pat;
+                            let style = self.hatch_pick_point_session.as_ref()
+                                .and_then(|(n, _, _)| n.clone())
+                                .unwrap_or_else(|| "SOLID".to_string());
+                            self.set_prompt(format!(
+                                "hatch ({}): click another region OR Enter to finish  [Esc=cancel]",
+                                style));
+                        }
                         return;
                     }
 
