@@ -2396,6 +2396,28 @@ impl CadApp {
             None => {
                 self.hatch_dbg(
                     "  → trace found no closed boundary around the click");
+                // FALLBACK: cheap path with auto-islands. The trace can
+                // fail at junctions where multiple dobjects share a
+                // vertex and the CCW-turn rule is ambiguous (e.g. the
+                // polyline #8 + polyline #12 shared-corner case the
+                // user surfaced — trace diverts into the wrong sub-loop
+                // and never closes). The cheap path with auto-islands
+                // produces a useful answer in that case: outer = the
+                // single containing closed dobject, islands = any
+                // closed dobjects fully nested inside it.
+                if let Some(idx) = self.find_smallest_containing_closed(seed) {
+                    let kind = self.doc.dobjects.get(idx)
+                        .map(|d| dobject_kind_name(&d.geom))
+                        .unwrap_or("?");
+                    let islands = self.collect_islands_inside(idx, seed);
+                    self.hatch_dbg(format!(
+                        "  → trace failed; falling back to CHEAP PATH with outer #{} ({}) + {} auto-island(s)",
+                        idx, kind, islands.len()));
+                    self.selection = std::iter::once(idx).chain(islands).collect();
+                    self.apply_hatch();
+                    self.selection.clear();
+                    return true;
+                }
                 self.history.push(
                     "  ! hatch pick-point: no closed boundary contains the click".into());
                 return false;
