@@ -183,6 +183,16 @@ pub struct CadApp {
     /// after the boundary-selection session finalises. Default
     /// (None, 1.0, 0.0) = solid fill.
     pending_hatch_pattern: (Option<String>, f64, f64),
+    /// "Choose Hatch Attributes" modal — open when the user runs bare
+    /// `hatch` so they can pick pattern + scale + angle with a live
+    /// preview before any boundary is selected. Mirrors LibreCAD's
+    /// dialog. State lives here so the dialog persists last-used
+    /// choices across openings.
+    hatch_dialog_open:  bool,
+    hatch_dialog_solid: bool,
+    hatch_dialog_name:  String,     // catalog name when solid==false
+    hatch_dialog_scale: f64,
+    hatch_dialog_angle: f64,
     /// ACI polar-wheel picker — shared state for the floating picker
     /// window. The same window serves every call site; `pick_request`
     /// names who asked for the pick so the chosen ACI flows back to
@@ -656,6 +666,11 @@ impl Default for CadApp {
             move_state:         MoveState::Off,
             queued_op:          QueuedOp::None,
             pending_hatch_pattern: (None, 1.0, 0.0),
+            hatch_dialog_open:  false,
+            hatch_dialog_solid: false,
+            hatch_dialog_name:  "ANSI31".into(),
+            hatch_dialog_scale: 1.0,
+            hatch_dialog_angle: 0.0,
             fps_smooth: 0.0,
             index:       None,
             index_dirty: true,
@@ -1336,6 +1351,18 @@ impl CadApp {
                 }
             }
             Ok(Command::Hatch { pattern, scale, angle_deg }) => {
+                // No args → open the attributes dialog so the user
+                // picks pattern + scale + angle with a live preview
+                // BEFORE picking the boundary. With args, run directly
+                // (the scriptable / power-user path).
+                if pattern.is_none() && (scale - 1.0).abs() < 1e-9
+                    && angle_deg.abs() < 1e-9
+                {
+                    self.hatch_dialog_open = true;
+                    self.set_prompt(
+                        "hatch: pick pattern + scale + angle in the dialog, then click OK");
+                    return;
+                }
                 self.pending_hatch_pattern = (pattern.clone(), scale, angle_deg);
                 if self.selection.is_empty() {
                     self.begin_selection(SelectMode::ForSelect);
@@ -1588,27 +1615,34 @@ impl CadApp {
         let mut loops: Vec<Vec<Vec2>> = Vec::with_capacity(h.boundary_handles.len());
         for handle in &h.boundary_handles {
             let Some(d) = self.doc.find_by_handle(*handle) else { continue; };
-            // MVP supports closed polyline boundaries only. Future: any
-            // closed chain of lines / arcs / polylines (boundary
-            // traversal helper in the kernel).
-            let Geom::Polyline(p) = &d.geom else { continue; };
-            if !p.closed || p.vertices.len() < 3 { continue; }
-            // Tessellate the closed polyline into screen-independent
-            // world vertices. Straight segments contribute one vertex;
-            // arc segments contribute many. We sample the arc with a
-            // fixed angular density here (vs the on-screen-pixel
-            // density used in the dobject renderer) — fill tessellation
-            // doesn't need to track zoom so we can keep it cheap.
-            let mut loop_verts: Vec<Vec2> = Vec::new();
-            let n = p.vertices.len();
-            loop_verts.push(p.vertices[0].pos);
-            for i in 0..n {
-                let a = p.vertices[i].pos;
-                let b = p.vertices[(i + 1) % n].pos;
-                let bulge = p.vertices[i].bulge;
-                append_arc_world_samples(a, b, bulge, &mut loop_verts);
+            // Any closed boundary dobject is fair game now —
+            // Polyline (closed), Circle, Ellipse. Open dobjects and
+            // arcs would need boundary-traversal (chain into a loop);
+            // queued for the pick-point slice.
+            let loop_verts: Option<Vec<Vec2>> = match &d.geom {
+                Geom::Polyline(p) if p.closed && p.vertices.len() >= 3 => {
+                    let mut v: Vec<Vec2> = Vec::with_capacity(p.vertices.len() + 1);
+                    v.push(p.vertices[0].pos);
+                    let n = p.vertices.len();
+                    for i in 0..n {
+                        let a = p.vertices[i].pos;
+                        let b = p.vertices[(i + 1) % n].pos;
+                        let bulge = p.vertices[i].bulge;
+                        append_arc_world_samples(a, b, bulge, &mut v);
+                    }
+                    Some(v)
+                }
+                Geom::Circle(c) => {
+                    Some(tessellate_circle_loop(c.center, c.radius, 64))
+                }
+                Geom::Ellipse(e) => {
+                    Some(tessellate_ellipse_loop(e, 64))
+                }
+                _ => None,
+            };
+            if let Some(v) = loop_verts {
+                loops.push(v);
             }
-            loops.push(loop_verts);
         }
         loops
     }
@@ -1791,6 +1825,9 @@ impl CadApp {
                 Geom::Polyline(p) if p.closed && p.vertices.len() >= 3 => {
                     handles.push(d.handle);
                 }
+                Geom::Circle(_) | Geom::Ellipse(_) => {
+                    handles.push(d.handle);
+                }
                 _ => skipped += 1,
             }
         }
@@ -1955,6 +1992,181 @@ impl CadApp {
     // Egui-port of LibreCAD's `qg_layerwidget`. Operates directly on
     // `self.doc.layers` (the `LayerTable` from cad_kernel). Active layer
     // = the one new Dobjects get assigned to on `Document::push`.
+
+    /// "Choose Hatch Attributes" modal — pattern + scale + angle +
+    /// live preview. Mirrors LibreCAD's hatch dialog. OK feeds into
+    /// the same `apply_hatch` path as the command-line form; Cancel
+    /// drops the pending state. Opens whenever the user types bare
+    /// `hatch` with no args.
+    fn render_hatch_dialog(&mut self, ctx: &egui::Context) {
+        if !self.hatch_dialog_open { return; }
+        let mut open = true;
+        let mut clicked_ok     = false;
+        let mut clicked_cancel = false;
+        egui::Window::new("Choose Hatch Attributes")
+            .id(egui::Id::new("hatch_dialog"))
+            .open(&mut open)
+            .default_size(egui::vec2(560.0, 360.0))
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    // --- LEFT: pattern + scale + angle ---
+                    ui.vertical(|ui| {
+                        ui.heading("Pattern");
+                        ui.add_space(4.0);
+                        ui.checkbox(&mut self.hatch_dialog_solid, "Solid Fill");
+                        ui.add_space(4.0);
+                        ui.add_enabled_ui(!self.hatch_dialog_solid, |ui| {
+                            egui::ComboBox::from_id_salt("hatch_pattern_combo")
+                                .selected_text(&self.hatch_dialog_name)
+                                .width(200.0)
+                                .show_ui(ui, |ui| {
+                                    for name in cad_kernel::patterns::PATTERN_NAMES {
+                                        if *name == "SOLID" { continue; }
+                                        ui.selectable_value(
+                                            &mut self.hatch_dialog_name,
+                                            (*name).to_string(),
+                                            *name);
+                                    }
+                                });
+                        });
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Scale:");
+                            ui.add(egui::DragValue::new(&mut self.hatch_dialog_scale)
+                                .speed(0.05).range(0.05..=100.0));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Angle:");
+                            ui.add(egui::DragValue::new(&mut self.hatch_dialog_angle)
+                                .speed(1.0).range(-360.0..=360.0).suffix("°"));
+                        });
+                    });
+                    ui.separator();
+                    // --- RIGHT: live preview ---
+                    ui.vertical(|ui| {
+                        ui.heading("Preview");
+                        ui.add_space(4.0);
+                        let (rect, _resp) = ui.allocate_exact_size(
+                            egui::vec2(240.0, 240.0), egui::Sense::hover());
+                        let p = ui.painter_at(rect);
+                        // Backdrop
+                        p.rect_filled(rect, 0.0,
+                            egui::Color32::from_rgb(18, 22, 28));
+                        p.rect_stroke(rect, 0.0,
+                            egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 80, 95)));
+                        // Square boundary in preview-local coords
+                        let pad = 18.0_f32;
+                        let bound = egui::Rect::from_min_max(
+                            rect.left_top() + egui::vec2(pad, pad),
+                            rect.right_bottom() - egui::vec2(pad, pad));
+                        let accent = egui::Color32::from_rgb(255, 80, 80);
+                        // Pattern fill preview
+                        if self.hatch_dialog_solid {
+                            p.rect_filled(bound, 0.0, accent);
+                        } else {
+                            // Render the chosen pattern inside `bound`
+                            // by walking each LineFamily, generating
+                            // parallel screen-space lines, clipping to
+                            // bound. No world↔screen transform — the
+                            // preview just shows the pattern's shape.
+                            let families = cad_kernel::patterns::lookup(
+                                &self.hatch_dialog_name);
+                            let user_angle = self.hatch_dialog_angle.to_radians();
+                            let user_scale = self.hatch_dialog_scale.max(0.05);
+                            // World→preview scale: ~10 px per world unit
+                            // so the catalog's natural spacings of a
+                            // few mm read as visible textures.
+                            let px_per_unit = 10.0_f32;
+                            for fam in &families {
+                                let theta = fam.angle + user_angle;
+                                let spacing_px = (fam.spacing * user_scale) as f32 * px_per_unit;
+                                if spacing_px < 1.0 { continue; }   // safety
+                                let cos = theta.cos() as f32;
+                                let sin = theta.sin() as f32;
+                                // bbox diag = max distance from any
+                                // point in bound to any other, gives a
+                                // safe range to walk.
+                                let diag = (bound.width()*bound.width()
+                                            + bound.height()*bound.height()).sqrt();
+                                let n_lines = (diag / spacing_px).ceil() as i32;
+                                let centre = bound.center();
+                                for k in -n_lines..=n_lines {
+                                    let s = (k as f32) * spacing_px;
+                                    // Line through centre+s*normal, direction = (cos, sin).
+                                    let nx = -sin; let ny = cos;
+                                    let mid = egui::pos2(
+                                        centre.x + nx * s,
+                                        centre.y + ny * s);
+                                    let a = egui::pos2(
+                                        mid.x - cos * diag,
+                                        mid.y - sin * diag);
+                                    let b = egui::pos2(
+                                        mid.x + cos * diag,
+                                        mid.y + sin * diag);
+                                    // Clip the line to bound via
+                                    // Cohen-Sutherland-lite (egui has
+                                    // no built-in line clip; do a
+                                    // parametric clamp against the
+                                    // 4 edges).
+                                    if let Some((p1, p2)) = clip_line_to_rect(a, b, bound) {
+                                        p.line_segment([p1, p2],
+                                            egui::Stroke::new(1.0, accent));
+                                    }
+                                }
+                            }
+                        }
+                        // Centre marker (the "+" shown in LibreCAD's preview)
+                        let c = rect.center();
+                        let mk = egui::Stroke::new(1.0,
+                            egui::Color32::from_rgb(80, 90, 105));
+                        p.line_segment(
+                            [egui::pos2(c.x - 8.0, c.y), egui::pos2(c.x + 8.0, c.y)], mk);
+                        p.line_segment(
+                            [egui::pos2(c.x, c.y - 8.0), egui::pos2(c.x, c.y + 8.0)], mk);
+                    });
+                });
+                ui.add_space(10.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("✅ OK").clicked() { clicked_ok = true; }
+                        if ui.button("❌ Cancel").clicked() { clicked_cancel = true; }
+                    });
+                });
+            });
+        if clicked_cancel || !open {
+            self.hatch_dialog_open = false;
+            self.clear_prompt();
+            return;
+        }
+        if clicked_ok {
+            self.hatch_dialog_open = false;
+            // Stash the chosen settings + dispatch through the same
+            // command path as `hatch ANSI31 1.0 0.0` would.
+            let pattern = if self.hatch_dialog_solid {
+                None
+            } else {
+                Some(self.hatch_dialog_name.clone())
+            };
+            self.pending_hatch_pattern = (
+                pattern.clone(),
+                self.hatch_dialog_scale,
+                self.hatch_dialog_angle,
+            );
+            if self.selection.is_empty() {
+                self.begin_selection(SelectMode::ForSelect);
+                self.queued_op = QueuedOp::Hatch;
+                let style = pattern.as_deref().unwrap_or("SOLID");
+                self.set_prompt(format!(
+                    "hatch ({}): pick CLOSED boundary dobject(s), Enter to fill  [Esc=cancel]",
+                    style));
+            } else {
+                self.apply_hatch();
+            }
+        }
+    }
 
     /// Trim Debug floating window — instrumented log of every trim /
     /// extend state transition + canvas click. User pastes the log back
@@ -4592,6 +4804,68 @@ fn append_arc_world_samples(a: Vec2, b: Vec2, bulge: f64, out: &mut Vec<Vec2>) {
     }
 }
 
+/// Clip a screen-space line segment to an axis-aligned rectangle —
+/// parametric Liang-Barsky-lite. Returns the visible portion or None
+/// if the segment misses the rect entirely. Used only by the hatch
+/// preview's pattern renderer; the canvas hatch render uses the
+/// polygon-clip path against the real boundary loops.
+fn clip_line_to_rect(a: egui::Pos2, b: egui::Pos2, r: egui::Rect)
+    -> Option<(egui::Pos2, egui::Pos2)>
+{
+    let mut t0 = 0.0_f32;
+    let mut t1 = 1.0_f32;
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    let clip = |p: f32, q: f32, t0: &mut f32, t1: &mut f32| -> bool {
+        if p.abs() < 1e-9 { return q >= 0.0; }
+        let r = q / p;
+        if p < 0.0 {
+            if r > *t1 { return false; }
+            if r > *t0 { *t0 = r; }
+        } else {
+            if r < *t0 { return false; }
+            if r < *t1 { *t1 = r; }
+        }
+        true
+    };
+    if !clip(-dx, a.x - r.left(),   &mut t0, &mut t1) { return None; }
+    if !clip( dx, r.right() - a.x,  &mut t0, &mut t1) { return None; }
+    if !clip(-dy, a.y - r.top(),    &mut t0, &mut t1) { return None; }
+    if !clip( dy, r.bottom() - a.y, &mut t0, &mut t1) { return None; }
+    if t1 < t0 { return None; }
+    Some((
+        egui::pos2(a.x + dx * t0, a.y + dy * t0),
+        egui::pos2(a.x + dx * t1, a.y + dy * t1),
+    ))
+}
+
+/// Tessellate a circle into an N-vertex closed loop (world coords).
+/// Sample density is fixed — fill tessellation doesn't need to track
+/// zoom. 64 is smooth at typical printable sizes; bump to 128 if a
+/// large-radius hatch looks faceted.
+fn tessellate_circle_loop(centre: Vec2, radius: f64, n: usize) -> Vec<Vec2> {
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let t = (i as f64) / (n as f64) * std::f64::consts::TAU;
+        out.push(Vec2::new(
+            centre.x + radius * t.cos(),
+            centre.y + radius * t.sin(),
+        ));
+    }
+    out
+}
+
+/// Tessellate an Ellipse to an N-vertex closed loop using the kernel's
+/// own `point_at`. Same density rationale as circles.
+fn tessellate_ellipse_loop(e: &Ellipse, n: usize) -> Vec<Vec2> {
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let t = (i as f64) / (n as f64) * std::f64::consts::TAU;
+        out.push(e.point_at(t));
+    }
+    out
+}
+
 /// Find the t-value at which an infinite line (origin `o`, unit
 /// direction `u`) crosses the SEGMENT a→b. Returns None if the line
 /// misses the segment (intersection lies outside [0,1] along the
@@ -6099,6 +6373,11 @@ impl eframe::App for CadApp {
         // ---- floating: ACI color picker (polar wheel) ------------------
         // Renders only when a call site has set `aci_pick_request`.
         self.render_aci_picker_window(ctx);
+
+        // ---- floating: Hatch attributes dialog -------------------------
+        // Modal-ish (resizable=false, collapsible=false), opens when
+        // bare `hatch` is typed; closes on OK / Cancel / X.
+        self.render_hatch_dialog(ctx);
 
         // ---- DObjects palette — floating Window -------------------------
         let mut dobjects_open = self.dobjects_window_open;
