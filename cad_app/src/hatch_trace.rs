@@ -584,8 +584,23 @@ pub fn trace_boundary_at(doc: &Document, seed: Vec2) -> Option<TracedBoundary> {
     // segment that crosses the +X ray. We start the walk at the SOUTH
     // endpoint of that segment so the walk direction is northward,
     // which puts the WEST side (where the seed is) on our LEFT.
+    //
+    // Dedupe hits that land on the same world point — when several
+    // dobjects share a vertex AND the +X ray happens to pass through
+    // it, the same (x, y) shows up once per dobject. Each duplicate
+    // gives the same trace outcome, so iterating them wastes work
+    // and clutters the debug log.
+    let mut seen_hits: Vec<Vec2> = Vec::new();
+    let hits_deduped: Vec<&(f64, usize, Vec2)> = hits.iter().filter(|(_, _, p)| {
+        if seen_hits.iter().any(|s| (*s - *p).len() < 1e-6) {
+            false
+        } else {
+            seen_hits.push(*p);
+            true
+        }
+    }).collect();
     let mut traced: Vec<Vec<Vec2>> = Vec::new();
-    for &(_, seg_idx, _) in &hits {
+    for &&(_, seg_idx, _) in &hits_deduped {
         let (a_id, b_id) = endpoints[seg_idx];
         let pa = cluster_pos[a_id];
         let pb = cluster_pos[b_id];

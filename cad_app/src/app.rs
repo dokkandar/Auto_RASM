@@ -2245,8 +2245,8 @@ impl CadApp {
         // meet?" without guessing. Skipped when the debug window is
         // closed (`hatch_dbg` is a no-op then).
         self.hatch_dbg(format!(
-            "  --- doc snapshot at pick-point click ({:.3},{:.3}) ---",
-            seed.x, seed.y));
+            "  --- doc snapshot at pick-point click ({:.3},{:.3})  zoom={:.2} px/world  world_per_px={:.4} ---",
+            seed.x, seed.y, self.scale, 1.0 / (self.scale as f64).max(1e-9)));
         let doc_lines: Vec<String> = self.doc.dobjects.iter().enumerate()
             .map(|(i, d)| {
                 let (bmin, bmax) = d.geom.bbox();
@@ -2445,8 +2445,24 @@ impl CadApp {
         // internally, but with diagnostic output for each starting
         // hit so we can see exactly which junctions dead-end the walk
         // and which produce loops not containing the seed.
+        //
+        // Dedupe hits that land on the same world point — the trace
+        // path does the same dedup internally, so log only what the
+        // trace will actually attempt.
         let adj = crate::hatch_trace::build_adjacency(&segs, &endpoints, cluster_pos.len());
-        for (k, &(_, sidx, _)) in hits.iter().enumerate() {
+        let mut seen_hits: Vec<Vec2> = Vec::new();
+        let mut deduped: Vec<&(f64, usize, Vec2)> = Vec::new();
+        for h in &hits {
+            if seen_hits.iter().any(|s| (*s - h.2).len() < 1e-6) { continue; }
+            seen_hits.push(h.2);
+            deduped.push(h);
+        }
+        if deduped.len() != hits.len() {
+            self.hatch_dbg(format!(
+                "    (deduped {} duplicate-position hits → {} unique attempts)",
+                hits.len() - deduped.len(), deduped.len()));
+        }
+        for (k, &&(_, sidx, _)) in deduped.iter().enumerate() {
             let (a_id, b_id) = endpoints[sidx];
             let pa = cluster_pos[a_id];
             let pb = cluster_pos[b_id];
