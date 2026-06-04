@@ -88,6 +88,14 @@ pub struct UserEnv {
     pub GrClrS: u32,
     /// Grip size in pixels.
     pub GrpSz:  u8,
+    /// Grip HOVER + GRAB radius in screen pixels. When a dobject is
+    /// selected and the cursor comes within this many pixels of one
+    /// of its grip points, that grip highlights (preview = "this is
+    /// what your click will grab"); the same threshold is the click
+    /// tolerance for entering grip-drag. 25 px is roomy enough that
+    /// the user doesn't have to pixel-aim. AutoCAD has no exact
+    /// equivalent; LibreCAD's grip "hot radius" defaults to ~20 px.
+    pub GrpHvR: u8,
 
     // ---- grid + ortho ----
     /// Background grid display (AutoCAD GRIDMODE). ON = render the grid
@@ -142,6 +150,7 @@ impl Default for UserEnv {
             GrClrU: 0x4099FF,    // light blue
             GrClrS: 0xFF6464,    // red-pink
             GrpSz:  4,
+            GrpHvR: 25,
             GrdEnb: true,
             GrdSnp: false,
             GrdSpc: 10.0,
@@ -214,6 +223,7 @@ impl UserEnv {
         push_u32(&mut s, "GrClrU", self.GrClrU);
         push_u32(&mut s, "GrClrS", self.GrClrS);
         push_u8(&mut s, "GrpSz",  self.GrpSz);
+        push_u8(&mut s, "GrpHvR", self.GrpHvR);
         push_bool(&mut s, "GrdEnb", self.GrdEnb);
         push_bool(&mut s, "GrdSnp", self.GrdSnp);
         push_f64(&mut s, "GrdSpc", self.GrdSpc);
@@ -265,6 +275,7 @@ impl UserEnv {
             "GrClrU" => if let Some(v) = parse_u32(val) { self.GrClrU = v; }
             "GrClrS" => if let Some(v) = parse_u32(val) { self.GrClrS = v; }
             "GrpSz"  => if let Ok(v) = val.parse() { self.GrpSz = v; }
+            "GrpHvR" => if let Ok(v) = val.parse() { self.GrpHvR = v; }
             "GrdEnb" => if let Some(v) = parse_bool(val) { self.GrdEnb = v; }
             "GrdSnp" => if let Some(v) = parse_bool(val) { self.GrdSnp = v; }
             "GrdSpc" => if let Ok(v) = val.parse() { self.GrdSpc = v; }

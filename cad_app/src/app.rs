@@ -5744,6 +5744,8 @@ impl eframe::App for CadApp {
                             &mut self.env.GrClrS);
                         env_u8(ui, "GrpSz",  "Grip size (px)",
                             &mut self.env.GrpSz, 1, 20);
+                        env_u8(ui, "GrpHvR", "Grip hover + grab radius (px)",
+                            &mut self.env.GrpHvR, 4, 80);
 
                         ui.separator();
                         ui.heading("External references");
@@ -6509,7 +6511,10 @@ impl eframe::App for CadApp {
                 if try_grab && self.grip_drag.is_none() {
                     if let Some(pos) = resp.interact_pointer_pos() {
                         let cur_world = self.s2w(pos, rect);
-                        let tol = (self.env.GrpSz as f64 + 4.0) / self.scale as f64;
+                        // Match the visual hover-highlight radius so any
+                        // grip that looks lit-up actually grabs on click.
+                        // GrpHvR is in screen pixels; convert to world.
+                        let tol = self.env.GrpHvR as f64 / self.scale as f64;
                         let mut targets: Vec<usize> = self.selection.clone();
                         if let Some(s) = self.selected { targets.push(s); }
                         targets.sort_unstable(); targets.dedup();
@@ -7662,16 +7667,43 @@ impl eframe::App for CadApp {
                         draw_dobject(&painter, rect, self, geom_ref,
                             egui::Color32::from_rgba_unmultiplied(255, 255, 255, 160));
                     }
+                    // Hover-highlight: any grip within GrpHvR px of the
+                    // cursor lights up so the user knows clicking will
+                    // grab it. Same threshold drives the grab-on-click
+                    // tolerance below — no risk of "looks highlighted
+                    // but doesn't grab". Skipped while a drag is in
+                    // progress (the dragged grip already glows).
+                    let cursor_screen = resp.hover_pos();
+                    let hover_r2_px = (self.env.GrpHvR as f32).powi(2);
                     for (gp, _role) in geom_ref.grip_points() {
                         let sp = self.w2s(gp, rect);
-                        let r = egui::Rect::from_center_size(
-                            sp, egui::vec2(gsz * 2.0, gsz * 2.0));
-                        let hot = self.grip_drag
+                        let active_drag = self.grip_drag
                             .map(|gd| gd.dobject_idx == *idx
                                  && gd.grip_origin.dist(gp) < 1e-6)
                             .unwrap_or(false);
+                        let hover = !active_drag
+                            && self.grip_drag.is_none()
+                            && cursor_screen.map(|c| {
+                                let d = sp - c;
+                                d.x*d.x + d.y*d.y <= hover_r2_px
+                            }).unwrap_or(false);
+                        let hot = active_drag || hover;
+                        // Slightly larger square when hot so it reads
+                        // as a "ready to grab" affordance, not just a
+                        // color swap.
+                        let half = if hot { gsz + 2.0 } else { gsz };
+                        let r = egui::Rect::from_center_size(
+                            sp, egui::vec2(half * 2.0, half * 2.0));
                         let col = if hot { grip_col_s } else { grip_col_u };
                         painter.rect_filled(r, 0.0, col);
+                        // Pale outline ring around a hovered grip — extra
+                        // visual cue the user can spot from the corner
+                        // of their eye.
+                        if hover {
+                            painter.circle_stroke(sp, (gsz + 4.0).max(8.0),
+                                egui::Stroke::new(1.2, egui::Color32::from_rgba_unmultiplied(
+                                    255, 255, 255, 200)));
+                        }
                         painter.rect_stroke(r, 0.0, egui::Stroke::new(1.0,
                             egui::Color32::from_rgb(20, 20, 20)));
                     }
