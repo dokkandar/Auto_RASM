@@ -3,6 +3,7 @@
 
 use eframe::egui;
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::Arc as StdArc;
 
@@ -171,6 +172,14 @@ pub struct CadApp {
     /// handle of a selected dobject. v1 semantic: dragging any grip
     /// translates the whole dobject by the cursor delta.
     grip_drag: Option<GripDrag>,
+    /// Edge-docked positions for floating Windows. When the user drags
+    /// a Window within `DOCK_THRESHOLD_PX` of any screen edge, we snap
+    /// it flush to that edge and record the snapped position here;
+    /// the next frame's window-show pass passes the stored position
+    /// via `current_pos(...)` so the snap "sticks". Dragging the
+    /// Window away further than the threshold removes the entry, so
+    /// the snap is reversible.
+    docked_window_pos: HashMap<&'static str, egui::Pos2>,
     /// Open/closed state for each dockable Window panel. Default true
     /// for the most-used panels. Toggled from the Tools menu.
     cmd_window_open:     bool,
@@ -639,6 +648,7 @@ impl Default for CadApp {
             last_command:       None,
             empty_enter_count_in_select: 0,
             grip_drag: None,
+            docked_window_pos:   HashMap::new(),
             cmd_window_open:     true,
             layers_window_open:  true,
             pens_window_open:    false,
@@ -2619,6 +2629,64 @@ impl CadApp {
     /// the same `apply_hatch` path as the command-line form; Cancel
     /// drops the pending state. Opens whenever the user types bare
     /// `hatch` with no args.
+    /// Width within which a floating Window's edge is treated as "close
+    /// enough to dock". Same value the user asked for.
+    const DOCK_THRESHOLD_PX: f32 = 50.0;
+
+    /// If `id` has a snapped position stored, attach `current_pos` to
+    /// the Window so it renders there. Reversible — when the user
+    /// drags away further than the threshold, `process_dock_after_show`
+    /// removes the entry and the Window goes back to free positioning.
+    fn apply_dock_pos<'a>(
+        &self,
+        id: &'static str,
+        mut window: egui::Window<'a>,
+    ) -> egui::Window<'a> {
+        if let Some(p) = self.docked_window_pos.get(id) {
+            window = window.current_pos(*p);
+        }
+        window
+    }
+
+    /// After a Window has been shown, compute whether any of its edges
+    /// is within `DOCK_THRESHOLD_PX` of a screen edge. If so, snap it
+    /// flush to that edge and store the snapped position. Otherwise
+    /// clear any prior snap so subsequent drags are free.
+    fn process_dock_after_show<R>(
+        &mut self,
+        id: &'static str,
+        ctx: &egui::Context,
+        resp: Option<egui::InnerResponse<R>>,
+    ) {
+        let Some(r) = resp else { return; };
+        let rect = r.response.rect;
+        let screen = ctx.screen_rect();
+        let th = Self::DOCK_THRESHOLD_PX;
+        let mut p = rect.min;
+        let mut snapped = false;
+        // Horizontal edges
+        if rect.min.x >= screen.min.x && (rect.min.x - screen.min.x) < th {
+            p.x = screen.min.x;
+            snapped = true;
+        } else if rect.max.x <= screen.max.x && (screen.max.x - rect.max.x) < th {
+            p.x = screen.max.x - rect.width();
+            snapped = true;
+        }
+        // Vertical edges
+        if rect.min.y >= screen.min.y && (rect.min.y - screen.min.y) < th {
+            p.y = screen.min.y;
+            snapped = true;
+        } else if rect.max.y <= screen.max.y && (screen.max.y - rect.max.y) < th {
+            p.y = screen.max.y - rect.height();
+            snapped = true;
+        }
+        if snapped {
+            self.docked_window_pos.insert(id, p);
+        } else {
+            self.docked_window_pos.remove(id);
+        }
+    }
+
     fn render_hatch_dialog(&mut self, ctx: &egui::Context) {
         if !self.hatch_dialog_open { return; }
         let mut open = true;
@@ -2821,12 +2889,13 @@ impl CadApp {
     /// when reporting a bug.
     fn render_trim_debug_window(&mut self, ctx: &egui::Context) {
         let mut open = self.trim_debug_open;
-        egui::Window::new("Trim Debug Log")
+        let win = egui::Window::new("Trim Debug Log")
             .open(&mut open)
             .default_width(640.0)
             .default_height(400.0)
-            .resizable(true)
-            .show(ctx, |ui| {
+            .resizable(true);
+        let win = self.apply_dock_pos("Trim Debug Log", win);
+        let resp = win.show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     if ui.button("📋 Copy Log").on_hover_text("Copy the whole log to the clipboard").clicked() {
                         let text = self.trim_debug_log.join("\n");
@@ -2870,6 +2939,7 @@ impl CadApp {
                         }
                     });
             });
+        self.process_dock_after_show("Trim Debug Log", ctx, resp);
         self.trim_debug_open = open;
     }
 
@@ -2883,12 +2953,13 @@ impl CadApp {
     fn render_hatch_debug_window(&mut self, ctx: &egui::Context) {
         let mut open = self.hatch_debug_open;
         let mut do_dump_state = false;
-        egui::Window::new("Hatch Debug Log")
+        let win = egui::Window::new("Hatch Debug Log")
             .open(&mut open)
             .default_width(720.0)
             .default_height(420.0)
-            .resizable(true)
-            .show(ctx, |ui| {
+            .resizable(true);
+        let win = self.apply_dock_pos("Hatch Debug Log", win);
+        let resp = win.show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     if ui.button("📋 Copy Log").on_hover_text("Copy the whole log to the clipboard").clicked() {
                         let text = self.hatch_debug_log.join("\n");
@@ -2947,6 +3018,7 @@ impl CadApp {
                         }
                     });
             });
+        self.process_dock_after_show("Hatch Debug Log", ctx, resp);
         self.hatch_debug_open = open;
         if do_dump_state {
             self.dump_hatch_state();
@@ -3040,14 +3112,15 @@ impl CadApp {
 
     fn render_layer_panel(&mut self, ctx: &egui::Context) {
         let mut open = self.layers_window_open;
-        egui::Window::new(format!("Layers ({})", self.doc.layers.len()))
+        let win = egui::Window::new(format!("Layers ({})", self.doc.layers.len()))
             .open(&mut open)
             .default_pos(egui::pos2(10.0, 70.0))
             .default_size(egui::vec2(320.0, 480.0))
             .min_width(240.0)
             .resizable(true)
-            .collapsible(true)
-            .show(ctx, |ui| {
+            .collapsible(true);
+        let win = self.apply_dock_pos("Layers", win);
+        let resp = win.show(ctx, |ui| {
                 ui.separator();
 
                 // ---- toolbar row: add + rename + delete -----------------
@@ -3280,6 +3353,7 @@ impl CadApp {
                     self.aci_pick_request = Some(AciPickRequest::Layer(id));
                 }
             });
+        self.process_dock_after_show("Layers", ctx, resp);
         self.layers_window_open = open;
     }
 
@@ -3463,14 +3537,15 @@ impl CadApp {
 
     fn render_pen_palette(&mut self, ctx: &egui::Context) {
         let mut open = self.pens_window_open;
-        egui::Window::new(format!("Pens ({})", self.doc.pens.len()))
+        let win = egui::Window::new(format!("Pens ({})", self.doc.pens.len()))
             .open(&mut open)
             .default_pos(egui::pos2(340.0, 70.0))
             .default_size(egui::vec2(280.0, 420.0))
             .min_width(220.0)
             .resizable(true)
-            .collapsible(true)
-            .show(ctx, |ui| {
+            .collapsible(true);
+        let win = self.apply_dock_pos("Pens", win);
+        let resp = win.show(ctx, |ui| {
                 ui.separator();
 
                 if self.selection.is_empty() {
@@ -3556,6 +3631,7 @@ impl CadApp {
                     }
                 }
             });
+        self.process_dock_after_show("Pens", ctx, resp);
         self.pens_window_open = open;
     }
 
@@ -3572,14 +3648,15 @@ impl CadApp {
 
     fn render_info_panel(&mut self, ctx: &egui::Context) {
         let mut open = self.info_window_open;
-        egui::Window::new("Info / Properties")
+        let win = egui::Window::new("Info / Properties")
             .open(&mut open)
             .default_pos(egui::pos2(640.0, 70.0))
             .default_size(egui::vec2(300.0, 520.0))
             .min_width(240.0)
             .resizable(true)
-            .collapsible(true)
-            .show(ctx, |ui| {
+            .collapsible(true);
+        let win = self.apply_dock_pos("Info / Properties", win);
+        let resp = win.show(ctx, |ui| {
                 ui.separator();
 
                 // Decide which mode we're in.
@@ -3607,6 +3684,7 @@ impl CadApp {
                     }
                 }
             });
+        self.process_dock_after_show("Info / Properties", ctx, resp);
         self.info_window_open = open;
     }
 
@@ -7522,15 +7600,16 @@ impl eframe::App for CadApp {
         // ---- DObjects palette — floating Window -------------------------
         let mut dobjects_open = self.dobjects_window_open;
         let dobjects_count = self.doc.dobjects.len();
-        egui::Window::new(format!("DObjects ({})", dobjects_count))
+        let win = egui::Window::new(format!("DObjects ({})", dobjects_count))
             .open(&mut dobjects_open)
             .default_pos(egui::pos2(
                 ctx.screen_rect().right() - 320.0, 70.0))
             .default_size(egui::vec2(300.0, 520.0))
             .min_width(220.0)
             .resizable(true)
-            .collapsible(true)
-            .show(ctx, |ui| {
+            .collapsible(true);
+        let win = self.apply_dock_pos("DObjects", win);
+        let resp = win.show(ctx, |ui| {
             if self.picking_source {
                 ui.colored_label(
                     egui::Color32::from_rgb(255, 220, 100),
@@ -7578,6 +7657,7 @@ impl eframe::App for CadApp {
                 }
             });
         });
+        self.process_dock_after_show("DObjects", ctx, resp);
         self.dobjects_window_open = dobjects_open;
 
         // ---- UI.1: STATUS BAR (very bottom) -----------------------------
@@ -7725,15 +7805,16 @@ impl eframe::App for CadApp {
             egui::pos2(r.left() + 360.0, r.bottom() - 220.0)
         };
         let mut cmd_open = self.cmd_window_open;
-        egui::Window::new("Command")
+        let win = egui::Window::new("Command")
             .open(&mut cmd_open)
             .default_pos(cmd_default_pos)
             .default_size(egui::vec2(720.0, 180.0))
             .min_width(360.0)
             .min_height(120.0)
             .resizable(true)
-            .collapsible(true)
-            .show(ctx, |ui| {
+            .collapsible(true);
+        let win = self.apply_dock_pos("Command", win);
+        let resp = win.show(ctx, |ui| {
                 // Reserve space at the bottom for: prompt line (if any) +
                 // the input row.
                 let prompt_h = if self.current_prompt.is_empty() { 0.0 } else { 18.0 };
@@ -7826,6 +7907,7 @@ impl eframe::App for CadApp {
                     }
                 });
             });
+        self.process_dock_after_show("Command", ctx, resp);
         self.cmd_window_open = cmd_open;
 
         // ---- central panel: canvas --------------------------------------
