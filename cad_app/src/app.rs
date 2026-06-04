@@ -193,6 +193,11 @@ pub struct CadApp {
     hatch_dialog_name:  String,     // catalog name when solid==false
     hatch_dialog_scale: f64,
     hatch_dialog_angle: f64,
+    /// "Click inside a region to hatch it" mode — armed by the
+    /// dialog's "Pick Point" button. Next pointer-mode click runs the
+    /// smallest-containing-closed-dobject search, hatches it, and
+    /// disarms. Esc disarms manually.
+    hatch_pick_point_armed: bool,
     /// ACI polar-wheel picker — shared state for the floating picker
     /// window. The same window serves every call site; `pick_request`
     /// names who asked for the pick so the chosen ACI flows back to
@@ -671,6 +676,7 @@ impl Default for CadApp {
             hatch_dialog_name:  "ANSI31".into(),
             hatch_dialog_scale: 1.0,
             hatch_dialog_angle: 0.0,
+            hatch_pick_point_armed: false,
             fps_smooth: 0.0,
             index:       None,
             index_dirty: true,
@@ -1806,6 +1812,57 @@ impl CadApp {
         }
     }
 
+    /// Pick-point boundary finder — returns the INDEX in
+    /// `self.doc.dobjects` of the smallest closed dobject whose
+    /// interior contains `world`. Used by the hatch dialog's "Pick
+    /// Point" button. "Smallest" is measured by bbox area (a cheap
+    /// proxy for actual enclosed area — fine for nested loops; falls
+    /// down when two disjoint loops have similar bboxes but the
+    /// click is in only one of them, which the point-in test filters
+    /// out anyway).
+    ///
+    /// Closed dobject types considered today:
+    ///   * Closed Polyline — even-odd ray cast on the vertex polygon
+    ///   * Circle          — distance from centre < radius
+    ///   * Ellipse         — local coords + (x/a)² + (y/b)² < 1
+    ///
+    /// Open chains (line + arc loops) and Splines are skipped — they
+    /// need boundary-traversal to chain into a loop, which is the
+    /// pick-point v2b slice's job.
+    fn find_smallest_containing_closed(&self, world: Vec2) -> Option<usize> {
+        let mut best: Option<(usize, f64)> = None;
+        for (i, d) in self.doc.dobjects.iter().enumerate() {
+            let contains = match &d.geom {
+                Geom::Polyline(p) if p.closed && p.vertices.len() >= 3 => {
+                    point_in_polygon(world, p.vertices.iter().map(|v| v.pos))
+                }
+                Geom::Circle(c) => {
+                    (world - c.center).len() < c.radius
+                }
+                Geom::Ellipse(e) => {
+                    // Convert world point to ellipse-local coords:
+                    // project onto u_hat (major direction) + v_hat
+                    // (minor), divide by semi-axes, test sum of
+                    // squares against 1.
+                    let d = world - e.center;
+                    let a = e.semi_major().max(1e-12);
+                    let b = e.semi_minor().max(1e-12);
+                    let u = d.dot(e.u_hat()) / a;
+                    let v = d.dot(e.v_hat()) / b;
+                    u * u + v * v < 1.0
+                }
+                _ => false,
+            };
+            if !contains { continue; }
+            let (bmin, bmax) = d.geom.bbox();
+            let area = (bmax.x - bmin.x).abs() * (bmax.y - bmin.y).abs();
+            if best.map_or(true, |(_, ba)| area < ba) {
+                best = Some((i, area));
+            }
+        }
+        best.map(|(i, _)| i)
+    }
+
     /// Smart hatch finaliser: collect handles of every CLOSED polyline
     /// in the current selection and add ONE Hatch dobject that
     /// REFERENCES all of them as boundary loops (outer first, holes
@@ -2001,8 +2058,8 @@ impl CadApp {
     fn render_hatch_dialog(&mut self, ctx: &egui::Context) {
         if !self.hatch_dialog_open { return; }
         let mut open = true;
-        let mut clicked_ok     = false;
-        let mut clicked_cancel = false;
+        let mut clicked_dobjects   = false;
+        let mut clicked_pick_point = false;
         egui::Window::new("Choose Hatch Attributes")
             .id(egui::Id::new("hatch_dialog"))
             .open(&mut open)
@@ -2131,20 +2188,26 @@ impl CadApp {
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("✅ OK").clicked() { clicked_ok = true; }
-                        if ui.button("❌ Cancel").clicked() { clicked_cancel = true; }
+                        if ui.button("◉ Pick Point")
+                            .on_hover_text("Click inside a closed region — the app finds the smallest containing closed dobject and hatches it")
+                            .clicked() { clicked_pick_point = true; }
+                        if ui.button("☐ Dobject/s")
+                            .on_hover_text("Select boundary dobjects (closed polylines / circles / ellipses), Enter to fill")
+                            .clicked() { clicked_dobjects = true; }
                     });
                 });
             });
-        if clicked_cancel || !open {
+        // X close button → dismiss (no commit, no follow-up state).
+        if !open {
             self.hatch_dialog_open = false;
             self.clear_prompt();
             return;
         }
-        if clicked_ok {
+        if clicked_dobjects || clicked_pick_point {
             self.hatch_dialog_open = false;
-            // Stash the chosen settings + dispatch through the same
-            // command path as `hatch ANSI31 1.0 0.0` would.
+            // Stash the chosen settings — both follow-up paths flow
+            // through the same `apply_hatch` finaliser that reads
+            // them.
             let pattern = if self.hatch_dialog_solid {
                 None
             } else {
@@ -2155,15 +2218,25 @@ impl CadApp {
                 self.hatch_dialog_scale,
                 self.hatch_dialog_angle,
             );
-            if self.selection.is_empty() {
-                self.begin_selection(SelectMode::ForSelect);
-                self.queued_op = QueuedOp::Hatch;
-                let style = pattern.as_deref().unwrap_or("SOLID");
-                self.set_prompt(format!(
-                    "hatch ({}): pick CLOSED boundary dobject(s), Enter to fill  [Esc=cancel]",
-                    style));
+            let style = pattern.as_deref().unwrap_or("SOLID").to_string();
+            if clicked_dobjects {
+                if self.selection.is_empty() {
+                    self.begin_selection(SelectMode::ForSelect);
+                    self.queued_op = QueuedOp::Hatch;
+                    self.set_prompt(format!(
+                        "hatch ({}): pick CLOSED boundary dobject(s), Enter to fill  [Esc=cancel]",
+                        style));
+                } else {
+                    self.apply_hatch();
+                }
             } else {
-                self.apply_hatch();
+                // Pick-point — arm the canvas-click handler; clear
+                // any pending selection mode so the click isn't
+                // routed into a basket.
+                self.hatch_pick_point_armed = true;
+                self.set_prompt(format!(
+                    "hatch ({}): click inside a closed region  [Esc=cancel]",
+                    style));
             }
         }
     }
@@ -4804,6 +4877,30 @@ fn append_arc_world_samples(a: Vec2, b: Vec2, bulge: f64, out: &mut Vec<Vec2>) {
     }
 }
 
+/// Even-odd ray-cast point-in-polygon test. Returns true iff `p` lies
+/// in the interior of the closed polygon traced by the iterator. Half-
+/// open Y-test avoids double-counting horizontal edge endpoints — the
+/// standard correct PIP. Used today by the hatch pick-point boundary
+/// finder; would also fit hit-testing closed splines / regions when
+/// those land.
+fn point_in_polygon<I: IntoIterator<Item = Vec2>>(p: Vec2, verts: I) -> bool {
+    let vs: Vec<Vec2> = verts.into_iter().collect();
+    let n = vs.len();
+    if n < 3 { return false; }
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let pi = vs[i];
+        let pj = vs[j];
+        if (pi.y > p.y) != (pj.y > p.y) {
+            let x_int = pi.x + (p.y - pi.y) * (pj.x - pi.x) / (pj.y - pi.y);
+            if p.x < x_int { inside = !inside; }
+        }
+        j = i;
+    }
+    inside
+}
+
 /// Clip a screen-space line segment to an axis-aligned rectangle —
 /// parametric Liang-Barsky-lite. Returns the visible portion or None
 /// if the segment misses the rect entirely. Used only by the hatch
@@ -5491,6 +5588,8 @@ impl eframe::App for CadApp {
             self.pline_arc_sub = PlineArcSub::Normal;
             self.tool = Tool::None;
             self.picking_source = false;
+            self.hatch_pick_point_armed = false;
+            self.hatch_dialog_open = false;
             self.intersect_pending_click = false;
             self.intersect_view_pending  = false;
             self.snap_override = None;
@@ -7092,6 +7191,25 @@ impl eframe::App for CadApp {
                     // point (line endpoint, move base/dest, …).
                     let click_world = snap_hit.map(|h| h.point)
                         .unwrap_or_else(|| self.apply_constraints(world));
+
+                    // Hatch pick-point — consumes the click before any
+                    // other handler. Finds the smallest closed dobject
+                    // containing the click and hatches it with the
+                    // pre-stashed pattern settings. Misses → message.
+                    if self.hatch_pick_point_armed {
+                        self.hatch_pick_point_armed = false;
+                        self.clear_prompt();
+                        match self.find_smallest_containing_closed(world) {
+                            Some(handle_idx) => {
+                                self.selection = vec![handle_idx];
+                                self.apply_hatch();
+                                self.selection.clear();
+                            }
+                            None => self.history.push(
+                                "  ! hatch pick-point: no closed dobject contains the click".into()),
+                        }
+                        return;
+                    }
 
                     if self.move_state != MoveState::Off {
                         match self.move_state {
