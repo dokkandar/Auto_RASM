@@ -83,7 +83,7 @@ fn main() {
                 writeln!(out, "(open/save ignored — CLI is a math REPL, not a doc viewer)").ok();
             }
             Ok(Command::Copy) | Ok(Command::Rotate) | Ok(Command::Scale)
-            | Ok(Command::Mirror) | Ok(Command::Hatch) | Ok(Command::DeleteSelected) | Ok(Command::Undo)
+            | Ok(Command::Mirror) | Ok(Command::Hatch { .. }) | Ok(Command::DeleteSelected) | Ok(Command::Undo)
             | Ok(Command::Redo) | Ok(Command::MatchProps) | Ok(Command::Reverse)
             | Ok(Command::ChangeLayer) | Ok(Command::Offset(_))
             | Ok(Command::Lengthen(_)) | Ok(Command::Break) | Ok(Command::Align)

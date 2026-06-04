@@ -68,11 +68,12 @@ pub enum Command {
     Scale,
     /// Mirror the selection across a line (two clicks define the line).
     Mirror,
-    /// Fill the closed polyline in the current selection with a solid
-    /// hatch in the active color. MVP: takes the FIRST closed polyline
-    /// from the selection (or the current single selection); other
-    /// patterns + multi-loop boundaries come later.
-    Hatch,
+    /// Fill closed polylines in the current selection with a named
+    /// hatch pattern (or solid if `None`). `scale` and `angle_deg`
+    /// default to 1.0 and 0.0 when not supplied. The app collects
+    /// every closed polyline in the selection as boundary loops of
+    /// ONE Hatch dobject (even-odd islands).
+    Hatch { pattern: Option<String>, scale: f64, angle_deg: f64 },
     /// Delete every dobject in the current selection.
     DeleteSelected,
     /// Undo the most recent editing operation.
@@ -192,7 +193,15 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "rotate" | "ro"   => Ok(Command::Rotate),
         "scale" | "sc"    => Ok(Command::Scale),
         "mirror" | "mi"   => Ok(Command::Mirror),
-        "hatch" | "h" | "bhatch" => Ok(Command::Hatch),
+        "hatch" | "h" | "bhatch" => {
+            // Optional args:  hatch [NAME] [scale] [angle_deg]
+            // Bare `hatch` = solid; bare `hatch ANSI31` = pattern with
+            // defaults; `hatch ANSI31 2.0 30` = scale 2x at +30°.
+            let pattern = toks.get(1).map(|s| s.to_string());
+            let scale     = toks.get(2).and_then(|s| s.parse().ok()).unwrap_or(1.0);
+            let angle_deg = toks.get(3).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            Ok(Command::Hatch { pattern, scale, angle_deg })
+        }
         "delete" | "erase" | "e" => Ok(Command::DeleteSelected),
         "undo" | "u"      => Ok(Command::Undo),
         "redo" | "y"      => Ok(Command::Redo),

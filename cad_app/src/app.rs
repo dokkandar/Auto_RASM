@@ -178,6 +178,11 @@ pub struct CadApp {
     pens_window_open:    bool,
     info_window_open:    bool,
     dobjects_window_open: bool,
+    /// Pattern args for the in-progress hatch op — set when the user
+    /// runs `hatch [NAME] [scale] [angle]`, consumed by `apply_hatch`
+    /// after the boundary-selection session finalises. Default
+    /// (None, 1.0, 0.0) = solid fill.
+    pending_hatch_pattern: (Option<String>, f64, f64),
     /// ACI polar-wheel picker — shared state for the floating picker
     /// window. The same window serves every call site; `pick_request`
     /// names who asked for the pick so the chosen ACI flows back to
@@ -650,6 +655,7 @@ impl Default for CadApp {
             selection_prev:     Vec::new(),
             move_state:         MoveState::Off,
             queued_op:          QueuedOp::None,
+            pending_hatch_pattern: (None, 1.0, 0.0),
             fps_smooth: 0.0,
             index:       None,
             index_dirty: true,
@@ -1329,12 +1335,15 @@ impl CadApp {
                         self.selection.len()));
                 }
             }
-            Ok(Command::Hatch) => {
+            Ok(Command::Hatch { pattern, scale, angle_deg }) => {
+                self.pending_hatch_pattern = (pattern.clone(), scale, angle_deg);
                 if self.selection.is_empty() {
                     self.begin_selection(SelectMode::ForSelect);
                     self.queued_op = QueuedOp::Hatch;
-                    self.set_prompt(
-                        "hatch: pick CLOSED boundary dobject(s), Enter to fill  [Esc=cancel]");
+                    let style = pattern.as_deref().unwrap_or("SOLID");
+                    self.set_prompt(format!(
+                        "hatch ({}): pick CLOSED boundary dobject(s), Enter to fill  [Esc=cancel]",
+                        style));
                 } else {
                     self.apply_hatch();
                 }
@@ -1620,40 +1629,146 @@ impl CadApp {
     ) {
         let loops = self.resolve_hatch_loops(h);
         if loops.is_empty() { return; }
-        // Single-loop case — let egui's tessellator fill the closed path
-        // directly (handles concave shapes via ear clipping). Cheap and
-        // correct.
+        match &h.pattern {
+            cad_kernel::HatchPattern::Solid =>
+                self.render_hatch_solid(painter, rect, &loops, color),
+            cad_kernel::HatchPattern::Pattern { name, scale, angle_deg } =>
+                self.render_hatch_pattern(
+                    painter, rect, &loops, color, name, *scale, *angle_deg),
+        }
+    }
+
+    /// Solid fill path — outer loop fills, alternating loops "subtract"
+    /// by overdrawing in the canvas background color (poor man's even-
+    /// odd; real tessellator pass is a follow-up).
+    fn render_hatch_solid(
+        &self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        loops: &[Vec<Vec2>],
+        color: egui::Color32,
+    ) {
         if loops.len() == 1 {
             let pts: Vec<egui::Pos2> = loops[0].iter()
                 .map(|w| self.w2s(*w, rect)).collect();
             if pts.len() < 3 { return; }
             painter.add(egui::Shape::Path(egui::epaint::PathShape {
-                points: pts,
-                closed: true,
-                fill:   color,
+                points: pts, closed: true, fill: color,
                 stroke: egui::epaint::PathStroke::NONE,
             }));
             return;
         }
-        // Multi-loop case — even-odd fill with islands. egui's
-        // PathShape doesn't natively support multiple sub-paths with
-        // even-odd, so for v1 we fall back to rendering each loop as
-        // its own filled path with alternating opacity: outer loop
-        // opaque, next loop "subtracts" by overdrawing in canvas color,
-        // and so on. Not perfect (overdraw doesn't compose under
-        // arbitrary alpha) but reads correctly on a solid backdrop.
-        let bg = egui::Color32::from_rgb(18, 22, 28);   // canvas background
+        let bg = egui::Color32::from_rgb(18, 22, 28);
         for (i, l) in loops.iter().enumerate() {
             let pts: Vec<egui::Pos2> = l.iter()
                 .map(|w| self.w2s(*w, rect)).collect();
             if pts.len() < 3 { continue; }
             let fill = if i % 2 == 0 { color } else { bg };
             painter.add(egui::Shape::Path(egui::epaint::PathShape {
-                points: pts,
-                closed: true,
-                fill,
+                points: pts, closed: true, fill,
                 stroke: egui::epaint::PathStroke::NONE,
             }));
+        }
+    }
+
+    /// Named-pattern fill — for each line family in the catalog entry,
+    /// generate parallel lines covering the boundary bbox, clip each
+    /// against ALL loops via even-odd along the line, draw the
+    /// surviving segments. Unknown pattern name → no lines drawn.
+    fn render_hatch_pattern(
+        &self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        loops: &[Vec<Vec2>],
+        color: egui::Color32,
+        name: &str,
+        user_scale: f64,
+        user_angle_deg: f64,
+    ) {
+        let families = cad_kernel::patterns::lookup(name);
+        if families.is_empty() { return; }
+        // Union bbox of all loops in world coords.
+        let mut min = Vec2::new(f64::INFINITY, f64::INFINITY);
+        let mut max = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for l in loops {
+            for v in l {
+                if v.x < min.x { min.x = v.x; }
+                if v.y < min.y { min.y = v.y; }
+                if v.x > max.x { max.x = v.x; }
+                if v.y > max.y { max.y = v.y; }
+            }
+        }
+        if !min.x.is_finite() || !max.x.is_finite() { return; }
+        let user_angle = user_angle_deg.to_radians();
+        let stroke = egui::Stroke::new(0.9, color);
+        for fam in &families {
+            // Effective angle + spacing after user transform.
+            let theta = fam.angle + user_angle;
+            let spacing = fam.spacing * user_scale.abs().max(1e-9);
+            // Line direction u, normal n (CCW perp of u).
+            let cos = theta.cos();
+            let sin = theta.sin();
+            let u = Vec2::new(cos, sin);
+            let n = Vec2::new(-sin, cos);
+            // Project bbox corners onto n to find the range of
+            // s-values (offset along n) that the pattern needs to
+            // cover. The bbox of a rotated axis-aligned rect is
+            // bounded by the projection of its 4 corners.
+            let corners = [
+                Vec2::new(min.x, min.y), Vec2::new(max.x, min.y),
+                Vec2::new(min.x, max.y), Vec2::new(max.x, max.y),
+            ];
+            let base = Vec2::new(fam.base_x, fam.base_y);
+            let mut s_min = f64::INFINITY;
+            let mut s_max = f64::NEG_INFINITY;
+            for c in &corners {
+                let s = (*c - base).dot(n);
+                if s < s_min { s_min = s; }
+                if s > s_max { s_max = s; }
+            }
+            // First line at s = ceil(s_min / spacing) * spacing.
+            let mut s = (s_min / spacing).ceil() * spacing;
+            // Safety cap: spacing too small for the world bbox would
+            // generate millions of lines and freeze. Bail out if the
+            // family would produce > 10 000 lines for this hatch.
+            let line_count_estimate = ((s_max - s_min) / spacing).ceil();
+            if line_count_estimate > 10_000.0 { continue; }
+            while s <= s_max + 1e-9 {
+                let line_origin = base + n * s;
+                // Clip this infinite line against the loops — gather
+                // every (t-value, edge-orientation) intersection, sort,
+                // emit segments via even-odd.
+                let mut hits: Vec<f64> = Vec::new();
+                for l in loops {
+                    let m = l.len();
+                    if m < 2 { continue; }
+                    for i in 0..m {
+                        let a = l[i];
+                        let b = l[(i + 1) % m];
+                        if let Some(t) = line_segment_intersect_t(line_origin, u, a, b) {
+                            hits.push(t);
+                        }
+                    }
+                }
+                if hits.len() >= 2 {
+                    hits.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+                    // Pair consecutive hits — even-odd inside/outside.
+                    let mut i = 0;
+                    while i + 1 < hits.len() {
+                        let t0 = hits[i];
+                        let t1 = hits[i + 1];
+                        if (t1 - t0).abs() > 1e-6 {
+                            let p0 = line_origin + u * t0;
+                            let p1 = line_origin + u * t1;
+                            painter.line_segment(
+                                [self.w2s(p0, rect), self.w2s(p1, rect)],
+                                stroke);
+                        }
+                        i += 2;
+                    }
+                }
+                s += spacing;
+            }
         }
     }
 
@@ -1685,15 +1800,33 @@ impl CadApp {
         }
         self.snapshot_doc();
         let loop_count = handles.len();
+        // Build pattern from the args the user provided to `hatch`.
+        // None → Solid; Some(name) → Pattern { name, scale, angle }.
+        // Reset to defaults after consuming so the next bare `hatch`
+        // doesn't reuse a stale pattern.
+        let (pat_name, pat_scale, pat_angle) =
+            std::mem::replace(&mut self.pending_hatch_pattern, (None, 1.0, 0.0));
+        let pattern = match pat_name {
+            None       => cad_kernel::HatchPattern::Solid,
+            Some(name) => cad_kernel::HatchPattern::Pattern {
+                name:      name.to_ascii_uppercase(),
+                scale:     pat_scale,
+                angle_deg: pat_angle,
+            },
+        };
+        let pattern_label = match &pattern {
+            cad_kernel::HatchPattern::Solid => "SOLID".to_string(),
+            cad_kernel::HatchPattern::Pattern { name, .. } => name.clone(),
+        };
         self.doc.push(cad_kernel::Hatch {
             boundary_handles: handles,
-            pattern: cad_kernel::HatchPattern::Solid,
+            pattern,
         }.into());
         self.gpu_dirty = true;
         self.index_dirty = true;
         self.history.push(format!(
-            "  + hatch: 1 fill, {} boundary loop(s){}",
-            loop_count,
+            "  + hatch ({}): 1 fill, {} boundary loop(s){}",
+            pattern_label, loop_count,
             if skipped > 0 {
                 format!("  ({} non-closed-polyline dobject(s) skipped)", skipped)
             } else { String::new() },
@@ -4457,6 +4590,33 @@ fn append_arc_world_samples(a: Vec2, b: Vec2, bulge: f64, out: &mut Vec<Vec2>) {
         let ang = start_ang + sweep * t;
         out.push(centre + Vec2::new(r * ang.cos(), r * ang.sin()));
     }
+}
+
+/// Find the t-value at which an infinite line (origin `o`, unit
+/// direction `u`) crosses the SEGMENT a→b. Returns None if the line
+/// misses the segment (intersection lies outside [0,1] along the
+/// segment) or if the line is parallel to the segment. Used by the
+/// hatch-pattern renderer to clip each parallel line against each
+/// boundary edge.
+fn line_segment_intersect_t(o: Vec2, u: Vec2, a: Vec2, b: Vec2) -> Option<f64> {
+    let d = b - a;
+    // Parametric line: o + t*u; segment: a + s*d. Solve for (t, s).
+    //   o.x + t*u.x = a.x + s*d.x
+    //   o.y + t*u.y = a.y + s*d.y
+    // → [u.x  -d.x] [t]   [a.x - o.x]
+    //   [u.y  -d.y] [s] = [a.y - o.y]
+    let det = u.x * (-d.y) - (-d.x) * u.y;
+    if det.abs() < 1e-12 { return None; }   // parallel
+    let rhs_x = a.x - o.x;
+    let rhs_y = a.y - o.y;
+    let t = (rhs_x * (-d.y) - (-d.x) * rhs_y) / det;
+    let s = (u.x * rhs_y - u.y * rhs_x) / det;
+    // Segment-end test — accept hits AT endpoints (half-open avoids
+    // double-counting at shared vertices via the standard even-odd
+    // ray-cast convention, but for hatch pattern lines we want every
+    // edge crossing once).
+    if s < -1e-9 || s > 1.0 + 1e-9 { return None; }
+    Some(t)
 }
 
 /// AutoCAD polyline bulge for a 3-point arc through (p1, p2, p3) in

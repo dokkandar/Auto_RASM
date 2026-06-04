@@ -141,12 +141,31 @@ impl Polyline {
 }
 
 /// Hatch pattern — the visual style applied INSIDE a hatch boundary.
-/// MVP ships `Solid` only; named patterns (ANSI31, BRICK, etc.) and
-/// user-defined parallel-line patterns (angle + spacing) land later.
-#[derive(Clone, Copy, Debug)]
+/// `Solid` fills the polygon area. `Pattern { name, scale, angle_deg }`
+/// references a named line-family pattern from `crate::patterns::lookup`
+/// (ANSI31, BRICK, EARTH, NET, …); the renderer clips parallel lines
+/// against the resolved boundary using even-odd.
+///
+/// `scale` and `angle_deg` are per-hatch transforms applied on top of
+/// the catalog entry: spacing multiplies by `scale`, every line family's
+/// angle gets `angle_deg` added. Defaults (1.0, 0.0) mean "render the
+/// pattern as the catalog defines it". Negative scale, angle outside
+/// [0, 360) are allowed and behave consistently.
+#[derive(Clone, Debug)]
 pub enum HatchPattern {
     /// Fill the entire boundary with the dobject's solid color.
     Solid,
+    /// Named pattern from the built-in catalog.
+    Pattern {
+        /// Canonical name (`"ANSI31"`, `"BRICK"`, …) — case-insensitive
+        /// lookup. Unknown names render as nothing (the hatch still
+        /// exists in the doc; user can rename it later).
+        name:      String,
+        /// Multiplier applied to every family's spacing. 1.0 = catalog.
+        scale:     f64,
+        /// Degrees added to every family's angle. 0.0 = catalog.
+        angle_deg: f64,
+    },
 }
 
 /// An AutoCAD-style HATCH entity. Holds REFERENCES to its boundary

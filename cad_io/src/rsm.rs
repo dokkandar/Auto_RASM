@@ -230,14 +230,22 @@ fn write_geom(w: &mut Vec<u8>, g: &Geom) {
         }
         Geom::Hatch(h) => {
             write_u8(w, 7);
-            let pattern_code: u8 = match h.pattern {
-                HatchPattern::Solid => 0,
-            };
-            write_u8(w, pattern_code);
-            // Boundary handles. Hatch's boundary is BY REFERENCE now, so
-            // RSM stores each handle as a u64. Round-trip preserves the
-            // handles verbatim — works as long as the boundary dobjects
-            // are loaded in the same RSM (their handles are written too).
+            // Pattern encoding:
+            //   0 = Solid                              (no extra payload)
+            //   1 = Pattern { name, scale, angle_deg } (utf-8 name + 2 f64)
+            match &h.pattern {
+                HatchPattern::Solid => {
+                    write_u8(w, 0);
+                }
+                HatchPattern::Pattern { name, scale, angle_deg } => {
+                    write_u8(w, 1);
+                    let bytes = name.as_bytes();
+                    write_u32(w, bytes.len() as u32);
+                    w.extend_from_slice(bytes);
+                    write_f64(w, *scale);
+                    write_f64(w, *angle_deg);
+                }
+            }
             write_u32(w, h.boundary_handles.len() as u32);
             for handle in &h.boundary_handles {
                 write_u64(w, *handle);
@@ -450,6 +458,15 @@ fn read_geom(r: &mut R) -> Result<Geom, String> {
         7 => {
             let pattern = match r.u8()? {
                 0 => HatchPattern::Solid,
+                1 => {
+                    let name_len = r.u32()? as usize;
+                    let bytes = r.take(name_len)?.to_vec();
+                    let name = String::from_utf8(bytes)
+                        .map_err(|e| format!("RSM: hatch pattern name not UTF-8: {}", e))?;
+                    let scale     = r.f64()?;
+                    let angle_deg = r.f64()?;
+                    HatchPattern::Pattern { name, scale, angle_deg }
+                }
                 other => return Err(format!("RSM: unknown hatch pattern code {}", other)),
             };
             let n = r.u32()? as usize;
