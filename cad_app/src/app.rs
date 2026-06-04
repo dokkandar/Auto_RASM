@@ -6195,6 +6195,93 @@ fn tool_button(ui: &mut egui::Ui, current: &mut Tool, this: Tool, label: &str) -
     false
 }
 
+// ---- hatch command button (one-shot — opens dialog) -----------------------
+
+/// Custom-painted Hatch button. Hatch isn't a persistent draw tool
+/// (no `Tool::Hatch` variant), so this lives outside `tool_button` —
+/// click → `run_command("hatch")` → opens the Choose Hatch Attributes
+/// dialog. Icon: a square outline with 45° hatching, corner
+/// registration ticks (so it reads as a "boundary"), and a small
+/// pick-point cursor at the bottom-right (signifying the Pick Point
+/// flow). User reference: the freenom-style "hatch" pictogram with
+/// crosshairs at every corner.
+fn hatch_command_button(ui: &mut egui::Ui) -> bool {
+    let (resp, painter) =
+        ui.allocate_painter(egui::vec2(56.0, 52.0), egui::Sense::click());
+    let rect = resp.rect;
+    let bg = if resp.hovered() {
+        egui::Color32::from_rgb(48, 58, 72)
+    } else {
+        egui::Color32::from_rgb(28, 34, 42)
+    };
+    painter.rect(
+        rect, 5.0, bg,
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 80, 95)),
+    );
+
+    let c = rect.center() - egui::vec2(0.0, 4.0);
+    let icon_col = egui::Color32::from_rgb(225, 235, 245);
+    let pen      = egui::Stroke::new(1.6, icon_col);
+    let thin     = egui::Stroke::new(1.0, icon_col);
+
+    // Boundary square
+    let half = 11.0_f32;
+    let sq = egui::Rect::from_center_size(c, egui::vec2(half * 2.0, half * 2.0));
+    painter.rect_stroke(sq, 0.0, pen);
+
+    // Hatching: 5 diagonal lines at 45°, clipped to the square. Drawing
+    // long lines and clipping is simpler than computing exact entry/exit
+    // points per line — egui's `with_clip_rect` does the rest.
+    let inner = painter.with_clip_rect(sq);
+    let span = half * 4.0;
+    let spacing = (half * 2.0) / 4.0;       // 5 lines: at -2s, -s, 0, +s, +2s
+    for k in -2..=2 {
+        let off = k as f32 * spacing;
+        let p1 = egui::pos2(c.x - span + off, c.y + span + off);
+        let p2 = egui::pos2(c.x + span + off, c.y - span + off);
+        inner.line_segment([p1, p2], thin);
+    }
+
+    // Corner registration ticks — a short "L" extending outward from
+    // each corner of the boundary. Reads as "this is a boundary I'm
+    // selecting" rather than just an arbitrary outline.
+    let ext = 4.5_f32;
+    for &(corner, dx, dy) in &[
+        (sq.left_top(),     -1.0_f32, -1.0_f32),
+        (sq.right_top(),     1.0,     -1.0),
+        (sq.left_bottom(),  -1.0,      1.0),
+        (sq.right_bottom(),  1.0,      1.0),
+    ] {
+        painter.line_segment([corner, corner + egui::vec2(dx * ext, 0.0)], pen);
+        painter.line_segment([corner, corner + egui::vec2(0.0, dy * ext)], pen);
+    }
+
+    // Pick-point cursor at lower-right: a small offset pickbox + arrow
+    // pointing INTO the main square. Communicates "click inside to
+    // pick the boundary" at a glance.
+    let pb_center = sq.right_bottom() + egui::vec2(3.0, 3.0);
+    let pb_half = 2.5_f32;
+    let pb_rect = egui::Rect::from_center_size(
+        pb_center, egui::vec2(pb_half * 2.0, pb_half * 2.0));
+    painter.rect_stroke(pb_rect, 0.0, pen);
+    // Arrow from pickbox toward sq's center
+    let arrow_tip = pb_center + egui::vec2(-3.0, -3.0);
+    let arrow_tail = pb_center + egui::vec2(-0.5, -0.5);
+    painter.line_segment([arrow_tail, arrow_tip], pen);
+    painter.line_segment([arrow_tip,   arrow_tip + egui::vec2(2.5, 0.0)], pen);
+    painter.line_segment([arrow_tip,   arrow_tip + egui::vec2(0.0, 2.5)], pen);
+
+    painter.text(
+        rect.center_bottom() - egui::vec2(0.0, 10.0),
+        egui::Align2::CENTER_BOTTOM,
+        "hatch",
+        egui::FontId::proportional(10.0),
+        icon_col,
+    );
+
+    resp.clicked()
+}
+
 // ---- arc tool button (toolbar, one per quick-access method) ---------------
 
 fn arc_tool_button(
@@ -6845,21 +6932,18 @@ impl eframe::App for CadApp {
                 ui.add_space(4.0);
                 tool_button(ui, &mut self.tool, Tool::Line,     "line");
                 tool_button(ui, &mut self.tool, Tool::Circle,   "circle");
+                // Hatch is a one-shot command (not a persistent draw
+                // tool); custom-painted icon — clicking opens the
+                // Choose Hatch Attributes dialog same as the `hatch`
+                // cmd-line word. Placed next to circle per user req.
+                if hatch_command_button(ui) {
+                    self.run_command("hatch");
+                }
                 tool_button(ui, &mut self.tool, Tool::Ellipse,    "ellipse");
                 tool_button(ui, &mut self.tool, Tool::EllipseArc, "ell.arc");
                 tool_button(ui, &mut self.tool, Tool::Point,    "point");
                 tool_button(ui, &mut self.tool, Tool::Polyline, "pline");
                 tool_button(ui, &mut self.tool, Tool::Spline,   "spline");
-                // Hatch is a one-shot command (not a persistent draw
-                // tool), so it's a plain button — clicking it opens
-                // the same Choose Hatch Attributes dialog as the
-                // `hatch` cmd-line word.
-                if ui.button("⧱ hatch")
-                    .on_hover_text("Hatch — opens the pattern dialog; pick boundaries or click inside a closed region")
-                    .clicked()
-                {
-                    self.run_command("hatch");
-                }
                 // Three quick-access buttons for the functional arc methods.
                 let prev_method = self.arc_method;
                 arc_tool_button(ui, &mut self.tool, &mut self.arc_method,
