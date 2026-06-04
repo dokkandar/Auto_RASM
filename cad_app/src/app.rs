@@ -4,6 +4,7 @@
 use eframe::egui;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::sync::Arc as StdArc;
 
@@ -172,6 +173,24 @@ pub struct CadApp {
     /// handle of a selected dobject. v1 semantic: dragging any grip
     /// translates the whole dobject by the cursor delta.
     grip_drag: Option<GripDrag>,
+    /// Cooperative-cancellation flag for long-running operations
+    /// (hatch trace, intersect-everything, bulk modify, …). The flag
+    /// is set by the global Esc handler; cancellable functions read
+    /// it periodically and bail out early when set.
+    ///
+    /// CAVEAT: today the heavy ops run SYNCHRONOUSLY inside `update`,
+    /// so the egui input snapshot doesn't refresh mid-operation —
+    /// Esc presses that happen DURING a long op aren't seen until the
+    /// op completes. To make mid-op Esc work we need to background
+    /// the op (std::thread or rayon) and have the worker check this
+    /// flag while the UI thread keeps spinning. That refactor is the
+    /// next slice; this primitive is the API the worker will use.
+    ///
+    /// For now the flag is useful in two cases:
+    ///   1. Esc PRE-set before a new op starts (resets at op begin)
+    ///   2. Multi-phase ops can check between phases (already partial
+    ///      protection — a long phase still freezes the UI)
+    op_cancel: StdArc<AtomicBool>,
     /// Edge-docked positions for floating Windows. When the user drags
     /// a Window within `DOCK_THRESHOLD_PX` of any screen edge, we snap
     /// it flush to that edge and record the snapped position here;
@@ -648,6 +667,7 @@ impl Default for CadApp {
             last_command:       None,
             empty_enter_count_in_select: 0,
             grip_drag: None,
+            op_cancel:           StdArc::new(AtomicBool::new(false)),
             docked_window_pos:   HashMap::new(),
             cmd_window_open:     true,
             layers_window_open:  true,
@@ -2381,12 +2401,32 @@ impl CadApp {
         // Full trace path — handles arbitrary chains AND partial overlaps
         // (intersection-splitting inside trace_boundary_at).
         self.hatch_dbg("  --- TRACE PATH engaged ---");
+        // Reset the cancel flag at op start. From here on, anything
+        // pre-set by an earlier session is cleared; Esc this frame
+        // sets it again and the cancellable phases below bail out
+        // BETWEEN phases (sync trace still blocks the frame, so
+        // mid-phase Esc doesn't help until the op moves to a worker
+        // thread — see op_cancel field doc comment).
+        self.op_cancel.store(false, Ordering::Relaxed);
+        let cancel = self.op_cancel.clone();
         // Run a manual instrumentation pass first so the user can see
         // segment / cluster / ray-hit counts before the actual trace.
-        let raw_segs = crate::hatch_trace::tessellate_doc(&self.doc);
-        let segs = crate::hatch_trace::split_at_intersections(&raw_segs);
+        let raw_segs = crate::hatch_trace::tessellate_doc_cancellable(&self.doc, &cancel);
+        if cancel.load(Ordering::Relaxed) {
+            self.hatch_dbg("  → trace cancelled (tessellation phase)");
+            return false;
+        }
+        let segs = crate::hatch_trace::split_at_intersections_cancellable(&raw_segs, &cancel);
+        if cancel.load(Ordering::Relaxed) {
+            self.hatch_dbg("  → trace cancelled (split phase)");
+            return false;
+        }
         let (endpoints, cluster_pos) =
-            crate::hatch_trace::cluster_endpoints(&segs);
+            crate::hatch_trace::cluster_endpoints_cancellable(&segs, &cancel);
+        if cancel.load(Ordering::Relaxed) {
+            self.hatch_dbg("  → trace cancelled (cluster phase)");
+            return false;
+        }
         let hits = crate::hatch_trace::ray_cast_horiz(seed, &segs);
         self.hatch_dbg(format!(
             "    tessellated {} segs → split into {} segs (+{}), {} clusters, ray cast found {} hit(s) east of seed",
@@ -6698,6 +6738,11 @@ impl eframe::App for CadApp {
             self.pline_arc_sub = PlineArcSub::Normal;
             self.tool = Tool::None;
             self.picking_source = false;
+            // Set the cooperative-cancellation flag for any long-
+            // running op currently in flight (or queued — flag is
+            // reset at op start). When async/threading lands, this
+            // is the signal the worker thread reads to bail out.
+            self.op_cancel.store(true, Ordering::Relaxed);
             self.hatch_pick_point_armed = false;
             self.hatch_pick_point_session = None;
             self.pending_hatch_pattern = (None, 1.0, 0.0);

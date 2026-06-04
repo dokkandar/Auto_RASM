@@ -33,8 +33,54 @@
 //!    "shapes connected at endpoints" case (rectangles, polygons with
 //!    arc corners) works; "lens between two overlapping circles" does
 //!    not. Splitting at intersections is a v2c follow-up.
+//!
+//! Cancellation / scaling roadmap (for the "1M dobjects" scenario the
+//! user flagged):
+//!  * Each heavy phase has a `_cancellable` variant taking
+//!    `&AtomicBool`. They poll the flag every CANCEL_CHECK_STRIDE
+//!    iterations and return whatever they've built so far when set.
+//!  * Caller must verify the flag after each phase and discard the
+//!    partial result on cancel.
+//!  * `split_at_intersections_cancellable` is O(N²) and is THE
+//!    bottleneck at scale. The next slice should:
+//!     1. Replace pairwise scan with a spatial-index (UniformGrid)
+//!        broad-phase so pairs to test become O(N·k) where k is the
+//!        avg overlap count.
+//!     2. Run the whole `trace_boundary_at_cancellable` on a worker
+//!        thread (std::thread + mpsc), so the UI thread keeps
+//!        spinning and Esc presses are seen mid-op. The cancel flag
+//!        becomes the bridge between the UI Esc handler and the
+//!        worker.
+//!  * Today (synchronous): mid-op Esc is NOT honoured because the
+//!    egui input snapshot is frozen for the duration of the
+//!    `update` call. The cancel infrastructure is in place so
+//!    that the work for (2) is a localised change, not a rewrite.
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use cad_kernel::{DObject, Document, Geom, Vec2, EPS};
+
+/// Cooperative-cancellation shim. The hatch trace pipeline reads
+/// this between phases (and inside the heavy O(N²) loop) and bails
+/// out early when set. Pass `&NEVER_CANCELLED` if you don't have one.
+///
+/// The caller — typically `apply_pick_point_hatch` — controls the
+/// lifetime: it resets the flag before starting and is responsible
+/// for sharing the same Arc with whatever sets the cancel (the
+/// global Esc handler today; a future background-thread driver when
+/// the trace gets moved off the UI thread).
+pub fn never_cancelled() -> AtomicBool { AtomicBool::new(false) }
+
+#[inline]
+fn cancelled(c: &AtomicBool) -> bool {
+    c.load(Ordering::Relaxed)
+}
+
+/// Stride between cancel checks inside the O(N²) split pass. Picked
+/// so the check cost is negligible (one atomic load per ~256 inner
+/// iterations) while still bailing within a few milliseconds even
+/// on very large drawings.
+const CANCEL_CHECK_STRIDE: usize = 256;
 
 /// Tolerance for treating two segment endpoints as the same graph node.
 /// Tessellation noise + user-drawn corners typically fall well within
@@ -71,8 +117,20 @@ type AdjEntry = (usize, usize, f64);
 /// Hatch dobjects are skipped — they're an output of this pipeline, not
 /// an input.
 pub fn tessellate_doc(doc: &Document) -> Vec<TessSeg> {
+    let never = never_cancelled();
+    tessellate_doc_cancellable(doc, &never)
+}
+
+/// Cancellable variant. Checks the cancel flag every
+/// `CANCEL_CHECK_STRIDE` dobjects and bails out, returning whatever
+/// has been collected so far. Callers must verify the cancel flag
+/// and treat a partial list as invalid.
+pub fn tessellate_doc_cancellable(doc: &Document, cancel: &AtomicBool) -> Vec<TessSeg> {
     let mut out = Vec::new();
     for (i, d) in doc.dobjects.iter().enumerate() {
+        if i & (CANCEL_CHECK_STRIDE - 1) == 0 && cancelled(cancel) {
+            return out;
+        }
         if !d.style.visible { continue; }
         if matches!(d.geom, Geom::Hatch(_) | Geom::Point(_)) { continue; }
         tessellate_one(d, i, &mut out);
@@ -197,6 +255,18 @@ fn push_bulged(a: Vec2, b: Vec2, bulge: f64, src: usize, out: &mut Vec<TessSeg>)
 pub fn cluster_endpoints(segs: &[TessSeg])
     -> (Vec<(usize, usize)>, Vec<Vec2>)
 {
+    let never = never_cancelled();
+    cluster_endpoints_cancellable(segs, &never)
+}
+
+/// Cancellable variant. Naive matching is O(N·C) — for many-cluster
+/// drawings this is the second-most-expensive phase after split.
+/// Checks the cancel flag every `CANCEL_CHECK_STRIDE` segments.
+/// Returns a partial result on cancel; caller must verify.
+pub fn cluster_endpoints_cancellable(
+    segs: &[TessSeg],
+    cancel: &AtomicBool,
+) -> (Vec<(usize, usize)>, Vec<Vec2>) {
     let mut centres: Vec<Vec2> = Vec::new();
     let mut endpoints: Vec<(usize, usize)> = Vec::with_capacity(segs.len());
     let find_or_add = |p: Vec2, centres: &mut Vec<Vec2>| -> usize {
@@ -206,7 +276,10 @@ pub fn cluster_endpoints(segs: &[TessSeg])
         centres.push(p);
         centres.len() - 1
     };
-    for s in segs {
+    for (i, s) in segs.iter().enumerate() {
+        if i & (CANCEL_CHECK_STRIDE - 1) == 0 && cancelled(cancel) {
+            return (endpoints, centres);
+        }
         let a_id = find_or_add(s.a, &mut centres);
         let b_id = find_or_add(s.b, &mut centres);
         endpoints.push((a_id, b_id));
@@ -271,14 +344,30 @@ pub fn seg_seg_intersect_params(p: &TessSeg, q: &TessSeg) -> Option<(f64, f64, V
 /// that's 20k checks → sub-millisecond. Spatial-index acceleration
 /// is a future optimisation if profiling demands it.
 pub fn split_at_intersections(segs: &[TessSeg]) -> Vec<TessSeg> {
+    let never = never_cancelled();
+    split_at_intersections_cancellable(segs, &never)
+}
+
+/// Cancellable variant. Checks the cancel flag every
+/// `CANCEL_CHECK_STRIDE` inner-loop iterations and bails out
+/// returning whatever fragments have been collected so far. The
+/// returned segment list may be incomplete in that case — callers
+/// must verify the cancel flag and discard the result on cancel.
+pub fn split_at_intersections_cancellable(
+    segs: &[TessSeg],
+    cancel: &AtomicBool,
+) -> Vec<TessSeg> {
     let n = segs.len();
     if n < 2 { return segs.to_vec(); }
-    // For each segment i, accumulate (t_along_i, intersection_point)
-    // pairs at every interior crossing. We process them at the end by
-    // sorting by t and emitting consecutive fragments.
     let mut cuts: Vec<Vec<(f64, Vec2)>> = vec![Vec::new(); n];
+    let mut counter: usize = 0;
     for i in 0..n {
+        if cancelled(cancel) { return segs.to_vec(); }
         for j in (i + 1)..n {
+            counter += 1;
+            if counter & (CANCEL_CHECK_STRIDE - 1) == 0 && cancelled(cancel) {
+                return segs.to_vec();
+            }
             if segs[i].src == segs[j].src { continue; }
             let Some((ti, tj, pt)) = seg_seg_intersect_params(&segs[i], &segs[j]) else { continue; };
             // Endpoint-touching intersections are already handled by
