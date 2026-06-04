@@ -1857,6 +1857,44 @@ impl CadApp {
     /// Open chains (line + arc loops) and Splines are skipped — they
     /// need boundary-traversal to chain into a loop, which is the
     /// pick-point v2b slice's job.
+    /// Same containment test as `find_smallest_containing_closed`, but
+    /// returns ALL containing closed dobjects with their bbox area + kind
+    /// label — useful for the hatch-debug log so the user can see every
+    /// candidate the cheap path considered, not just the winner.
+    fn collect_closed_containing(&self, world: Vec2) -> Vec<(usize, f64, &'static str)> {
+        let mut out = Vec::new();
+        for (i, d) in self.doc.dobjects.iter().enumerate() {
+            let contains = match &d.geom {
+                Geom::Polyline(p) if p.closed && p.vertices.len() >= 3 => {
+                    let mut verts: Vec<Vec2> = Vec::with_capacity(p.vertices.len() * 4);
+                    let n = p.vertices.len();
+                    verts.push(p.vertices[0].pos);
+                    for k in 0..n {
+                        let a = p.vertices[k].pos;
+                        let b = p.vertices[(k + 1) % n].pos;
+                        append_arc_world_samples(a, b, p.vertices[k].bulge, &mut verts);
+                    }
+                    point_in_polygon(world, verts)
+                }
+                Geom::Circle(c) => (world - c.center).len() < c.radius,
+                Geom::Ellipse(e) => {
+                    let dvec = world - e.center;
+                    let a = e.semi_major().max(1e-12);
+                    let b = e.semi_minor().max(1e-12);
+                    let u = dvec.dot(e.u_hat()) / a;
+                    let v = dvec.dot(e.v_hat()) / b;
+                    u * u + v * v < 1.0
+                }
+                _ => false,
+            };
+            if !contains { continue; }
+            let (bmin, bmax) = d.geom.bbox();
+            let area = (bmax.x - bmin.x).abs() * (bmax.y - bmin.y).abs();
+            out.push((i, area, dobject_kind_name(&d.geom)));
+        }
+        out
+    }
+
     fn find_smallest_containing_closed(&self, world: Vec2) -> Option<usize> {
         let mut best: Option<(usize, f64)> = None;
         for (i, d) in self.doc.dobjects.iter().enumerate() {
@@ -1918,6 +1956,19 @@ impl CadApp {
         self.hatch_dbg(format!(
             "apply_hatch() entry — selection.len() = {}, idx = {:?}",
             self.selection.len(), self.selection));
+        // Verbose dump of every selected dobject so the user can
+        // verify the algorithm's view matches what's visible on the
+        // canvas. Especially useful for polylines where `closed=false`
+        // with a near-zero endpoint gap looks identical to the closed
+        // form when rendered.
+        for &idx in &self.selection.clone() {
+            if let Some(d) = self.doc.dobjects.get(idx) {
+                self.hatch_dbg(format!(
+                    "    selected #{:02}: {}", idx, describe_verbose(&d.geom)));
+            } else {
+                self.hatch_dbg(format!("    selected #{:02}: <out of range>", idx));
+            }
+        }
         let mut handles: Vec<cad_kernel::Handle> = Vec::new();
         let mut skipped = 0_usize;
         // Capture per-idx decisions first WITHOUT borrowing self mutably,
@@ -2011,20 +2062,68 @@ impl CadApp {
     /// polylines are normal dobjects — the user can grip-edit them
     /// later (the hatch updates because it's handle-referenced).
     fn apply_pick_point_hatch(&mut self, seed: Vec2) -> bool {
+        // Verbose dump: every dobject + every coordinate the trace
+        // pipeline will see this click. Lets the user verify "is this
+        // polyline actually closed?", "do these line endpoints really
+        // meet?" without guessing. Skipped when the debug window is
+        // closed (`hatch_dbg` is a no-op then).
+        self.hatch_dbg(format!(
+            "  --- doc snapshot at pick-point click ({:.3},{:.3}) ---",
+            seed.x, seed.y));
+        let doc_lines: Vec<String> = self.doc.dobjects.iter().enumerate()
+            .map(|(i, d)| format!(
+                "    #{:02} [{}] {}", i,
+                if d.style.visible { "vis" } else { "hid" },
+                describe_verbose(&d.geom)))
+            .collect();
+        for line in doc_lines {
+            self.hatch_dbg(line);
+        }
         // Cheap path first: hits the typical "click inside one closed
         // shape" workflow without paying for the trace.
+        let cheap_candidates = self.collect_closed_containing(seed);
+        if !cheap_candidates.is_empty() {
+            self.hatch_dbg(format!(
+                "  --- cheap-path candidates ({} found, picked smallest by bbox area) ---",
+                cheap_candidates.len()));
+            for (idx, area, kind) in &cheap_candidates {
+                self.hatch_dbg(format!(
+                    "    #{:02} {} — bbox area {:.3}", idx, kind, area));
+            }
+        } else {
+            self.hatch_dbg("  --- cheap-path: 0 self-closed dobjects contain the click ---");
+        }
         if let Some(idx) = self.find_smallest_containing_closed(seed) {
             let kind = self.doc.dobjects.get(idx)
                 .map(|d| dobject_kind_name(&d.geom))
                 .unwrap_or("?");
             self.hatch_dbg(format!(
-                "  → smallest containing dobject #{} ({})", idx, kind));
+                "  → CHEAP PATH chose smallest containing dobject #{} ({})", idx, kind));
             self.selection = vec![idx];
             self.apply_hatch();
             self.selection.clear();
             return true;
         }
         // Full trace path — handles arbitrary chains.
+        self.hatch_dbg("  --- TRACE PATH engaged ---");
+        // Run a manual instrumentation pass first so the user can see
+        // segment / cluster / ray-hit counts before the actual trace.
+        let segs = crate::hatch_trace::tessellate_doc(&self.doc);
+        let (endpoints, cluster_pos) =
+            crate::hatch_trace::cluster_endpoints(&segs);
+        let hits = crate::hatch_trace::ray_cast_horiz(seed, &segs);
+        self.hatch_dbg(format!(
+            "    tessellated {} segs, {} clusters, ray cast found {} hit(s) east of seed",
+            segs.len(), cluster_pos.len(), hits.len()));
+        for (k, (t, sidx, hp)) in hits.iter().enumerate() {
+            let (a_id, b_id) = endpoints[*sidx];
+            let pa = cluster_pos[a_id];
+            let pb = cluster_pos[b_id];
+            let src = segs[*sidx].src;
+            self.hatch_dbg(format!(
+                "      hit{}: t={:.3} at ({:.3},{:.3}) seg#{} src=#{} a={:?} b={:?}",
+                k, t, hp.x, hp.y, sidx, src, (pa.x, pa.y), (pb.x, pb.y)));
+        }
         let tb = match crate::hatch_trace::trace_boundary_at(&self.doc, seed) {
             Some(tb) => tb,
             None => {
@@ -5454,6 +5553,94 @@ fn describe(g: &Geom) -> String {
     }
 }
 
+/// Verbose dump — every coordinate the algorithm sees, no summarisation.
+/// Used by the hatch debug log so the user can verify "is this polyline
+/// actually closed? do its first and last verts coincide?". Polyline
+/// vertices include their bulge so arc segments don't appear straight in
+/// the dump. Spline dumps control points + weights. Hatch lists handle
+/// IDs in order. Coordinates print at 3 decimal places — enough to spot
+/// "1e-3 gap between supposedly coincident endpoints" without flooding
+/// the log on big polylines.
+fn describe_verbose(g: &Geom) -> String {
+    match g {
+        Geom::Line(l) => format!(
+            "line  a=({:.3},{:.3})  b=({:.3},{:.3})  len={:.3}",
+            l.a.x, l.a.y, l.b.x, l.b.y, (l.b - l.a).len()
+        ),
+        Geom::Circle(c) => format!(
+            "circle  c=({:.3},{:.3})  r={:.3}",
+            c.center.x, c.center.y, c.radius
+        ),
+        Geom::Arc(a) => format!(
+            "arc  c=({:.3},{:.3})  r={:.3}  start={:.2}°  sweep={:.2}°",
+            a.center.x, a.center.y, a.radius,
+            a.start_angle.to_degrees(), a.sweep_angle.to_degrees()
+        ),
+        Geom::Ellipse(el) => format!(
+            "ellipse  c=({:.3},{:.3})  a={:.3}  ratio={:.3}  rot={:.2}°",
+            el.center.x, el.center.y, el.semi_major(), el.ratio,
+            el.major.angle().to_degrees()
+        ),
+        Geom::EllipseArc(ea) => format!(
+            "ellipsearc  c=({:.3},{:.3})  a={:.3}  ratio={:.3}  start={:.2}°  sweep={:.2}°",
+            ea.ellipse.center.x, ea.ellipse.center.y,
+            ea.ellipse.semi_major(), ea.ellipse.ratio,
+            ea.start_param.to_degrees(), ea.sweep_param.to_degrees()
+        ),
+        Geom::Point(pt) => format!(
+            "point  ({:.3},{:.3})", pt.location.x, pt.location.y
+        ),
+        Geom::Polyline(p) => {
+            let n = p.vertices.len();
+            let head = format!(
+                "polyline  {} verts  closed={}  len={:.3}",
+                n, p.closed, p.length());
+            let mut s = head;
+            for (i, v) in p.vertices.iter().enumerate() {
+                let suffix = if v.bulge.abs() > 1e-9 {
+                    format!(" bulge={:.4}", v.bulge)
+                } else { String::new() };
+                s.push_str(&format!(
+                    "\n        v{:02}=({:.3},{:.3}){}",
+                    i, v.pos.x, v.pos.y, suffix));
+            }
+            if n >= 2 {
+                let first = p.vertices[0].pos;
+                let last  = p.vertices[n - 1].pos;
+                let gap = (last - first).len();
+                s.push_str(&format!(
+                    "\n        endpoint gap (v00→v{:02}) = {:.6}{}",
+                    n - 1, gap,
+                    if !p.closed && gap < 1e-3 {
+                        "  ← visually closed but `closed=false`"
+                    } else { "" }));
+            }
+            s
+        }
+        Geom::Hatch(h) => {
+            let mut s = format!(
+                "hatch  pattern={:?}  {} boundary handle(s)",
+                h.pattern, h.boundary_handles.len());
+            for (i, hh) in h.boundary_handles.iter().enumerate() {
+                s.push_str(&format!("\n        loop{} → handle #{}", i, hh));
+            }
+            s
+        }
+        Geom::Spline(s) => {
+            let mut out = format!(
+                "spline  degree={}  {} ctrl pts  rational={}",
+                s.degree, s.control_points.len(),
+                !s.weights.iter().all(|w| (*w - 1.0).abs() < 1e-9));
+            for (i, p) in s.control_points.iter().enumerate() {
+                out.push_str(&format!(
+                    "\n        cp{:02}=({:.3},{:.3}) w={:.3}",
+                    i, p.x, p.y, s.weights.get(i).copied().unwrap_or(1.0)));
+            }
+            out
+        }
+    }
+}
+
 // ---- icon tool-button -------------------------------------------------------
 
 /// Color picker UI — ACI palette as PRIMARY, TrueColor as secondary.
@@ -8087,19 +8274,42 @@ impl eframe::App for CadApp {
                             }
                         } else { false };
                         if !pline_handled {
-                            if self.tool == Tool::Polyline && !self.pending.is_empty() {
-                                let new_bulge = if self.pline_mode == PlineMode::Arc {
-                                    self.pline_arc_bulge_to(click_world)
-                                } else {
-                                    0.0
+                            // PLINE auto-close: a click that lands on
+                            // (or within pickbox-tolerance of) vertex[0]
+                            // when at least 3 vertices are already in
+                            // `pending` commits the polyline as CLOSED
+                            // and exits drawing mode. Matches AutoCAD's
+                            // behaviour where snapping back to the start
+                            // ends the PLINE command.
+                            let auto_closed = self.tool == Tool::Polyline
+                                && self.pending.len() >= 3
+                                && {
+                                    let first = self.pending[0];
+                                    let world_tol = (self.env.PkBxSz.max(4) as f64)
+                                        / (self.scale as f64).max(1e-6);
+                                    (click_world - first).len() < world_tol
                                 };
-                                self.pending_bulges.push(new_bulge);
-                            }
-                            self.pending.push(click_world);
-                            if self.tool == Tool::Polyline {
+                            if auto_closed {
+                                let verts = self.drain_pline_pending(true);
+                                self.add_dobject(Geom::Polyline(Polyline {
+                                    vertices: verts, closed: true,
+                                }), "canvas (auto-closed on first vertex)");
                                 self.update_pline_prompt();
+                            } else {
+                                if self.tool == Tool::Polyline && !self.pending.is_empty() {
+                                    let new_bulge = if self.pline_mode == PlineMode::Arc {
+                                        self.pline_arc_bulge_to(click_world)
+                                    } else {
+                                        0.0
+                                    };
+                                    self.pending_bulges.push(new_bulge);
+                                }
+                                self.pending.push(click_world);
+                                if self.tool == Tool::Polyline {
+                                    self.update_pline_prompt();
+                                }
+                                self.try_finalise();
                             }
-                            self.try_finalise();
                         }
                         // canvas click steals focus away from the command box;
                         // restore it so typing keeps working without a manual
