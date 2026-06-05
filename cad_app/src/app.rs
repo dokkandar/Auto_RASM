@@ -5,8 +5,10 @@ use eframe::egui;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::Mutex;
 use std::sync::Arc as StdArc;
+use std::thread;
 
 use cad_kernel::*;
 
@@ -173,6 +175,12 @@ pub struct CadApp {
     /// handle of a selected dobject. v1 semantic: dragging any grip
     /// translates the whole dobject by the cursor delta.
     grip_drag: Option<GripDrag>,
+    /// Background worker for hatch trace. `None` when no trace is in
+    /// flight. While `Some`, every frame `poll_hatch_worker` tries to
+    /// receive the result; on receipt the loops are materialised as
+    /// boundary polylines + a Hatch dobject and this field clears.
+    /// See `HatchWorker` doc comment for the full lifecycle.
+    hatch_worker: Option<HatchWorker>,
     /// Cooperative-cancellation flag for long-running operations
     /// (hatch trace, intersect-everything, bulk modify, …). The flag
     /// is set by the global Esc handler; cancellable functions read
@@ -646,6 +654,57 @@ pub enum RenderMode {
     Gpu,
 }
 
+/// Result delivered from the hatch trace worker thread back to the
+/// main UI thread via mpsc. The worker bundles its log buffer with
+/// the result so the per-hit attempt diagnostics and the
+/// tessellate/split/cluster counts arrive together with the loops
+/// (otherwise we'd need a streaming log channel, which complicates
+/// the lifecycle for no real gain).
+pub enum HatchWorkerResult {
+    /// Trace succeeded — `loops[0]` is the outer, the rest are islands.
+    Success {
+        loops:     Vec<Vec<Vec2>>,
+        log_lines: Vec<String>,
+    },
+    /// Trace failed (dead-ended, no valid face contains the seed, etc.).
+    /// Caller should fall back to cheap path with auto-islands.
+    Failure {
+        reason:    String,
+        log_lines: Vec<String>,
+    },
+    /// User pressed Esc; the worker's cancel flag tripped a check
+    /// somewhere in tessellate / split / cluster / trace.
+    Cancelled {
+        log_lines: Vec<String>,
+    },
+}
+
+/// Handle on a background hatch-trace operation. Held in
+/// `CadApp::hatch_worker` while a worker is alive; `poll_hatch_worker`
+/// drains it each frame and materialises the result when ready.
+///
+/// Lifecycle:
+///   * spawn: `apply_pick_point_hatch` decides trace path → clones the
+///     Document (CHEAP via Arc-internals for handles + Vec for
+///     dobjects), spawns a `std::thread`, stores the receiver here.
+///   * poll: each `update` call tries `rx.try_recv`; on Ok the
+///     worker output is materialised and the field is set to None.
+///   * cancel: Esc handler sets `cancel` and drops the worker; the
+///     thread reads the flag at its next CANCEL_CHECK_STRIDE point
+///     and exits (its send may fail — that's fine, we already dropped
+///     the receiver).
+///   * replace: a fresh Pick Point click while a worker is in flight
+///     cancels the current one + spawns a new one. The old thread
+///     exits naturally; its result is discarded.
+pub struct HatchWorker {
+    pub seed:         Vec2,
+    pub pattern:      cad_kernel::HatchPattern,
+    pub active_layer: LayerId,
+    #[allow(dead_code)]  // mirror of op_cancel; kept for direct debugging access
+    pub cancel:       StdArc<AtomicBool>,
+    pub rx:           mpsc::Receiver<HatchWorkerResult>,
+}
+
 /// Who asked the floating ACI picker for a color, so the chosen ACI flows
 /// back to the right slot when the user clicks a circle in the wheel.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -667,6 +726,7 @@ impl Default for CadApp {
             last_command:       None,
             empty_enter_count_in_select: 0,
             grip_drag: None,
+            hatch_worker:        None,
             op_cancel:           StdArc::new(AtomicBool::new(false)),
             docked_window_pos:   HashMap::new(),
             cmd_window_open:     true,
@@ -2238,6 +2298,230 @@ impl CadApp {
     /// a Hatch referencing those new dobjects' handles. Materialised
     /// polylines are normal dobjects — the user can grip-edit them
     /// later (the hatch updates because it's handle-referenced).
+    /// Spawn the trace pipeline on a worker thread. Mid-op Esc fires
+    /// because the worker reads `op_cancel` between phases (and inside
+    /// the O(N²) split scan) while the UI thread keeps spinning;
+    /// `poll_hatch_worker` drains the result the frame after the
+    /// worker finishes.
+    ///
+    /// Replaces any existing in-flight worker (cancel old + spawn
+    /// new). The previous worker's result is silently discarded — its
+    /// receiver gets dropped.
+    fn spawn_hatch_worker(&mut self, seed: Vec2) {
+        // If a worker is already running, cancel it. The old thread
+        // will exit at its next cancel-check; its send will fail
+        // harmlessly because we drop the receiver here.
+        if self.hatch_worker.is_some() {
+            self.op_cancel.store(true, Ordering::Relaxed);
+            self.hatch_worker = None;
+            self.hatch_dbg("  (cancelled previous in-flight hatch worker)");
+        }
+        // Build the pattern args from the current pick-point session
+        // snapshot (or fall back to SOLID if no session — shouldn't
+        // happen via Pick Point button, but defensive).
+        let (pat_name, pat_scale, pat_angle) = self.hatch_pick_point_session
+            .clone()
+            .unwrap_or_else(|| self.pending_hatch_pattern.clone());
+        let pattern = match pat_name {
+            None       => cad_kernel::HatchPattern::Solid,
+            Some(name) => cad_kernel::HatchPattern::Pattern {
+                name:      name.to_ascii_uppercase(),
+                scale:     pat_scale,
+                angle_deg: pat_angle,
+            },
+        };
+        let active_layer = self.doc.layers.active;
+        // Fresh cancel flag for this worker — old flag may have just
+        // been set to cancel the previous worker. Replace with new.
+        let cancel = StdArc::new(AtomicBool::new(false));
+        self.op_cancel = cancel.clone();
+        // Clone the Document for the worker — read-only on its side,
+        // so a snapshot is safe even if the user keeps editing on the
+        // main thread. Document::clone is O(N) over dobjects; for
+        // 1M dobjects this is the dominant up-front cost (will likely
+        // need optimisation when we get there).
+        let doc_snapshot = self.doc.clone();
+        let cancel_for_thread = cancel.clone();
+        let (tx, rx) = mpsc::channel::<HatchWorkerResult>();
+        thread::spawn(move || {
+            let mut log: Vec<String> = Vec::new();
+            log.push(format!(
+                "  worker started: seed=({:.3},{:.3}), {} dobjects",
+                seed.x, seed.y, doc_snapshot.dobjects.len()));
+            let raw = crate::hatch_trace::tessellate_doc_cancellable(
+                &doc_snapshot, &cancel_for_thread);
+            if cancel_for_thread.load(Ordering::Relaxed) {
+                let _ = tx.send(HatchWorkerResult::Cancelled { log_lines: log });
+                return;
+            }
+            let segs = crate::hatch_trace::split_at_intersections_cancellable(
+                &raw, &cancel_for_thread);
+            if cancel_for_thread.load(Ordering::Relaxed) {
+                let _ = tx.send(HatchWorkerResult::Cancelled { log_lines: log });
+                return;
+            }
+            log.push(format!(
+                "  worker: tessellated {} → split into {} segs (+{})",
+                raw.len(), segs.len(), segs.len() - raw.len()));
+            let tb = crate::hatch_trace::trace_boundary_at(&doc_snapshot, seed);
+            if cancel_for_thread.load(Ordering::Relaxed) {
+                let _ = tx.send(HatchWorkerResult::Cancelled { log_lines: log });
+                return;
+            }
+            match tb {
+                Some(tb) => {
+                    log.push(format!(
+                        "  worker: traced outer {} verts, {} island(s)",
+                        tb.outer.len(), tb.islands.len()));
+                    let mut loops = Vec::with_capacity(1 + tb.islands.len());
+                    loops.push(tb.outer);
+                    loops.extend(tb.islands);
+                    let _ = tx.send(HatchWorkerResult::Success {
+                        loops, log_lines: log,
+                    });
+                }
+                None => {
+                    log.push("  worker: trace produced no boundary".to_string());
+                    let _ = tx.send(HatchWorkerResult::Failure {
+                        reason: "trace returned None".into(),
+                        log_lines: log,
+                    });
+                }
+            }
+        });
+        self.hatch_worker = Some(HatchWorker {
+            seed, pattern, active_layer, cancel, rx,
+        });
+        self.hatch_dbg(format!(
+            "  spawned hatch worker for seed ({:.3},{:.3}) — UI stays responsive; Esc cancels",
+            seed.x, seed.y));
+        self.set_prompt(
+            "hatching… UI stays responsive — press Esc to cancel".to_string());
+    }
+
+    /// Called every frame from `update`. Drains the worker channel if
+    /// the trace has completed; materialises the result into the doc
+    /// (Success) or logs the failure / cancel and falls back to the
+    /// cheap path if applicable (Failure).
+    fn poll_hatch_worker(&mut self) {
+        let Some(worker) = &self.hatch_worker else { return; };
+        let result = match worker.rx.try_recv() {
+            Ok(r) => r,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // Worker thread died without sending (e.g. panic).
+                // Clear the field and log; don't fall back blindly.
+                self.hatch_dbg("  worker disconnected without result (likely cancelled or panicked)");
+                self.hatch_worker = None;
+                return;
+            }
+        };
+        // Take ownership of the worker so we can mutate `self.doc` etc.
+        let worker = self.hatch_worker.take().unwrap();
+        match result {
+            HatchWorkerResult::Success { loops, log_lines } => {
+                for line in log_lines { self.hatch_dbg(line); }
+                self.snapshot_doc();
+                let mut handles: Vec<cad_kernel::Handle> = Vec::new();
+                for loop_verts in loops {
+                    let mut verts: Vec<cad_kernel::PolyVertex> = loop_verts.iter()
+                        .map(|v| cad_kernel::PolyVertex { pos: *v, bulge: 0.0 })
+                        .collect();
+                    if verts.len() >= 2 {
+                        let first = verts[0].pos;
+                        let last  = verts[verts.len() - 1].pos;
+                        if (last - first).len() < crate::hatch_trace::JOIN_EPS {
+                            verts.pop();
+                        }
+                    }
+                    if verts.len() < 3 { continue; }
+                    let pl = cad_kernel::Polyline { vertices: verts, closed: true };
+                    let mut d = cad_kernel::DObject::from(pl);
+                    d.style = cad_kernel::Style::on_layer(worker.active_layer);
+                    let idx = self.doc.push(d);
+                    handles.push(self.doc.dobjects[idx].handle);
+                }
+                if handles.is_empty() {
+                    self.hatch_dbg("  worker result had no usable polylines");
+                    self.clear_prompt();
+                    return;
+                }
+                let pattern_label = match &worker.pattern {
+                    cad_kernel::HatchPattern::Solid => "SOLID".to_string(),
+                    cad_kernel::HatchPattern::Pattern { name, .. } => name.clone(),
+                };
+                let n_loops = handles.len();
+                let mut d = cad_kernel::DObject::from(cad_kernel::Hatch {
+                    boundary_handles: handles,
+                    pattern: worker.pattern.clone(),
+                });
+                d.style = cad_kernel::Style::on_layer(worker.active_layer);
+                self.doc.push(d);
+                self.gpu_dirty = true;
+                self.index_dirty = true;
+                self.history.push(format!(
+                    "  + hatch ({}): traced boundary, {} loop(s) materialised (async)",
+                    pattern_label, n_loops));
+                self.dump_hatch_state();
+                // If pick-point session is still armed, restore prompt
+                // for the next click.
+                if self.hatch_pick_point_armed {
+                    let style = self.hatch_pick_point_session.as_ref()
+                        .and_then(|(n, _, _)| n.clone())
+                        .unwrap_or_else(|| "SOLID".to_string());
+                    self.set_prompt(format!(
+                        "hatch ({}): click another region OR Enter to finish  [Esc=cancel]",
+                        style));
+                } else {
+                    self.clear_prompt();
+                }
+            }
+            HatchWorkerResult::Failure { reason, log_lines } => {
+                for line in log_lines { self.hatch_dbg(line); }
+                self.hatch_dbg(format!("  worker failure: {}", reason));
+                // Fall back to cheap path with auto-islands — same
+                // logic apply_pick_point_hatch's sync fallback uses.
+                let seed = worker.seed;
+                if let Some(idx) = self.find_smallest_containing_closed(seed) {
+                    let kind = self.doc.dobjects.get(idx)
+                        .map(|d| dobject_kind_name(&d.geom))
+                        .unwrap_or("?");
+                    let islands = self.collect_islands_inside(idx, seed);
+                    self.hatch_dbg(format!(
+                        "  fallback → CHEAP PATH outer #{} ({}) + {} island(s)",
+                        idx, kind, islands.len()));
+                    // Restore the pending pattern so apply_hatch picks it up.
+                    if let Some(sess) = self.hatch_pick_point_session.clone() {
+                        self.pending_hatch_pattern = sess;
+                    }
+                    self.selection = std::iter::once(idx).chain(islands).collect();
+                    self.apply_hatch();
+                    self.selection.clear();
+                } else {
+                    self.history.push(
+                        "  ! hatch pick-point: no closed boundary contains the click".into());
+                }
+                // Restore prompt if session armed
+                if self.hatch_pick_point_armed {
+                    let style = self.hatch_pick_point_session.as_ref()
+                        .and_then(|(n, _, _)| n.clone())
+                        .unwrap_or_else(|| "SOLID".to_string());
+                    self.set_prompt(format!(
+                        "hatch ({}): click another region OR Enter to finish  [Esc=cancel]",
+                        style));
+                } else {
+                    self.clear_prompt();
+                }
+            }
+            HatchWorkerResult::Cancelled { log_lines } => {
+                for line in log_lines { self.hatch_dbg(line); }
+                self.hatch_dbg("  worker: trace cancelled by user (Esc)");
+                self.history.push("  hatch trace cancelled".into());
+                self.clear_prompt();
+            }
+        }
+    }
+
     fn apply_pick_point_hatch(&mut self, seed: Vec2) -> bool {
         // Verbose dump: every dobject + every coordinate the trace
         // pipeline will see this click. Lets the user verify "is this
@@ -2400,187 +2684,14 @@ impl CadApp {
         // (the single_outer_crossed log was emitted above before the branch)
         // Full trace path — handles arbitrary chains AND partial overlaps
         // (intersection-splitting inside trace_boundary_at).
-        self.hatch_dbg("  --- TRACE PATH engaged ---");
-        // Reset the cancel flag at op start. From here on, anything
-        // pre-set by an earlier session is cleared; Esc this frame
-        // sets it again and the cancellable phases below bail out
-        // BETWEEN phases (sync trace still blocks the frame, so
-        // mid-phase Esc doesn't help until the op moves to a worker
-        // thread — see op_cancel field doc comment).
-        self.op_cancel.store(false, Ordering::Relaxed);
-        let cancel = self.op_cancel.clone();
-        // Run a manual instrumentation pass first so the user can see
-        // segment / cluster / ray-hit counts before the actual trace.
-        let raw_segs = crate::hatch_trace::tessellate_doc_cancellable(&self.doc, &cancel);
-        if cancel.load(Ordering::Relaxed) {
-            self.hatch_dbg("  → trace cancelled (tessellation phase)");
-            return false;
-        }
-        let segs = crate::hatch_trace::split_at_intersections_cancellable(&raw_segs, &cancel);
-        if cancel.load(Ordering::Relaxed) {
-            self.hatch_dbg("  → trace cancelled (split phase)");
-            return false;
-        }
-        let (endpoints, cluster_pos) =
-            crate::hatch_trace::cluster_endpoints_cancellable(&segs, &cancel);
-        if cancel.load(Ordering::Relaxed) {
-            self.hatch_dbg("  → trace cancelled (cluster phase)");
-            return false;
-        }
-        let hits = crate::hatch_trace::ray_cast_horiz(seed, &segs);
-        self.hatch_dbg(format!(
-            "    tessellated {} segs → split into {} segs (+{}), {} clusters, ray cast found {} hit(s) east of seed",
-            raw_segs.len(), segs.len(), segs.len() - raw_segs.len(),
-            cluster_pos.len(), hits.len()));
-        for (k, (t, sidx, hp)) in hits.iter().enumerate() {
-            let (a_id, b_id) = endpoints[*sidx];
-            let pa = cluster_pos[a_id];
-            let pb = cluster_pos[b_id];
-            let src = segs[*sidx].src;
-            self.hatch_dbg(format!(
-                "      hit{}: t={:.3} at ({:.3},{:.3}) seg#{} src=#{} a={:?} b={:?}",
-                k, t, hp.x, hp.y, sidx, src, (pa.x, pa.y), (pb.x, pb.y)));
-        }
-        // Per-hit trace attempts — same logic trace_boundary_at uses
-        // internally, but with diagnostic output for each starting
-        // hit so we can see exactly which junctions dead-end the walk
-        // and which produce loops not containing the seed.
         //
-        // Dedupe hits that land on the same world point — the trace
-        // path does the same dedup internally, so log only what the
-        // trace will actually attempt.
-        let adj = crate::hatch_trace::build_adjacency(&segs, &endpoints, cluster_pos.len());
-        let mut seen_hits: Vec<Vec2> = Vec::new();
-        let mut deduped: Vec<&(f64, usize, Vec2)> = Vec::new();
-        for h in &hits {
-            if seen_hits.iter().any(|s| (*s - h.2).len() < 1e-6) { continue; }
-            seen_hits.push(h.2);
-            deduped.push(h);
-        }
-        if deduped.len() != hits.len() {
-            self.hatch_dbg(format!(
-                "    (deduped {} duplicate-position hits → {} unique attempts)",
-                hits.len() - deduped.len(), deduped.len()));
-        }
-        for (k, &&(_, sidx, _)) in deduped.iter().enumerate() {
-            let (a_id, b_id) = endpoints[sidx];
-            let pa = cluster_pos[a_id];
-            let pb = cluster_pos[b_id];
-            let start_cluster = if pa.y < pb.y { a_id } else { b_id };
-            match crate::hatch_trace::trace_loop(
-                sidx, start_cluster, &segs, &endpoints, &adj, &cluster_pos)
-            {
-                Some(loop_verts) => {
-                    let n = loop_verts.len();
-                    let inside = point_in_polygon(seed, loop_verts.clone());
-                    self.hatch_dbg(format!(
-                        "      attempt{}: trace_loop OK — {} verts, contains seed: {}",
-                        k, n, inside));
-                }
-                None => {
-                    self.hatch_dbg(format!(
-                        "      attempt{}: trace_loop DEAD-END (best=None at some junction OR exceeded MAX_TRACE_STEPS)",
-                        k));
-                }
-            }
-        }
-        let tb = match crate::hatch_trace::trace_boundary_at(&self.doc, seed) {
-            Some(tb) => tb,
-            None => {
-                self.hatch_dbg(
-                    "  → trace found no closed boundary around the click");
-                // FALLBACK: cheap path with auto-islands. The trace can
-                // fail at junctions where multiple dobjects share a
-                // vertex and the CCW-turn rule is ambiguous (e.g. the
-                // polyline #8 + polyline #12 shared-corner case the
-                // user surfaced — trace diverts into the wrong sub-loop
-                // and never closes). The cheap path with auto-islands
-                // produces a useful answer in that case: outer = the
-                // single containing closed dobject, islands = any
-                // closed dobjects fully nested inside it.
-                if let Some(idx) = self.find_smallest_containing_closed(seed) {
-                    let kind = self.doc.dobjects.get(idx)
-                        .map(|d| dobject_kind_name(&d.geom))
-                        .unwrap_or("?");
-                    let islands = self.collect_islands_inside(idx, seed);
-                    self.hatch_dbg(format!(
-                        "  → trace failed; falling back to CHEAP PATH with outer #{} ({}) + {} auto-island(s)",
-                        idx, kind, islands.len()));
-                    self.selection = std::iter::once(idx).chain(islands).collect();
-                    self.apply_hatch();
-                    self.selection.clear();
-                    return true;
-                }
-                self.history.push(
-                    "  ! hatch pick-point: no closed boundary contains the click".into());
-                return false;
-            }
-        };
-        self.hatch_dbg(format!(
-            "  → traced boundary: outer {} verts, {} island(s)",
-            tb.outer.len(), tb.islands.len()));
-        self.snapshot_doc();
-        let active_layer = self.doc.layers.active;
-        let mut handles: Vec<cad_kernel::Handle> = Vec::new();
-        // Outer first, then islands — preserves the even-odd ordering
-        // the hatch render expects.
-        let mut loops_to_push: Vec<Vec<Vec2>> = Vec::with_capacity(1 + tb.islands.len());
-        loops_to_push.push(tb.outer);
-        loops_to_push.extend(tb.islands);
-        for loop_verts in loops_to_push {
-            let mut verts: Vec<cad_kernel::PolyVertex> = loop_verts.iter()
-                .map(|v| cad_kernel::PolyVertex { pos: *v, bulge: 0.0 })
-                .collect();
-            // Drop the closing repeat if present — closed polylines
-            // imply the last→first edge automatically.
-            if verts.len() >= 2 {
-                let first = verts[0].pos;
-                let last  = verts[verts.len() - 1].pos;
-                if (last - first).len() < crate::hatch_trace::JOIN_EPS {
-                    verts.pop();
-                }
-            }
-            if verts.len() < 3 { continue; }
-            let pl = cad_kernel::Polyline { vertices: verts, closed: true };
-            let mut d = cad_kernel::DObject::from(pl);
-            d.style = cad_kernel::Style::on_layer(active_layer);
-            let idx = self.doc.push(d);
-            handles.push(self.doc.dobjects[idx].handle);
-        }
-        if handles.is_empty() {
-            self.hatch_dbg("  → trace produced no usable polylines");
-            return false;
-        }
-        // Consume pending pattern args (same logic as apply_hatch).
-        let (pat_name, pat_scale, pat_angle) =
-            std::mem::replace(&mut self.pending_hatch_pattern, (None, 1.0, 0.0));
-        let pattern = match pat_name {
-            None       => cad_kernel::HatchPattern::Solid,
-            Some(name) => cad_kernel::HatchPattern::Pattern {
-                name: name.to_ascii_uppercase(),
-                scale: pat_scale,
-                angle_deg: pat_angle,
-            },
-        };
-        let pattern_label = match &pattern {
-            cad_kernel::HatchPattern::Solid => "SOLID".to_string(),
-            cad_kernel::HatchPattern::Pattern { name, .. } => name.clone(),
-        };
-        let loop_count = handles.len();
-        self.hatch_dbg(format!(
-            "  pushing Hatch (traced): pattern={}, scale={:.3}, angle={:.2}, {} loop(s)",
-            pattern_label, pat_scale, pat_angle, loop_count));
-        let mut d = cad_kernel::DObject::from(cad_kernel::Hatch {
-            boundary_handles: handles,
-            pattern,
-        });
-        d.style = cad_kernel::Style::on_layer(active_layer);
-        self.doc.push(d);
-        self.gpu_dirty = true;
-        self.index_dirty = true;
-        self.history.push(format!(
-            "  + hatch ({}): traced boundary, {} loop(s) materialised",
-            pattern_label, loop_count));
+        // Backgrounded: spawn the heavy work (tessellate + split +
+        // cluster + trace) on a worker thread. The UI keeps spinning
+        // and Esc presses are seen mid-op via the cancel flag.
+        // `poll_hatch_worker` (called each frame from `update`)
+        // drains the result and materialises the hatch when ready.
+        self.hatch_dbg("  --- TRACE PATH engaged (async, worker thread) ---");
+        self.spawn_hatch_worker(seed);
         true
     }
 
@@ -6714,6 +6825,14 @@ impl eframe::App for CadApp {
         // ensure continuous repaint, never frozen
         ctx.request_repaint();
         self.trim_debug_frame = self.trim_debug_frame.wrapping_add(1);
+
+        // Drain any in-flight hatch trace worker. If the worker
+        // finished this frame, this materialises the result (Success
+        // → push polylines + hatch dobject; Failure → fall back to
+        // cheap path; Cancelled → log + clear prompt). No-op when
+        // no worker is running. Runs FIRST so the rest of the frame
+        // sees the updated doc state.
+        self.poll_hatch_worker();
 
         // FPS — exponential moving average so the number doesn't jitter
         let dt = ctx.input(|i| i.stable_dt);
