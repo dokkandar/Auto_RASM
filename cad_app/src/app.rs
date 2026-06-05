@@ -175,6 +175,14 @@ pub struct CadApp {
     /// handle of a selected dobject. v1 semantic: dragging any grip
     /// translates the whole dobject by the cursor delta.
     grip_drag: Option<GripDrag>,
+    /// Snapshot from the last render pass — how many dobjects exist,
+    /// how many landed in the viewport, how many were painted, plus
+    /// per-cull skip counters. Surfaced in the "Screen Stats" floating
+    /// window so the user can verify the renderer's view of the doc.
+    last_render_stats: RenderStats,
+    /// Whether the "Screen Stats" window is currently visible. Toggle
+    /// via Tools menu.
+    screen_stats_open: bool,
     /// Background worker for hatch trace. `None` when no trace is in
     /// flight. While `Some`, every frame `poll_hatch_worker` tries to
     /// receive the result; on receipt the loops are materialised as
@@ -660,6 +668,38 @@ pub enum RenderMode {
     Gpu,
 }
 
+/// Snapshot of what the render loop did this frame. Surfaced in the
+/// "Screen Stats" floating window so the user can see at a glance how
+/// many dobjects exist, how many are in the viewport, and how many
+/// actually got painted (vs filtered by visibility/sub-pixel culls).
+///
+/// The `in_viewport` count tells you whether the spatial-index broad-
+/// phase is doing useful work: `in_viewport == total` at any zoom
+/// means the cull isn't helping (typically because the index is
+/// stale or absent).
+#[derive(Clone, Debug, Default)]
+pub struct RenderStats {
+    /// Total dobjects in the document.
+    pub total:           usize,
+    /// Passed the bbox-cull (spatial-index query OR full scan if index
+    /// is stale). This is the candidate set the render loop iterates.
+    pub in_viewport:     usize,
+    /// Painted this frame. Less than `in_viewport` when some
+    /// candidates were skipped (hidden / frozen layer / sub-pixel).
+    pub drawn:           usize,
+    /// Skipped: hidden Dobject style.visible == false OR layer is
+    /// hidden/frozen.
+    pub skipped_hidden:  usize,
+    /// Skipped: bbox < 1 pixel (the micro-cull); no visible benefit
+    /// to painting them.
+    pub skipped_subpx:   usize,
+    /// Frame time (seconds). Inverse of FPS.
+    pub frame_dt:        f32,
+    /// Last frame's spatial-index status string ("idx N entries" /
+    /// "idx stale" / etc.).
+    pub index_label:     String,
+}
+
 /// Result delivered from the hatch trace worker thread back to the
 /// main UI thread via mpsc. The worker bundles its log buffer with
 /// the result so the per-hit attempt diagnostics and the
@@ -732,6 +772,8 @@ impl Default for CadApp {
             last_command:       None,
             empty_enter_count_in_select: 0,
             grip_drag: None,
+            last_render_stats:   RenderStats::default(),
+            screen_stats_open:   true,
             hatch_worker:        None,
             op_cancel:           StdArc::new(AtomicBool::new(false)),
             docked_window_pos:   HashMap::new(),
@@ -3319,6 +3361,107 @@ impl CadApp {
                 self.hatch_dbg(format!("  {}", e));
             }
         }
+    }
+
+    /// Screen Stats window — confirms the renderer's view of the doc
+    /// (total / in viewport / drawn / skipped) so the user can verify
+    /// the spatial-index broad-phase is doing useful work, the
+    /// viewport cull isn't dropping things it shouldn't, etc.
+    /// Per-frame numbers from `last_render_stats`. Toggleable via the
+    /// Tools menu; open by default because that's the whole point —
+    /// the user wanted to SEE this info.
+    fn render_screen_stats_window(&mut self, ctx: &egui::Context) {
+        if !self.screen_stats_open { return; }
+        let mut open = self.screen_stats_open;
+        let stats = self.last_render_stats.clone();
+        let fps = if stats.frame_dt > 0.0 { 1.0 / stats.frame_dt } else { 0.0 };
+        let win = egui::Window::new("Screen Stats")
+            .open(&mut open)
+            .default_pos(egui::pos2(20.0, 110.0))
+            .default_size(egui::vec2(280.0, 220.0))
+            .resizable(true)
+            .collapsible(true);
+        let win = self.apply_dock_pos("Screen Stats", win);
+        let resp = win.show(ctx, |ui| {
+            ui.style_mut().override_font_id = Some(egui::FontId::monospace(12.0));
+            let cull_ratio = if stats.total > 0 {
+                100.0 * stats.in_viewport as f32 / stats.total as f32
+            } else { 0.0 };
+            let draw_ratio = if stats.in_viewport > 0 {
+                100.0 * stats.drawn as f32 / stats.in_viewport as f32
+            } else { 0.0 };
+
+            egui::Grid::new("stats_grid")
+                .num_columns(2)
+                .spacing([10.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label("total dobjects:");
+                    ui.label(format!("{}", stats.total));
+                    ui.end_row();
+
+                    ui.label("in viewport:");
+                    ui.label(format!("{}  ({:.1}% of total)",
+                        stats.in_viewport, cull_ratio));
+                    ui.end_row();
+
+                    ui.label("drawn:");
+                    ui.label(format!("{}  ({:.1}% of viewport)",
+                        stats.drawn, draw_ratio));
+                    ui.end_row();
+
+                    ui.label("skipped:");
+                    ui.label(format!("{}  (hidden / sub-pixel)",
+                        stats.skipped_hidden + stats.skipped_subpx));
+                    ui.end_row();
+
+                    ui.label("");
+                    ui.label("");
+                    ui.end_row();
+
+                    ui.label("FPS:");
+                    ui.label(format!("{:.1}", fps));
+                    ui.end_row();
+
+                    ui.label("frame:");
+                    ui.label(format!("{:.2} ms", stats.frame_dt * 1000.0));
+                    ui.end_row();
+
+                    ui.label("render mode:");
+                    ui.label(match self.render_mode {
+                        RenderMode::Cpu => "CPU",
+                        RenderMode::Gpu => "GPU",
+                    });
+                    ui.end_row();
+
+                    ui.label("spatial idx:");
+                    ui.label(&stats.index_label);
+                    ui.end_row();
+                });
+
+            ui.separator();
+
+            // Health hints — flag the common "renderer doesn't know
+            // what's on screen" symptoms the user was worried about.
+            if stats.in_viewport == stats.total && stats.total > 32 {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 200, 80),
+                    "⚠ viewport cull not active: all dobjects iterated.\n\
+                     spatial index is stale or absent (zoom/pan/edit invalidates it).",
+                );
+            } else if stats.total > 0 && stats.drawn == 0 {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 140, 140),
+                    "⚠ 0 drawn — everything filtered (hidden layer? sub-pixel? off-screen?)",
+                );
+            } else if stats.in_viewport > 0 {
+                ui.colored_label(
+                    egui::Color32::from_rgb(140, 220, 140),
+                    "✓ renderer sees the viewport set",
+                );
+            }
+        });
+        self.process_dock_after_show("Screen Stats", ctx, resp);
+        self.screen_stats_open = open;
     }
 
     fn render_layer_panel(&mut self, ctx: &egui::Context) {
@@ -7252,6 +7395,9 @@ impl eframe::App for CadApp {
                     ui.checkbox(&mut self.pens_window_open,     "Pens");
                     ui.checkbox(&mut self.info_window_open,     "Info / Properties");
                     ui.checkbox(&mut self.dobjects_window_open, "DObjects list");
+                    ui.checkbox(&mut self.screen_stats_open,    "Screen Stats")
+                        .on_hover_text(
+                            "Renderer's view of the doc: total / in viewport / drawn / skipped");
                     ui.separator();
                     if ui.button("Snap window").clicked() {
                         self.snap_window_open = !self.snap_window_open;
@@ -7803,6 +7949,12 @@ impl eframe::App for CadApp {
                 if close_it    { self.array_open = false; }
             }
         }
+
+        // ---- floating: Screen Stats (renderer's view of the doc) -------
+        // Always called — it checks `screen_stats_open` and bails if
+        // closed. Open by default since the user wanted to confirm
+        // the app knows what's on screen.
+        self.render_screen_stats_window(ctx);
 
         // ---- left panel: Layer dock (Slice B) ---------------------------
         if self.layer_panel_open {
@@ -9167,12 +9319,19 @@ impl eframe::App for CadApp {
             // Source the candidate indices: if a fresh index exists, query it
             // (O(visible cells)); otherwise fall back to O(N) iteration. The
             // index loop is dramatically faster at 1M+ dobjects.
-            let candidate_iter: Box<dyn Iterator<Item = usize>> =
+            //
+            // Collected into a Vec so we can both COUNT the candidates
+            // (= `in_viewport` in the screen-stats panel) and iterate
+            // them twice (CPU vs GPU branches consume the same set).
+            let candidates: Vec<usize> =
                 if let (Some(g), false) = (self.index.as_ref(), self.index_dirty) {
-                    Box::new(g.query_bbox(v_min, v_max).into_iter().map(|u| u as usize))
+                    g.query_bbox(v_min, v_max).into_iter().map(|u| u as usize).collect()
                 } else {
-                    Box::new(0..self.doc.dobjects.len())
+                    (0..self.doc.dobjects.len()).collect()
                 };
+            let in_viewport = candidates.len();
+            let candidate_iter: Box<dyn Iterator<Item = usize>> =
+                Box::new(candidates.into_iter());
 
             // DObject supplying the active snap, if any — highlighted in cyan
             // so the user can see "this is what I'm anchoring against" even
@@ -9461,6 +9620,19 @@ impl eframe::App for CadApp {
                 egui::FontId::monospace(11.0),
                 egui::Color32::from_rgb(200, 220, 240),
             );
+            // Snapshot for the Screen Stats panel — covers both CPU
+            // and GPU render paths (they share `drawn`/`skipped`).
+            self.last_render_stats = RenderStats {
+                total:           self.doc.dobjects.len(),
+                in_viewport,
+                drawn,
+                skipped_hidden:  skipped,    // combined hidden+subpx for now
+                skipped_subpx:   0,          // (split is a future refinement)
+                frame_dt:        dt,
+                index_label:     if self.index_label.is_empty() {
+                    idx_state.to_string()
+                } else { self.index_label.clone() },
+            };
             if !self.index_label.is_empty() {
                 painter.text(
                     rect.right_top() + egui::vec2(-8.0, 24.0),
