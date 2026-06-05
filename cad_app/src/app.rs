@@ -7678,20 +7678,58 @@ impl eframe::App for CadApp {
         if self.array_open {
             if self.picking_source {
                 // Banner — small, doesn't obscure the right panel.
+                // Three completion paths: click an dobject on the
+                // canvas (uses nearest_entity_under), click an dobject
+                // row in the DObjects panel, OR press OK to accept
+                // whatever `self.selected` already holds (useful when
+                // the user has already picked something via canvas
+                // earlier and just wants to reuse it).
+                let current_desc = self.selected
+                    .and_then(|i| self.doc.dobjects.get(i))
+                    .map(|d| describe(&d.geom));
+                let mut do_ok     = false;
+                let mut do_cancel = false;
                 egui::Window::new("Pick array source")
                     .resizable(false)
                     .collapsible(false)
                     .show(ctx, |ui| {
-                        ui.set_min_width(280.0);
+                        ui.set_min_width(320.0);
                         ui.colored_label(
                             egui::Color32::from_rgb(255, 220, 100),
-                            "→ Click an dobject in the right panel.",
+                            "→ Click an dobject on the canvas, or pick a row in the DObjects panel.",
                         );
-                        ui.label("It will be highlighted and the array dialog will return.");
-                        if ui.button("Cancel pick").clicked() {
-                            self.picking_source = false;
+                        ui.label("Once a source is picked the array dialog returns.");
+                        ui.separator();
+                        match &current_desc {
+                            Some(d) => {
+                                ui.horizontal(|ui| {
+                                    ui.label("current source:");
+                                    ui.monospace(format!("#{} {}",
+                                        self.selected.unwrap(), d));
+                                });
+                            }
+                            None => {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(255, 140, 140),
+                                    "(no source picked yet — OK is disabled)");
+                            }
                         }
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(self.selected.is_some(),
+                                              egui::Button::new("OK"))
+                                .on_hover_text("Accept the currently-selected dobject as the array source")
+                                .clicked()
+                            {
+                                do_ok = true;
+                            }
+                            if ui.button("Cancel pick").clicked() {
+                                do_cancel = true;
+                            }
+                        });
                     });
+                if do_ok || do_cancel {
+                    self.picking_source = false;
+                }
             } else {
                 let mut do_generate = false;
                 let mut close_it    = false;
