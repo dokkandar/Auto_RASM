@@ -60,6 +60,10 @@ pub struct UserEnv {
     /// Default chamfer distance along the SECOND picked line
     /// (AutoCAD `CHAMFERB`).
     pub ChmDs2: f64,
+    /// Default offset distance (AutoCAD `OFFSETDIST`). Set inline by
+    /// passing `offset <d>` — the new value persists across sessions
+    /// and bare `offset` re-uses it. Initial default 1.0.
+    pub OfsDis: f64,
 
     // ---- display ----
     /// Dragging display during MOVE/COPY. 0=off, 1=on, 2=auto.
@@ -158,6 +162,7 @@ impl Default for UserEnv {
             FltRad: 0.0,
             ChmDs1: 0.0,
             ChmDs2: 0.0,
+            OfsDis: 1.0,
             DrDspM: 2,
             MnuBar: false,
             TltEnb: true,
@@ -233,6 +238,7 @@ impl UserEnv {
         push_f64(&mut s, "FltRad", self.FltRad);
         push_f64(&mut s, "ChmDs1", self.ChmDs1);
         push_f64(&mut s, "ChmDs2", self.ChmDs2);
+        push_f64(&mut s, "OfsDis", self.OfsDis);
         push_u8(&mut s, "DrDspM", self.DrDspM);
         push_bool(&mut s, "MnuBar", self.MnuBar);
         push_bool(&mut s, "TltEnb", self.TltEnb);
@@ -288,6 +294,7 @@ impl UserEnv {
             "FltRad" => if let Ok(v) = val.parse() { self.FltRad = v; }
             "ChmDs1" => if let Ok(v) = val.parse() { self.ChmDs1 = v; }
             "ChmDs2" => if let Ok(v) = val.parse() { self.ChmDs2 = v; }
+            "OfsDis" => if let Ok(v) = val.parse() { self.OfsDis = v; }
             "DrDspM" => if let Ok(v) = val.parse() { self.DrDspM = v; }
             "MnuBar" => if let Some(v) = parse_bool(val) { self.MnuBar = v; }
             "TltEnb" => if let Some(v) = parse_bool(val) { self.TltEnb = v; }

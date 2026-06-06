@@ -1210,16 +1210,6 @@ impl CadApp {
                 return;
             }
         }
-        // Remember the line as the "last command" for Enter-on-empty
-        // repeat — but only NOW, AFTER the rotate/scale/etc sub-command
-        // intercepts have had their shot. Numbers / R / C typed inside
-        // a rotate or scale session are sub-command input, not top-level
-        // commands; they must not overwrite last_command. (Bug from
-        // 2026-06-03 screenshot: typing `2` mid-scale stored "2", so
-        // the next Enter tried to parse "2" as a global command.)
-        if !trimmed.is_empty() {
-            self.last_command = Some(trimmed.to_string());
-        }
         // ---- Selection-mode shortcut intercept ----
         //
         // While a select session is active, single-letter input is a
@@ -1240,7 +1230,23 @@ impl CadApp {
         } else {
             raw.to_string()
         };
-        match parse(&effective) {
+        let parsed = parse(&effective);
+        // Remember the line as the "last command" for Enter-on-empty
+        // repeat — ONLY on a successful parse. Set BEFORE dispatch so
+        // each Ok arm can clear / overwrite it if its own semantics
+        // demand. Sub-command intercepts (PLINE, rotate, scale, …)
+        // happened above and returned early; numbers / R / C typed
+        // inside those sessions never reach here.
+        //
+        // Why "successful only": a failed line like `1` typed by
+        // mistake used to overwrite last_command, so the next Enter
+        // re-ran `1` and printed "unknown command '1'" forever. The
+        // user's rule (2026-06-06): Enter-on-empty must repeat the
+        // last VALID command, never a sub-command and never a typo.
+        if !trimmed.is_empty() && parsed.is_ok() {
+            self.last_command = Some(trimmed.to_string());
+        }
+        match parsed {
             Ok(Command::Add(e))   => self.add_dobject(e, "command"),
             Ok(Command::Delete(i)) => {
                 if i < self.doc.dobjects.len() {
@@ -1514,9 +1520,24 @@ impl CadApp {
             }
             Ok(Command::Reverse)     => self.apply_reverse(),
             Ok(Command::ChangeLayer) => self.apply_chlayer(),
-            Ok(Command::Offset(d)) => {
+            Ok(Command::Offset(d_opt)) => {
+                // Resolve None to the persistent default (env.OfsDis).
+                // When the user supplied a distance explicitly, persist
+                // it so the next bare `offset` reuses it. Matches the
+                // AutoCAD OFFSETDIST behavior.
+                let d = match d_opt {
+                    Some(v) => {
+                        if (self.env.OfsDis - v).abs() > 1e-12 {
+                            self.env.OfsDis = v;
+                            let _ = self.env.save();
+                        }
+                        v
+                    }
+                    None => self.env.OfsDis,
+                };
                 if self.selection.is_empty() {
-                    self.history.push("  ! offset: empty basket — `select` first".into());
+                    self.history.push(format!(
+                        "  ! offset (d={:.3}): empty basket — `select` first", d));
                 } else {
                     self.offset_state = OffsetState::WaitingForSide(d);
                     self.history.push(format!(

@@ -88,7 +88,9 @@ pub enum Command {
     /// Bulk-set every selected dobject's `style.layer` to the active layer.
     ChangeLayer,
     /// Offset every selected dobject by a distance. App captures a side click.
-    Offset(f64),
+    /// `None` means "use the persistent default" (`env.OfsDis`); the app
+    /// resolves it. Matches the fillet pattern (radius optional).
+    Offset(Option<f64>),
     /// Lengthen every selected Line / Arc / EllipseArc by a signed delta.
     /// App captures a click on the end to extend.
     Lengthen(f64),
@@ -209,10 +211,17 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "reverse" | "rev" => Ok(Command::Reverse),
         "chlayer" | "cl"  => Ok(Command::ChangeLayer),
         "offset" | "o"    => {
-            let d: f64 = toks.get(1).ok_or("usage: offset <distance>")?
-                .parse().map_err(|_| "bad distance".to_string())?;
-            if d.abs() < 1e-12 { return Err("offset distance must be non-zero".into()); }
-            Ok(Command::Offset(d))
+            // Bare `offset` → use env.OfsDis (the app resolves None).
+            // `offset <d>` → use that distance and overwrite OfsDis on
+            // successful apply.
+            match toks.get(1) {
+                None    => Ok(Command::Offset(None)),
+                Some(s) => {
+                    let d: f64 = s.parse().map_err(|_| "bad distance".to_string())?;
+                    if d.abs() < 1e-12 { return Err("offset distance must be non-zero".into()); }
+                    Ok(Command::Offset(Some(d)))
+                }
+            }
         }
         "lengthen" | "len" => {
             let d: f64 = toks.get(1).ok_or("usage: lengthen <delta>")?
