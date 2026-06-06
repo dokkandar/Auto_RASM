@@ -594,6 +594,10 @@ pub enum QueuedOp {
     /// Generate. Multi-source: every grid cell instantiates a copy of
     /// every dobject in the selection (offset by cell position).
     Array,
+    /// Erase — applied on Enter. The finalised selection is deleted
+    /// in one batch. AutoCAD's ERASE: type `erase`, pick targets,
+    /// Enter to commit.
+    Erase,
 }
 
 /// State machine for the interactive copy tool — same shape as MoveState.
@@ -1806,8 +1810,15 @@ impl CadApp {
                 }
             }
             Ok(Command::DeleteSelected) => {
+                // AutoCAD ERASE flow: if basket is empty, enter select
+                // mode; on Enter the queued Erase op resumes and runs
+                // the actual delete. If basket is non-empty, delete
+                // immediately (pickfirst).
                 if self.selection.is_empty() {
-                    self.history.push("  ! nothing selected — use `select` first or click a dobject".into());
+                    self.begin_selection(SelectMode::ForSelect);
+                    self.queued_op = QueuedOp::Erase;
+                    self.set_prompt(
+                        "erase: select dobjects to delete, Enter to commit  [Esc=cancel]");
                 } else {
                     self.snapshot_doc();
                     // Remove from highest index downward so earlier indices stay valid.
@@ -1826,7 +1837,7 @@ impl CadApp {
                     self.intersections.clear();
                     self.index_dirty = true;
                     self.gpu_dirty = true;
-                    self.history.push(format!("  - deleted {} dobject(s)", n));
+                    self.history.push(format!("  - erased {} dobject(s)", n));
                 }
             }
             Ok(Command::Undo) => self.do_undo(),
@@ -2216,6 +2227,10 @@ impl CadApp {
                 self.history.push(format!(
                     "  array: {} source dobject(s) picked — set rows/cols and Generate",
                     self.selection.len()));
+            }
+            QueuedOp::Erase => {
+                // Replay the same path Command::DeleteSelected uses.
+                self.run_command("erase");
             }
         }
         // self.selection persists so follow-up commands (move, list, …) can use it.
