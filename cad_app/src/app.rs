@@ -7494,6 +7494,295 @@ fn panel_button(ui: &mut egui::Ui, label: &str, active: bool) -> bool {
     resp.clicked()
 }
 
+/// Toolbar button for a ONE-SHOT command (Move, Copy, Erase, Dist, …)
+/// — no `Tool` enum membership, just runs `cmd` on click. Matches the
+/// drafting `tool_button` height + color so the toolbar reads as one
+/// strip. `glyph_kind` picks a hand-drawn placeholder icon; replace
+/// with proper graphics later.
+fn cmd_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    glyph_kind: GlyphKind,
+    tip: &'static str,
+) -> bool {
+    let (resp, painter) =
+        ui.allocate_painter(egui::vec2(56.0, 52.0), egui::Sense::click());
+    let rect = resp.rect;
+    let bg = if resp.hovered() {
+        egui::Color32::from_rgb(48, 58, 72)
+    } else {
+        egui::Color32::from_rgb(28, 34, 42)
+    };
+    painter.rect(
+        rect, 5.0, bg,
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 80, 95)),
+    );
+    let c = rect.center() - egui::vec2(0.0, 6.0);
+    let ink = egui::Color32::from_rgb(225, 235, 245);
+    let pen = egui::Stroke::new(1.6, ink);
+    let dot = |p: egui::Pos2| { painter.circle_filled(p, 1.8, ink); };
+    draw_cmd_glyph(&painter, c, glyph_kind, pen, dot, ink);
+    // Label centered below the glyph.
+    painter.text(
+        egui::pos2(rect.center().x, rect.bottom() - 9.0),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(9.5),
+        ink,
+    );
+    let resp = resp.on_hover_text(tip);
+    resp.clicked()
+}
+
+/// Placeholder glyphs for `cmd_button`. Each variant is a few
+/// strokes — gets the idea across; we'll swap to real icons later.
+#[derive(Copy, Clone)]
+enum GlyphKind {
+    Move, Copy, Rotate, Scale, Mirror, Stretch, Align,
+    Trim, Extend, Fillet, Chamfer, Offset, Join, Break, Lengthen,
+    Erase, MatchProps, ChangeLayer, ArrayGrid, Reverse,
+    Dist, List,
+    Undo, Redo,
+}
+
+fn draw_cmd_glyph(
+    p: &egui::Painter,
+    c: egui::Pos2,
+    kind: GlyphKind,
+    pen: egui::Stroke,
+    dot: impl Fn(egui::Pos2),
+    ink: egui::Color32,
+) {
+    use egui::{Pos2 as _, vec2};
+    let v = |x: f32, y: f32| c + vec2(x, y);
+    match kind {
+        GlyphKind::Move => {
+            // four-headed arrow
+            p.line_segment([v(-10.0,0.0), v(10.0,0.0)], pen);
+            p.line_segment([v(0.0,-10.0), v(0.0,10.0)], pen);
+            for (dx, dy) in [(10.0,0.0), (-10.0,0.0), (0.0,10.0), (0.0,-10.0)] {
+                let tip = v(dx, dy);
+                let (nx, ny) = (-dx*0.3, -dy*0.3);
+                p.line_segment([tip, tip + vec2(nx-ny, ny+nx)], pen);
+                p.line_segment([tip, tip + vec2(nx+ny, ny-nx)], pen);
+            }
+        }
+        GlyphKind::Copy => {
+            // two overlapping rectangles
+            p.rect_stroke(egui::Rect::from_min_max(v(-11.0,-8.0), v(3.0,6.0)), 0.0, pen);
+            p.rect_stroke(egui::Rect::from_min_max(v(-3.0,-2.0), v(11.0,10.0)), 0.0, pen);
+        }
+        GlyphKind::Rotate => {
+            // 270° arc + arrowhead
+            let r = 11.0;
+            let mut pts = Vec::with_capacity(33);
+            for i in 0..=32 {
+                let t = -std::f32::consts::FRAC_PI_2 + (i as f32 / 32.0) * std::f32::consts::TAU * 0.78;
+                pts.push(v(r*t.cos(), r*t.sin()));
+            }
+            p.add(egui::Shape::line(pts, pen));
+            let last = v(r*(-std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU*0.78).cos(),
+                        r*(-std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU*0.78).sin());
+            p.line_segment([last, last + vec2(4.0, 1.0)], pen);
+            p.line_segment([last, last + vec2(1.0, 4.5)], pen);
+            dot(c);
+        }
+        GlyphKind::Scale => {
+            // small rect bottom-left, big rect top-right, diagonal
+            p.rect_stroke(egui::Rect::from_min_max(v(-11.0,2.0), v(-2.0,11.0)), 0.0, pen);
+            p.rect_stroke(egui::Rect::from_min_max(v(0.0,-11.0), v(12.0,1.0)), 0.0, pen);
+            p.line_segment([v(-2.0,2.0), v(0.0,1.0)], pen);
+        }
+        GlyphKind::Mirror => {
+            // shape + mirrored shape across vertical axis
+            p.line_segment([v(0.0,-11.0), v(0.0,11.0)], egui::Stroke::new(0.8, ink));
+            p.line_segment([v(-10.0,8.0), v(-3.0,-8.0)], pen);
+            p.line_segment([v(3.0,-8.0), v(10.0,8.0)], pen);
+            p.line_segment([v(-10.0,8.0), v(-3.0,8.0)], egui::Stroke::new(0.8, ink));
+            p.line_segment([v(3.0,8.0), v(10.0,8.0)], egui::Stroke::new(0.8, ink));
+        }
+        GlyphKind::Stretch => {
+            // dashed rectangle + outward arrow
+            for s in egui::Shape::dashed_line(
+                &[v(-11.0,-7.0), v(5.0,-7.0), v(5.0,5.0), v(-11.0,5.0), v(-11.0,-7.0)],
+                egui::Stroke::new(1.0, ink), 3.0, 2.0)
+            { p.add(s); }
+            p.line_segment([v(2.0,-1.0), v(11.0,-1.0)], pen);
+            p.line_segment([v(11.0,-1.0), v(8.0,-4.0)], pen);
+            p.line_segment([v(11.0,-1.0), v(8.0, 2.0)], pen);
+        }
+        GlyphKind::Align => {
+            // two segments aligning to a target line
+            p.line_segment([v(-12.0,5.0), v(-2.0,-5.0)], pen);
+            p.line_segment([v(4.0,5.0), v(12.0,-5.0)], pen);
+            p.line_segment([v(-12.0,8.0), v(12.0,8.0)], egui::Stroke::new(0.8, ink));
+        }
+        GlyphKind::Trim => {
+            // X over a line — "cut here"
+            p.line_segment([v(-12.0,5.0), v(12.0,5.0)], pen);
+            p.line_segment([v(-5.0,-5.0), v(5.0,5.0)], pen);
+            p.line_segment([v(-5.0,5.0), v(5.0,-5.0)], pen);
+        }
+        GlyphKind::Extend => {
+            // line + arrow extending to a wall
+            p.line_segment([v(-12.0,0.0), v(6.0,0.0)], pen);
+            p.line_segment([v(6.0,0.0), v(3.0,-3.0)], pen);
+            p.line_segment([v(6.0,0.0), v(3.0, 3.0)], pen);
+            p.line_segment([v(11.0,-10.0), v(11.0,10.0)], egui::Stroke::new(2.0, ink));
+        }
+        GlyphKind::Fillet => {
+            // two lines joined by an arc (rounded corner)
+            p.line_segment([v(-11.0,8.0), v(-4.0,8.0)], pen);
+            let r = 7.0;
+            let mut pts = Vec::with_capacity(17);
+            for i in 0..=16 {
+                let t = std::f32::consts::FRAC_PI_2 - (i as f32 / 16.0) * std::f32::consts::FRAC_PI_2;
+                pts.push(v(-4.0 + r*t.sin() - r, 8.0 + r - r*t.cos() - r) + vec2(7.0, 0.0));
+            }
+            // Simpler: draw the arc as a quarter circle joining the two lines
+            let arc_center = v(-4.0, 1.0);
+            let mut pts = Vec::with_capacity(17);
+            for i in 0..=16 {
+                let t = -std::f32::consts::FRAC_PI_2 + (i as f32 / 16.0) * std::f32::consts::FRAC_PI_2;
+                pts.push(arc_center + vec2(7.0 * t.cos(), 7.0 * t.sin()));
+            }
+            p.add(egui::Shape::line(pts, pen));
+            p.line_segment([v(3.0,1.0), v(3.0,10.0)], pen);
+        }
+        GlyphKind::Chamfer => {
+            // two lines joined by a diagonal (beveled corner)
+            p.line_segment([v(-11.0,8.0), v(-4.0,8.0)], pen);
+            p.line_segment([v(-4.0,8.0), v(3.0,1.0)], pen);
+            p.line_segment([v(3.0,1.0), v(3.0,10.0)], pen);
+        }
+        GlyphKind::Offset => {
+            // two parallel arcs
+            let r1 = 9.0;
+            let r2 = 5.0;
+            let mut a = Vec::new(); let mut b = Vec::new();
+            for i in 0..=24 {
+                let t = -std::f32::consts::FRAC_PI_2 + (i as f32 / 24.0) * std::f32::consts::PI;
+                a.push(v(r1*t.cos(), r1*t.sin()));
+                b.push(v(r2*t.cos(), r2*t.sin()));
+            }
+            p.add(egui::Shape::line(a, pen));
+            p.add(egui::Shape::line(b, pen));
+        }
+        GlyphKind::Join => {
+            // two arrows pointing at each other meeting at center
+            p.line_segment([v(-12.0,0.0), v(-2.0,0.0)], pen);
+            p.line_segment([v(-2.0,0.0), v(-5.0,-3.0)], pen);
+            p.line_segment([v(-2.0,0.0), v(-5.0, 3.0)], pen);
+            p.line_segment([v(12.0,0.0), v(2.0,0.0)], pen);
+            p.line_segment([v(2.0,0.0), v(5.0,-3.0)], pen);
+            p.line_segment([v(2.0,0.0), v(5.0, 3.0)], pen);
+        }
+        GlyphKind::Break => {
+            // line with gap in middle
+            p.line_segment([v(-12.0,0.0), v(-3.0,0.0)], pen);
+            p.line_segment([v(3.0,0.0), v(12.0,0.0)], pen);
+            p.line_segment([v(-3.0,-5.0), v(-3.0,5.0)], egui::Stroke::new(0.8, ink));
+            p.line_segment([v(3.0,-5.0), v(3.0,5.0)], egui::Stroke::new(0.8, ink));
+        }
+        GlyphKind::Lengthen => {
+            // short segment → arrow lengthening
+            p.line_segment([v(-12.0,0.0), v(-2.0,0.0)], pen);
+            p.line_segment([v(-12.0,-4.0), v(-12.0,4.0)], pen);
+            p.line_segment([v(-2.0,0.0), v(11.0,0.0)], egui::Stroke::new(1.0, ink));
+            p.line_segment([v(11.0,0.0), v(8.0,-3.0)], pen);
+            p.line_segment([v(11.0,0.0), v(8.0, 3.0)], pen);
+        }
+        GlyphKind::Erase => {
+            // pencil eraser block + diagonal
+            p.rect_filled(egui::Rect::from_min_max(v(-10.0,-2.0), v(2.0,8.0)),
+                3.0, egui::Color32::from_rgb(220, 100, 80));
+            p.rect_stroke(egui::Rect::from_min_max(v(-10.0,-2.0), v(2.0,8.0)),
+                3.0, egui::Stroke::new(1.0, ink));
+            p.line_segment([v(2.0,-2.0), v(11.0,-11.0)], pen);
+            p.line_segment([v(2.0, 8.0), v(11.0,-1.0)], pen);
+        }
+        GlyphKind::MatchProps => {
+            // brush + downward strokes
+            p.rect_stroke(egui::Rect::from_min_max(v(-8.0,-10.0), v(8.0,-2.0)),
+                1.0, pen);
+            for x in [-6.0, -2.0, 2.0, 6.0] {
+                p.line_segment([v(x,-2.0), v(x,9.0)], egui::Stroke::new(1.1, ink));
+            }
+        }
+        GlyphKind::ChangeLayer => {
+            // stacked rectangles
+            p.rect_stroke(egui::Rect::from_min_max(v(-11.0,4.0), v(7.0,10.0)), 1.0, pen);
+            p.rect_stroke(egui::Rect::from_min_max(v(-8.0,-2.0), v(10.0,4.0)), 1.0, pen);
+            p.rect_stroke(egui::Rect::from_min_max(v(-5.0,-8.0), v(13.0,-2.0)), 1.0, pen);
+        }
+        GlyphKind::ArrayGrid => {
+            // 3x3 dots
+            for y in [-8.0, 0.0, 8.0] {
+                for x in [-8.0, 0.0, 8.0] {
+                    p.rect_stroke(
+                        egui::Rect::from_min_max(v(x-3.0,y-3.0), v(x+3.0,y+3.0)),
+                        0.5, egui::Stroke::new(1.0, ink));
+                }
+            }
+        }
+        GlyphKind::Reverse => {
+            // curved arrow flipping direction
+            let mut pts = Vec::with_capacity(20);
+            for i in 0..=19 {
+                let t = std::f32::consts::PI - (i as f32 / 19.0) * std::f32::consts::PI;
+                pts.push(v(10.0 * t.cos(), 5.0 - 5.0 * t.sin()));
+            }
+            p.add(egui::Shape::line(pts, pen));
+            let tip = v(-10.0, 5.0);
+            p.line_segment([tip, tip + vec2(4.0, -3.0)], pen);
+            p.line_segment([tip, tip + vec2(4.0, 3.0)], pen);
+        }
+        GlyphKind::Dist => {
+            // ruler-style: line with tick marks + arrowheads
+            p.line_segment([v(-12.0,0.0), v(12.0,0.0)], pen);
+            for x in [-12.0, -6.0, 0.0, 6.0, 12.0] {
+                p.line_segment([v(x,-4.0), v(x,0.0)], egui::Stroke::new(0.8, ink));
+            }
+            p.line_segment([v(-12.0,0.0), v(-9.0,-3.0)], pen);
+            p.line_segment([v(-12.0,0.0), v(-9.0, 3.0)], pen);
+            p.line_segment([v(12.0,0.0), v(9.0,-3.0)], pen);
+            p.line_segment([v(12.0,0.0), v(9.0, 3.0)], pen);
+        }
+        GlyphKind::List => {
+            // three lines representing a list
+            for y in [-7.0, 0.0, 7.0] {
+                p.line_segment([v(-10.0,y), v(-6.0,y)],
+                    egui::Stroke::new(1.6, ink));
+                p.line_segment([v(-3.0,y), v(11.0,y)], pen);
+            }
+        }
+        GlyphKind::Undo => {
+            // curved arrow ←
+            let mut pts = Vec::with_capacity(17);
+            for i in 0..=16 {
+                let t = (i as f32 / 16.0) * std::f32::consts::PI;
+                pts.push(v(-9.0 + 9.0 * t.cos(), -9.0 * t.sin()));
+            }
+            p.add(egui::Shape::line(pts, pen));
+            let tip = v(-9.0, 0.0);
+            p.line_segment([tip, tip + vec2(4.0,-3.0)], pen);
+            p.line_segment([tip, tip + vec2(4.0, 3.0)], pen);
+        }
+        GlyphKind::Redo => {
+            // mirror of undo →
+            let mut pts = Vec::with_capacity(17);
+            for i in 0..=16 {
+                let t = (i as f32 / 16.0) * std::f32::consts::PI;
+                pts.push(v(9.0 - 9.0 * t.cos(), -9.0 * t.sin()));
+            }
+            p.add(egui::Shape::line(pts, pen));
+            let tip = v(9.0, 0.0);
+            p.line_segment([tip, tip + vec2(-4.0,-3.0)], pen);
+            p.line_segment([tip, tip + vec2(-4.0, 3.0)], pen);
+        }
+    }
+}
+
 fn tool_button(ui: &mut egui::Ui, current: &mut Tool, this: Tool, label: &str) -> bool {
     let selected = *current == this;
     let (resp, painter) =
@@ -8341,12 +8630,15 @@ impl eframe::App for CadApp {
                 });
                 ui.menu_button("Draw", |ui| {
                     for (label, cmd) in [
-                        ("Line",      "line"),
-                        ("Circle",    "circle"),
-                        ("Arc",       "arc"),
-                        ("Ellipse",   "ellipse"),
-                        ("Polyline",  "polyline"),
-                        ("Point",     "point"),
+                        ("Line",        "line"),
+                        ("Circle",      "circle"),
+                        ("Arc (3pt)",   "arc"),
+                        ("Ellipse",     "ellipse"),
+                        ("Ellipse Arc", "ellipsearc"),
+                        ("Polyline",    "polyline"),
+                        ("Spline",      "spline"),
+                        ("Point",       "point"),
+                        ("Hatch…",      "hatch"),
                     ] {
                         if ui.button(label).clicked() {
                             self.run_command(cmd);
@@ -8355,12 +8647,15 @@ impl eframe::App for CadApp {
                     }
                 });
                 ui.menu_button("Modify", |ui| {
+                    // Transform group
                     for (label, cmd) in [
                         ("Move",     "move"),
                         ("Copy",     "copy"),
                         ("Rotate",   "rotate"),
                         ("Scale",    "scale"),
                         ("Mirror",   "mirror"),
+                        ("Stretch",  "stretch"),
+                        ("Align",    "align"),
                     ] {
                         if ui.button(label).clicked() {
                             self.run_command(cmd);
@@ -8368,21 +8663,42 @@ impl eframe::App for CadApp {
                         }
                     }
                     ui.separator();
+                    // Edit-geometry group
                     for (label, cmd) in [
-                        ("Trim",     "trim"),
-                        ("Extend",   "extend"),
-                        ("Fillet",   "fillet"),
-                        ("Chamfer",  "chamfer"),
-                        ("Offset…",  "offset 1.0"),
-                        ("Join",     "join"),
-                        ("Break",    "break"),
-                        ("Align",    "align"),
-                        ("Stretch",  "stretch"),
+                        ("Trim",         "trim"),
+                        ("Extend",       "extend"),
+                        ("Fillet",       "fillet"),
+                        ("Chamfer",      "chamfer"),
+                        ("Offset",       "offset"),
+                        ("Join",         "join"),
+                        ("Break",        "break"),
+                        ("Lengthen",     "lengthen 1"),
+                        ("Reverse",      "reverse"),
                     ] {
                         if ui.button(label).clicked() {
                             self.run_command(cmd);
                             ui.close_menu();
                         }
+                    }
+                    ui.separator();
+                    // Multi-instance / properties group
+                    if ui.button("Array…").clicked() {
+                        self.array_open = true;
+                        ui.close_menu();
+                    }
+                    for (label, cmd) in [
+                        ("Match Properties", "matchprop"),
+                        ("Change Layer to Current", "chlayer"),
+                    ] {
+                        if ui.button(label).clicked() {
+                            self.run_command(cmd);
+                            ui.close_menu();
+                        }
+                    }
+                    ui.separator();
+                    if ui.button("Erase").clicked() {
+                        self.run_command("erase");
+                        ui.close_menu();
                     }
                 });
                 ui.menu_button("Tools", |ui| {
@@ -8584,6 +8900,82 @@ impl eframe::App for CadApp {
                 };
                 ui.colored_label(color, egui::RichText::new(label_s)
                     .monospace().size(14.0).strong());
+            });
+            // -------- SECOND TOOLBAR ROW: modify ops + inquiry -------
+            // Placeholder hand-drawn glyphs — swap to real icons later.
+            // Every modify command + inquiry tool surfaced here so the
+            // user doesn't have to dig through menus or type aliases.
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                // History
+                if cmd_button(ui, "undo", GlyphKind::Undo, "Undo last edit") {
+                    self.run_command("undo");
+                }
+                if cmd_button(ui, "redo", GlyphKind::Redo, "Redo") {
+                    self.run_command("redo");
+                }
+                ui.add_space(8.0);
+                // Transform group
+                for (lbl, kind, cmd, tip) in [
+                    ("move",    GlyphKind::Move,    "move",    "Translate selection by 2 picks"),
+                    ("copy",    GlyphKind::Copy,    "copy",    "Copy selection by 2 picks"),
+                    ("rotate",  GlyphKind::Rotate,  "rotate",  "Rotate selection around a pivot"),
+                    ("scale",   GlyphKind::Scale,   "scale",   "Scale selection from a pivot"),
+                    ("mirror",  GlyphKind::Mirror,  "mirror",  "Mirror selection across a line"),
+                    ("stretch", GlyphKind::Stretch, "stretch", "Stretch by crossing window"),
+                    ("align",   GlyphKind::Align,   "align",   "Translate + rotate to align 2 pts"),
+                ] {
+                    if cmd_button(ui, lbl, kind, tip) { self.run_command(cmd); }
+                }
+                ui.add_space(8.0);
+                // Edit-geometry group
+                for (lbl, kind, cmd, tip) in [
+                    ("trim",     GlyphKind::Trim,     "trim",     "Trim to cutting edges"),
+                    ("extend",   GlyphKind::Extend,   "extend",   "Extend to boundary"),
+                    ("fillet",   GlyphKind::Fillet,   "fillet",   "Round a corner (r/t/m sub-options)"),
+                    ("chamfer",  GlyphKind::Chamfer,  "chamfer",  "Bevel a corner (d/t/m sub-options)"),
+                    ("offset",   GlyphKind::Offset,   "offset",   "Parallel copy (t/e/l/u sub-options)"),
+                    ("join",     GlyphKind::Join,     "join",     "Merge collinear / chain-able dobjects"),
+                    ("break",    GlyphKind::Break,    "break",    "Split a dobject at a clicked point"),
+                    ("lengthen", GlyphKind::Lengthen, "lengthen 1", "Lengthen a line/arc end"),
+                    ("reverse",  GlyphKind::Reverse,  "reverse",  "Flip direction of selected dobjects"),
+                ] {
+                    if cmd_button(ui, lbl, kind, tip) { self.run_command(cmd); }
+                }
+                ui.add_space(8.0);
+                // Properties + multi-instance
+                if cmd_button(ui, "array", GlyphKind::ArrayGrid,
+                    "Rectangular array (rows × cols × dx, dy)")
+                {
+                    self.array_open = true;
+                }
+                if cmd_button(ui, "match", GlyphKind::MatchProps,
+                    "Match Properties — paint a source dobject's style onto selection")
+                {
+                    self.run_command("matchprop");
+                }
+                if cmd_button(ui, "→ layer", GlyphKind::ChangeLayer,
+                    "Change selection's layer to the active layer")
+                {
+                    self.run_command("chlayer");
+                }
+                ui.add_space(8.0);
+                // Destructive
+                if cmd_button(ui, "erase", GlyphKind::Erase,
+                    "Erase selection (or pick then Enter)")
+                {
+                    self.run_command("erase");
+                }
+                ui.add_space(20.0);
+                // Inquiry
+                if cmd_button(ui, "dist", GlyphKind::Dist,
+                    "Distance between two clicked points") {
+                    self.run_command("dist");
+                }
+                if cmd_button(ui, "list", GlyphKind::List,
+                    "List full properties of the selected dobjects") {
+                    self.run_command("list");
+                }
             });
             ui.add_space(4.0);
         });
