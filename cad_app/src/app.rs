@@ -250,6 +250,13 @@ pub struct CadApp {
     /// sit near a screen edge — which auto-docks freshly-opened
     /// windows on appear, before the user has even touched them.
     dock_dragging: std::collections::HashSet<&'static str>,
+    /// Timestamp (egui `ctx.input(|i| i.time)` units, seconds since
+    /// app launch) of the most recent primary-button press on the
+    /// canvas. Reset to None on release. Drives the time-gated drag
+    /// classifier: a window-drag only activates after the press has
+    /// been held longer than `env.SelDmTm`. Without this gate, fast
+    /// accidental drags during a click registered as windows.
+    press_time: Option<f64>,
     /// Screen-space rect of the canvas (central panel) from the last
     /// frame. Docking uses this — NOT `ctx.screen_rect()` — so docked
     /// strips align with the canvas area instead of overlapping the
@@ -844,6 +851,7 @@ impl Default for CadApp {
             dock_undock_hold:    HashMap::new(),
             dock_dragging:       std::collections::HashSet::new(),
             canvas_screen_rect:  None,
+            press_time:          None,
             cmd_window_open:     true,
             layers_window_open:  true,
             pens_window_open:    false,
@@ -8801,6 +8809,20 @@ impl eframe::App for CadApp {
             };
             let shift_held = ctx.input(|i| i.modifiers.shift);
             let in_select  = self.select_mode != SelectMode::Off;
+            // Track press time so the classifier below can enforce a
+            // hold-threshold before treating a drag as a window. See
+            // feedback_rust_cad_universal_selection_model. Cleared on
+            // release.
+            let now = ctx.input(|i| i.time);
+            if ctx.input(|i| i.pointer.primary_pressed()) && resp.contains_pointer() {
+                self.press_time = Some(now);
+            }
+            if ctx.input(|i| i.pointer.primary_released()) {
+                self.press_time = None;
+            }
+            let hold_thresh_secs = (self.env.SelDmTm as f64) / 1000.0;
+            let press_held_secs = self.press_time.map(|t0| now - t0).unwrap_or(0.0);
+            let hold_threshold_passed = press_held_secs >= hold_thresh_secs;
             let in_click_only_phase =
                 self.tool != Tool::None
                 || matches!(self.trim_state,
@@ -8826,10 +8848,20 @@ impl eframe::App for CadApp {
             // select mode, or (b) the user explicitly held Shift to
             // request a window drag. Edit phases (trim/draw/move/…)
             // keep the "always click" semantic too.
-            // Outside select mode + no Shift: drag_stopped → click.
-            // No motion threshold; the user's gesture wins.
+            //
+            // Time-gated activation: the press must have been held
+            // longer than env.SelDmTm (default 250 ms) before a drag
+            // counts as a window. A fast accidental drag during a
+            // click = still a click. The rubber-band preview honors
+            // the same gate (see ~10333). Reference:
+            // feedback_rust_cad_universal_selection_model.
+            //
+            // Shift-drag is exempt from the time gate — when the user
+            // is explicitly holding Shift to force a window-drag,
+            // they don't need to also hold the button to "prove" it.
             let drag_intent_is_window =
-                (in_select || (shift_held && !in_click_only_phase))
+                ((in_select && hold_threshold_passed)
+                 || (shift_held && !in_click_only_phase))
                 && press_release_dist > 1.0;     // any real motion at all
             let drag_was_a_click = drag_stopped && !drag_intent_is_window;
 
@@ -10311,8 +10343,14 @@ impl eframe::App for CadApp {
             // (select mode active OR Shift held in any other phase except
             // edit-active phases). L→R draws BLUE (window — fully-inside);
             // R→L draws GREEN (crossing — anything touching).
+            //
+            // Time-gated to match the classifier: no preview until the
+            // user has held the button past env.SelDmTm. Without this
+            // the visual would lie — preview appears, but the gesture
+            // gets discarded as a click on release.
             if resp.dragged()
-                && (in_select || (shift_held && !in_click_only_phase))
+                && ((in_select && hold_threshold_passed)
+                    || (shift_held && !in_click_only_phase))
             {
                 if let (Some(p), Some(c)) = (
                     ctx.input(|i| i.pointer.press_origin()),

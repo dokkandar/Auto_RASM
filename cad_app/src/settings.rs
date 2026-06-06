@@ -116,6 +116,17 @@ pub struct UserEnv {
     /// pure horizontal or vertical move. F8 toggles.
     pub OrtEnb: bool,
 
+    // ---- selection ----
+    /// Selection-drag activation hold time, in milliseconds. In
+    /// select-mode, a press becomes a window-drag ONLY after the user
+    /// has held the primary button this long. A fast press-drag-
+    /// release without holding past this threshold is treated as a
+    /// click on the release position (the user fumbled a click rather
+    /// than asking for a window). Range 50–2000 ms; AutoCAD-like
+    /// default is 250 ms. The rubber-band preview honors the same
+    /// gate, so nothing visual happens until the threshold passes.
+    pub SelDmTm: u16,
+
     // ---- APX (approximate / draft display) ----
     /// Dot-anchor strategy when rendering in APX (user-toggled draft
     /// mode). 0 = bbox center (default, simple/uniform). 1 = primitive
@@ -164,6 +175,7 @@ impl Default for UserEnv {
             GrdSnp: false,
             GrdSpc: 10.0,
             OrtEnb: false,
+            SelDmTm: 250,
             LodAnc: 0,
             XrLdMd: 2,
             XrTmpP: String::new(),
@@ -238,6 +250,8 @@ impl UserEnv {
         push_bool(&mut s, "GrdSnp", self.GrdSnp);
         push_f64(&mut s, "GrdSpc", self.GrdSpc);
         push_bool(&mut s, "OrtEnb", self.OrtEnb);
+        let push_u16_dec = |s: &mut String, k: &str, v: u16| s.push_str(&format!("{} = {}\n", k, v));
+        push_u16_dec(&mut s, "SelDmTm", self.SelDmTm);
         push_u8(&mut s, "LodAnc", self.LodAnc);
         push_u8(&mut s, "XrLdMd", self.XrLdMd);
         push_str(&mut s, "XrTmpP", &self.XrTmpP);
@@ -291,6 +305,7 @@ impl UserEnv {
             "GrdSnp" => if let Some(v) = parse_bool(val) { self.GrdSnp = v; }
             "GrdSpc" => if let Ok(v) = val.parse() { self.GrdSpc = v; }
             "OrtEnb" => if let Some(v) = parse_bool(val) { self.OrtEnb = v; }
+            "SelDmTm" => if let Ok(v) = val.parse() { self.SelDmTm = v; }
             "LodAnc" => if let Ok(v) = val.parse() { self.LodAnc = v; }
             "XrLdMd" => if let Ok(v) = val.parse() { self.XrLdMd = v; }
             "XrTmpP" => self.XrTmpP = val.to_string(),
