@@ -480,7 +480,14 @@ pub struct CadApp {
 
     // ---- Slices M.3 / M.4: fillet / chamfer ----
     fillet_state:   FilletState,
+    /// AutoCAD "Multiple" mode for Fillet — when true, completing one
+    /// fillet re-enters WaitingForFirst instead of returning to Off.
+    /// Esc exits. Transient (not a SYSVAR — matches AutoCAD's behavior
+    /// where each F command starts in single mode unless you type `m`).
+    fillet_multiple: bool,
     chamfer_state:  ChamferState,
+    /// Same as `fillet_multiple` for Chamfer.
+    chamfer_multiple: bool,
 
     // ---- Slice M.1 / M.2: trim / extend (two-basket) ----
     trim_state:   TrimState,
@@ -937,7 +944,9 @@ impl Default for CadApp {
             align_state:    AlignState::Off,
             stretch_state:  StretchState::Off,
             fillet_state:   FilletState::Off,
+            fillet_multiple: false,
             chamfer_state:  ChamferState::Off,
+            chamfer_multiple: false,
             trim_state:     TrimState::Off,
             extend_state:   ExtendState::Off,
             pre_op_selection: Vec::new(),
@@ -1111,6 +1120,111 @@ impl CadApp {
                     self.history.push(format!(
                         "  pline: sub-option '{}' recognised but not yet wired (Phase 2)",
                         trimmed));
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // ---- Fillet sub-command intercept ------------------------------
+        // While fillet is active (waiting for first or second pick), the
+        // user can type sub-options:
+        //   r <num>  — set radius (also `r` alone re-prompts for it)
+        //   t        — toggle trim mode (TrmMd SYSVAR)
+        //   m        — toggle Multiple mode (loop after each fillet)
+        // Anything else falls through to the normal parser.
+        if matches!(self.fillet_state,
+            FilletState::WaitingForFirst(_) | FilletState::WaitingForSecond(_, _, _))
+        {
+            let lc = trimmed.to_ascii_lowercase();
+            let mut toks = lc.split_ascii_whitespace();
+            match toks.next() {
+                Some("t") | Some("trim") | Some("nt") | Some("notrim") => {
+                    self.env.TrmMd = !self.env.TrmMd;
+                    let _ = self.env.save();
+                    self.history.push(format!(
+                        "  fillet: trim mode → {}",
+                        if self.env.TrmMd { "TRIM (lines cut to arc)" }
+                        else { "NO TRIM (lines kept, arc added)" }));
+                    self.refresh_fillet_prompt();
+                    return;
+                }
+                Some("m") | Some("multiple") => {
+                    self.fillet_multiple = !self.fillet_multiple;
+                    self.history.push(format!(
+                        "  fillet: multiple mode → {}",
+                        if self.fillet_multiple { "ON (loops after each fillet, Esc to exit)" }
+                        else { "OFF (one fillet then exit)" }));
+                    self.refresh_fillet_prompt();
+                    return;
+                }
+                Some("r") | Some("radius") => {
+                    if let Some(num) = toks.next() {
+                        if let Ok(v) = num.parse::<f64>() {
+                            self.env.FltRad = v;
+                            let _ = self.env.save();
+                            // Reset state to WaitingForFirst with new radius
+                            self.fillet_state = FilletState::WaitingForFirst(v);
+                            self.history.push(format!(
+                                "  fillet: radius → {}", v));
+                            self.refresh_fillet_prompt();
+                            return;
+                        }
+                        self.history.push(
+                            format!("  ! fillet: bad radius '{}'", num));
+                        return;
+                    }
+                    self.history.push(format!(
+                        "  fillet: type the new radius (current {})", self.env.FltRad));
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // ---- Chamfer sub-command intercept -----------------------------
+        // Same shape as Fillet's. Sub-options:
+        //   d <a> <b> — set distances (b defaults to a)
+        //   t         — toggle trim mode (shared TrmMd)
+        //   m         — toggle Multiple mode
+        if matches!(self.chamfer_state,
+            ChamferState::WaitingForFirst(_, _) | ChamferState::WaitingForSecond(_, _, _, _))
+        {
+            let lc = trimmed.to_ascii_lowercase();
+            let mut toks = lc.split_ascii_whitespace();
+            match toks.next() {
+                Some("t") | Some("trim") | Some("nt") | Some("notrim") => {
+                    self.env.TrmMd = !self.env.TrmMd;
+                    let _ = self.env.save();
+                    self.history.push(format!(
+                        "  chamfer: trim mode → {}",
+                        if self.env.TrmMd { "TRIM" } else { "NO TRIM" }));
+                    self.refresh_chamfer_prompt();
+                    return;
+                }
+                Some("m") | Some("multiple") => {
+                    self.chamfer_multiple = !self.chamfer_multiple;
+                    self.history.push(format!(
+                        "  chamfer: multiple mode → {}",
+                        if self.chamfer_multiple { "ON" } else { "OFF" }));
+                    self.refresh_chamfer_prompt();
+                    return;
+                }
+                Some("d") | Some("distance") => {
+                    if let Some(a) = toks.next().and_then(|s| s.parse::<f64>().ok()) {
+                        let b = toks.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(a);
+                        self.env.ChmDs1 = a;
+                        self.env.ChmDs2 = b;
+                        let _ = self.env.save();
+                        self.chamfer_state = ChamferState::WaitingForFirst(a, b);
+                        self.history.push(format!(
+                            "  chamfer: distances → ({}, {})", a, b));
+                        self.refresh_chamfer_prompt();
+                        return;
+                    }
+                    self.history.push(format!(
+                        "  chamfer: type new distances (current {}, {})",
+                        self.env.ChmDs1, self.env.ChmDs2));
                     return;
                 }
                 _ => {}
@@ -1660,8 +1774,8 @@ impl CadApp {
                 }
                 let r = self.env.FltRad;
                 self.fillet_state = FilletState::WaitingForFirst(r);
-                self.set_prompt(format!(
-                    "fillet (r={}): click FIRST line on the SIDE to KEEP  [Esc=cancel]", r));
+                self.fillet_multiple = false;       // each F starts single-mode
+                self.refresh_fillet_prompt();
             }
             Ok(Command::Chamfer(opt)) => {
                 if let Some((d1, d2_opt)) = opt {
@@ -1673,8 +1787,8 @@ impl CadApp {
                 let d1 = self.env.ChmDs1;
                 let d2 = self.env.ChmDs2;
                 self.chamfer_state = ChamferState::WaitingForFirst(d1, d2);
-                self.set_prompt(format!(
-                    "chamfer (d1={}, d2={}): click FIRST line  [Esc=cancel]", d1, d2));
+                self.chamfer_multiple = false;
+                self.refresh_chamfer_prompt();
             }
             Ok(Command::Join) => {
                 if self.selection.is_empty() {
@@ -5098,6 +5212,38 @@ impl CadApp {
         }
     }
 
+    /// Re-issue the fillet prompt with the current radius, trim mode,
+    /// and multiple-mode badges. Called after any sub-option toggle.
+    fn refresh_fillet_prompt(&mut self) {
+        let r = self.env.FltRad;
+        let tm = if self.env.TrmMd { "trim" } else { "no-trim" };
+        let mm = if self.fillet_multiple { ", multi" } else { "" };
+        let phase = match self.fillet_state {
+            FilletState::WaitingForFirst(_)  => "click FIRST line on SIDE to KEEP",
+            FilletState::WaitingForSecond(..) => "click SECOND line",
+            FilletState::Off => return,
+        };
+        self.set_prompt(format!(
+            "fillet (r={}, {}{}): {}  [t=trim, m=multi, r=radius, Esc]",
+            r, tm, mm, phase));
+    }
+
+    /// Re-issue the chamfer prompt — mirror of `refresh_fillet_prompt`.
+    fn refresh_chamfer_prompt(&mut self) {
+        let d1 = self.env.ChmDs1;
+        let d2 = self.env.ChmDs2;
+        let tm = if self.env.TrmMd { "trim" } else { "no-trim" };
+        let mm = if self.chamfer_multiple { ", multi" } else { "" };
+        let phase = match self.chamfer_state {
+            ChamferState::WaitingForFirst(..)  => "click FIRST line",
+            ChamferState::WaitingForSecond(..) => "click SECOND line",
+            ChamferState::Off => return,
+        };
+        self.set_prompt(format!(
+            "chamfer (d1={}, d2={}, {}{}): {}  [t=trim, m=multi, d=distance, Esc]",
+            d1, d2, tm, mm, phase));
+    }
+
     // ---------------------------------------------------------------------
     // Slice M.3 — Fillet (line-line). Two clicks; second click commits.
     // ---------------------------------------------------------------------
@@ -5121,11 +5267,16 @@ impl CadApp {
         let style1 = d1.style;
         let style2 = d2.style;
         self.snapshot_doc();
+        let trim = self.env.TrmMd;
         match cad_kernel::fillet_lines(&l1, pick1, &l2, pick2, r) {
             Ok(out) => {
-                // Replace in place (preserve handles + styles) and append arc.
-                if let Some(d) = self.doc.dobjects.get_mut(idx1) { d.geom = out.g1_new; }
-                if let Some(d) = self.doc.dobjects.get_mut(idx2) { d.geom = out.g2_new; }
+                // Trim mode → replace originals with kernel's shortened
+                // lines. No-trim mode → leave originals untouched, only
+                // append the arc. See AutoCAD TRIMMODE behavior.
+                if trim {
+                    if let Some(d) = self.doc.dobjects.get_mut(idx1) { d.geom = out.g1_new; }
+                    if let Some(d) = self.doc.dobjects.get_mut(idx2) { d.geom = out.g2_new; }
+                }
                 if let Some(arc) = out.arc {
                     let mut d = DObject::new(arc);
                     // Arc inherits style from the FIRST clicked line — same
@@ -5135,7 +5286,9 @@ impl CadApp {
                     self.doc.push(d);
                 }
                 self.history.push(format!(
-                    "  ⌐ fillet ✓ r={} between #{} and #{}", r, idx1, idx2));
+                    "  ⌐ fillet ✓ r={} between #{} and #{} ({})",
+                    r, idx1, idx2,
+                    if trim {"trim"} else {"no-trim"}));
                 self.intersections.clear();
                 self.index_dirty = true;
                 self.gpu_dirty = true;
@@ -5169,16 +5322,20 @@ impl CadApp {
         };
         let style1 = da.style;
         self.snapshot_doc();
+        let trim = self.env.TrmMd;
         match cad_kernel::chamfer_lines(&l1, pick1, &l2, pick2, d1_dist, d2_dist) {
             Ok(out) => {
-                if let Some(d) = self.doc.dobjects.get_mut(idx1) { d.geom = out.g1_new; }
-                if let Some(d) = self.doc.dobjects.get_mut(idx2) { d.geom = out.g2_new; }
+                if trim {
+                    if let Some(d) = self.doc.dobjects.get_mut(idx1) { d.geom = out.g1_new; }
+                    if let Some(d) = self.doc.dobjects.get_mut(idx2) { d.geom = out.g2_new; }
+                }
                 let mut bridge = DObject::new(out.bridge);
                 bridge.style = style1;
                 self.doc.push(bridge);
                 self.history.push(format!(
-                    "  ⌐ chamfer ✓ d=({}, {}) between #{} and #{}",
-                    d1_dist, d2_dist, idx1, idx2));
+                    "  ⌐ chamfer ✓ d=({}, {}) between #{} and #{} ({})",
+                    d1_dist, d2_dist, idx1, idx2,
+                    if trim {"trim"} else {"no-trim"}));
                 self.intersections.clear();
                 self.index_dirty = true;
                 self.gpu_dirty = true;
@@ -7378,10 +7535,12 @@ impl eframe::App for CadApp {
             }
             if self.fillet_state != FilletState::Off {
                 self.fillet_state = FilletState::Off;
+                self.fillet_multiple = false;
                 self.history.push("  fillet cancelled".into());
             }
             if self.chamfer_state != ChamferState::Off {
                 self.chamfer_state = ChamferState::Off;
+                self.chamfer_multiple = false;
                 self.history.push("  chamfer cancelled".into());
             }
             if self.grip_drag.is_some() {
@@ -9452,7 +9611,16 @@ impl eframe::App for CadApp {
                             }
                             (FilletState::WaitingForSecond(r, i1, p1), Some(i2)) => {
                                 self.apply_fillet(r, i1, p1, i2, click_world);
-                                self.fillet_state = FilletState::Off;
+                                // Multiple-mode loop: re-enter the
+                                // first-pick state with the same radius
+                                // instead of returning to Off. Esc
+                                // exits. Single-mode (default) → Off.
+                                if self.fillet_multiple {
+                                    self.fillet_state = FilletState::WaitingForFirst(r);
+                                    self.refresh_fillet_prompt();
+                                } else {
+                                    self.fillet_state = FilletState::Off;
+                                }
                             }
                             _ => self.history.push(
                                 "  fillet — click ON a line; missed".into()),
@@ -9471,7 +9639,13 @@ impl eframe::App for CadApp {
                             }
                             (ChamferState::WaitingForSecond(d1, d2, i1, p1), Some(i2)) => {
                                 self.apply_chamfer(d1, d2, i1, p1, i2, click_world);
-                                self.chamfer_state = ChamferState::Off;
+                                if self.chamfer_multiple {
+                                    self.chamfer_state =
+                                        ChamferState::WaitingForFirst(d1, d2);
+                                    self.refresh_chamfer_prompt();
+                                } else {
+                                    self.chamfer_state = ChamferState::Off;
+                                }
                             }
                             _ => self.history.push(
                                 "  chamfer — click ON a line; missed".into()),

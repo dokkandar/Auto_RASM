@@ -64,6 +64,13 @@ pub struct UserEnv {
     /// passing `offset <d>` — the new value persists across sessions
     /// and bare `offset` re-uses it. Initial default 1.0.
     pub OfsDis: f64,
+    /// Trim mode shared by Fillet and Chamfer (AutoCAD `TRIMMODE`).
+    /// `true` (default) → trim originals back to the new corner.
+    /// `false` → keep originals full-length, add the arc/bevel as a
+    /// separate dobject ("No Trim" mode). Toggle via `t` or `nt` at
+    /// the fillet/chamfer prompt. Persistent across the session +
+    /// across runs (saved to `user_env.txt`).
+    pub TrmMd: bool,
 
     // ---- display ----
     /// Dragging display during MOVE/COPY. 0=off, 1=on, 2=auto.
@@ -163,6 +170,7 @@ impl Default for UserEnv {
             ChmDs1: 0.0,
             ChmDs2: 0.0,
             OfsDis: 1.0,
+            TrmMd: true,
             DrDspM: 2,
             MnuBar: false,
             TltEnb: true,
@@ -239,6 +247,7 @@ impl UserEnv {
         push_f64(&mut s, "ChmDs1", self.ChmDs1);
         push_f64(&mut s, "ChmDs2", self.ChmDs2);
         push_f64(&mut s, "OfsDis", self.OfsDis);
+        push_bool(&mut s, "TrmMd", self.TrmMd);
         push_u8(&mut s, "DrDspM", self.DrDspM);
         push_bool(&mut s, "MnuBar", self.MnuBar);
         push_bool(&mut s, "TltEnb", self.TltEnb);
@@ -295,6 +304,7 @@ impl UserEnv {
             "ChmDs1" => if let Ok(v) = val.parse() { self.ChmDs1 = v; }
             "ChmDs2" => if let Ok(v) = val.parse() { self.ChmDs2 = v; }
             "OfsDis" => if let Ok(v) = val.parse() { self.OfsDis = v; }
+            "TrmMd"  => if let Some(v) = parse_bool(val) { self.TrmMd = v; }
             "DrDspM" => if let Ok(v) = val.parse() { self.DrDspM = v; }
             "MnuBar" => if let Some(v) = parse_bool(val) { self.MnuBar = v; }
             "TltEnb" => if let Some(v) = parse_bool(val) { self.TltEnb = v; }
