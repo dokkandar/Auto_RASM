@@ -128,6 +128,58 @@ pub enum Command {
     SetTool(ToolKind),
 }
 
+impl Command {
+    /// Canonical, capitalized name of the command — the form that gets
+    /// echoed into the command-history "log book" so it's readable
+    /// regardless of which alias the user actually typed (`F` → "Fillet",
+    /// `o` → "Offset", etc.).
+    pub fn canonical_name(&self) -> &'static str {
+        match self {
+            Command::Add(_)             => "Add",
+            Command::Delete(_)          => "Delete",
+            Command::Clear              => "Clear",
+            Command::Help               => "Help",
+            Command::GripsToggle        => "GripsToggle",
+            Command::SnapOverride(_)    => "SnapOverride",
+            Command::List               => "List",
+            Command::Select             => "Select",
+            Command::SelectAll          => "SelectAll",
+            Command::SelectPrevious     => "SelectPrevious",
+            Command::SelectNone         => "SelectNone",
+            Command::SelectRemoveMode   => "SelectRemoveMode",
+            Command::SelectAddMode      => "SelectAddMode",
+            Command::SelectWindow       => "SelectWindow",
+            Command::SelectCrossing     => "SelectCrossing",
+            Command::SelectLast         => "SelectLast",
+            Command::Move               => "Move",
+            Command::Copy               => "Copy",
+            Command::Rotate             => "Rotate",
+            Command::Scale              => "Scale",
+            Command::Mirror             => "Mirror",
+            Command::Hatch { .. }       => "Hatch",
+            Command::DeleteSelected     => "DeleteSelected",
+            Command::Undo               => "Undo",
+            Command::Redo               => "Redo",
+            Command::MatchProps         => "MatchProps",
+            Command::Reverse            => "Reverse",
+            Command::ChangeLayer        => "ChangeLayer",
+            Command::Offset(_)          => "Offset",
+            Command::Lengthen(_)        => "Lengthen",
+            Command::Break              => "Break",
+            Command::Align              => "Align",
+            Command::Stretch            => "Stretch",
+            Command::Trim               => "Trim",
+            Command::Extend             => "Extend",
+            Command::Fillet(_)          => "Fillet",
+            Command::Chamfer(_)         => "Chamfer",
+            Command::Join               => "Join",
+            Command::Open(_)            => "Open",
+            Command::SaveAs(_)          => "SaveAs",
+            Command::SetTool(_)         => "SetTool",
+        }
+    }
+}
+
 /// Parser-level mirror of the app's `Tool` enum. The app maps each
 /// variant to its own `Tool` when dispatching `Command::SetTool`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

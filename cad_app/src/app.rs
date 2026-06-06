@@ -485,9 +485,17 @@ pub struct CadApp {
     /// Esc exits. Transient (not a SYSVAR — matches AutoCAD's behavior
     /// where each F command starts in single mode unless you type `m`).
     fillet_multiple: bool,
+    /// True when fillet is waiting for the user to type a radius
+    /// value (after they typed `r` alone with no arg). The very next
+    /// non-empty cmd-line input is consumed as a number — NOT passed
+    /// to the main parser. Cleared on success or Esc.
+    fillet_waiting_radius: bool,
     chamfer_state:  ChamferState,
     /// Same as `fillet_multiple` for Chamfer.
     chamfer_multiple: bool,
+    /// True when chamfer is waiting for distance value(s) after `d`
+    /// alone. Next input is parsed as `<a>` or `<a> <b>`.
+    chamfer_waiting_distance: bool,
 
     // ---- Slice M.1 / M.2: trim / extend (two-basket) ----
     trim_state:   TrimState,
@@ -945,8 +953,10 @@ impl Default for CadApp {
             stretch_state:  StretchState::Off,
             fillet_state:   FilletState::Off,
             fillet_multiple: false,
+            fillet_waiting_radius: false,
             chamfer_state:  ChamferState::Off,
             chamfer_multiple: false,
+            chamfer_waiting_distance: false,
             trim_state:     TrimState::Off,
             extend_state:   ExtendState::Off,
             pre_op_selection: Vec::new(),
@@ -1050,6 +1060,55 @@ impl CadApp {
         let trimmed = raw.trim();
         // Any non-empty input cancels the 2-stage-Enter notice.
         self.empty_enter_count_in_select = 0;
+
+        // ---- Pending-sub-arg intercepts (must run FIRST) ----------
+        // When a fillet/chamfer sub-option has prompted for a numeric
+        // arg (e.g. user typed `r` alone), the next non-empty input
+        // is consumed as that number and must NOT reach the main
+        // parser. Without this, typing `2` after `r` produced
+        // `unknown command '2'`.
+        if self.fillet_waiting_radius && !trimmed.is_empty() {
+            match trimmed.parse::<f64>() {
+                Ok(v) => {
+                    self.env.FltRad = v;
+                    let _ = self.env.save();
+                    self.fillet_state = FilletState::WaitingForFirst(v);
+                    self.fillet_waiting_radius = false;
+                    self.history.push(format!("  fillet: radius → {}", v));
+                    self.refresh_fillet_prompt();
+                }
+                Err(_) => {
+                    self.history.push(format!(
+                        "  ! fillet: '{}' is not a number — type a radius or Esc to cancel",
+                        trimmed));
+                }
+            }
+            return;
+        }
+        if self.chamfer_waiting_distance && !trimmed.is_empty() {
+            let mut toks = trimmed.split_ascii_whitespace();
+            let a = toks.next().and_then(|s| s.parse::<f64>().ok());
+            let b = toks.next().and_then(|s| s.parse::<f64>().ok());
+            match a {
+                Some(d1) => {
+                    let d2 = b.unwrap_or(d1);
+                    self.env.ChmDs1 = d1;
+                    self.env.ChmDs2 = d2;
+                    let _ = self.env.save();
+                    self.chamfer_state = ChamferState::WaitingForFirst(d1, d2);
+                    self.chamfer_waiting_distance = false;
+                    self.history.push(format!(
+                        "  chamfer: distances → ({}, {})", d1, d2));
+                    self.refresh_chamfer_prompt();
+                }
+                None => {
+                    self.history.push(format!(
+                        "  ! chamfer: '{}' is not a number — type `<a>` or `<a> <b>` or Esc",
+                        trimmed));
+                }
+            }
+            return;
+        }
 
         // ---- PLINE sub-command intercept (AutoCAD PLINE Line/Arc flow) ----
         //
@@ -1163,7 +1222,6 @@ impl CadApp {
                         if let Ok(v) = num.parse::<f64>() {
                             self.env.FltRad = v;
                             let _ = self.env.save();
-                            // Reset state to WaitingForFirst with new radius
                             self.fillet_state = FilletState::WaitingForFirst(v);
                             self.history.push(format!(
                                 "  fillet: radius → {}", v));
@@ -1174,8 +1232,15 @@ impl CadApp {
                             format!("  ! fillet: bad radius '{}'", num));
                         return;
                     }
-                    self.history.push(format!(
-                        "  fillet: type the new radius (current {})", self.env.FltRad));
+                    // `r` alone — arm pending-radius-input. The next
+                    // numeric input fires the pending-input intercept
+                    // above and sets the radius. Without this flag,
+                    // typing `2` next would hit the main parser as
+                    // an unknown command.
+                    self.fillet_waiting_radius = true;
+                    self.set_prompt(format!(
+                        "fillet: enter new radius (current {})  [Esc=cancel]",
+                        self.env.FltRad));
                     return;
                 }
                 _ => {}
@@ -1222,8 +1287,12 @@ impl CadApp {
                         self.refresh_chamfer_prompt();
                         return;
                     }
-                    self.history.push(format!(
-                        "  chamfer: type new distances (current {}, {})",
+                    // `d` alone — arm pending-distance-input. The
+                    // next numeric input (or pair) fires the
+                    // pending-input intercept above.
+                    self.chamfer_waiting_distance = true;
+                    self.set_prompt(format!(
+                        "chamfer: enter `<a>` or `<a> <b>` (current {}, {})  [Esc=cancel]",
                         self.env.ChmDs1, self.env.ChmDs2));
                     return;
                 }
@@ -1359,6 +1428,20 @@ impl CadApp {
         // last VALID command, never a sub-command and never a typo.
         if !trimmed.is_empty() && parsed.is_ok() {
             self.last_command = Some(trimmed.to_string());
+        }
+        // Echo the canonical command name into the history "log book"
+        // so a glance shows `Fillet` whether the user typed `f`, `F`,
+        // or `fillet`. Only fires for real commands, not Add/SetTool
+        // (those are noisy + their own history lines already cover it).
+        if let Ok(ref c) = parsed {
+            let canon = c.canonical_name();
+            let raw_lc = trimmed.to_ascii_lowercase();
+            let aliased = !raw_lc.starts_with(&canon.to_ascii_lowercase());
+            let interesting = !matches!(c,
+                Command::Add(_) | Command::SetTool(_) | Command::SnapOverride(_));
+            if aliased && interesting {
+                self.history.push(format!("  command: {}", canon));
+            }
         }
         match parsed {
             Ok(Command::Add(e))   => self.add_dobject(e, "command"),
@@ -7536,11 +7619,13 @@ impl eframe::App for CadApp {
             if self.fillet_state != FilletState::Off {
                 self.fillet_state = FilletState::Off;
                 self.fillet_multiple = false;
+                self.fillet_waiting_radius = false;
                 self.history.push("  fillet cancelled".into());
             }
             if self.chamfer_state != ChamferState::Off {
                 self.chamfer_state = ChamferState::Off;
                 self.chamfer_multiple = false;
+                self.chamfer_waiting_distance = false;
                 self.history.push("  chamfer cancelled".into());
             }
             if self.grip_drag.is_some() {
