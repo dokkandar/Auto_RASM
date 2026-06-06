@@ -6,3 +6,4 @@
 # default layout — this file is only written when the user clicks
 # "Save mapping" in the picker. Per-user, not per-codebase.
 /aci_mapping.json
+target-docker/
