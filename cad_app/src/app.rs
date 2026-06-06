@@ -9174,6 +9174,14 @@ impl eframe::App for CadApp {
                             self.env.GrdEnb = !self.env.GrdEnb;
                             let _ = self.env.save();
                         }
+                        if drafting_badge(ui, "UCS", self.env.UcsIcn,
+                            "UCS indicator (UcsIcn) — origin marker with X/Y axes. \
+                             Anchors at world (0,0) when visible, else pins to the \
+                             bottom-left corner as a reference.")
+                        {
+                            self.env.UcsIcn = !self.env.UcsIcn;
+                            let _ = self.env.save();
+                        }
                         ui.separator();
                         // Snap badges — click any letter to toggle.
                         for k in SnapKind::ALL {
@@ -10876,6 +10884,15 @@ impl eframe::App for CadApp {
                 }
             }
 
+            // UCS indicator (origin marker) — anchors at world (0,0)
+            // when on-screen, else pinned to the bottom-left corner.
+            // Toggle: env.UcsIcn (SYSVAR). Renders OVER everything
+            // (after dobjects + grips) so it stays visible against
+            // any color underneath.
+            if self.env.UcsIcn {
+                draw_ucs_icon(&painter, rect, self);
+            }
+
             // HUD: FPS + drawn/skipped/total + index status + render mode.
             let idx_state = if self.index.is_some() && !self.index_dirty { "idx ✓" }
                             else { "idx stale" };
@@ -12252,6 +12269,116 @@ fn draw_polyline_full_ellipse(
 /// distance the new parallel copy should be from the source. Returns
 /// `f64::NAN` for geometry types we don't support (caller should treat
 /// NaN as failure).
+/// UCS indicator — small "where's (0,0)" marker. Anchors at the world
+/// origin's screen position when that's inside the canvas; otherwise
+/// pins to the bottom-left corner of the canvas with a fixed offset.
+/// Visual: red center disc + thin gray ring + X / Y axis arrows with
+/// labels + placeholder "User logo" box on the X arrow.
+///
+/// Toggled by `env.UcsIcn`. Future: `env.UcsAvP` will replace the
+/// placeholder box with a user-supplied avatar image.
+fn draw_ucs_icon(painter: &egui::Painter, rect: egui::Rect, app: &CadApp) {
+    // Anchor: world origin in screen space — clamped to a padded
+    // sub-rect of the canvas so the icon never overlaps the very edge.
+    let pad = 50.0;
+    let safe = egui::Rect::from_min_max(
+        rect.min + egui::vec2(pad, pad),
+        rect.max - egui::vec2(pad, pad),
+    );
+    let origin_world_screen = app.w2s(Vec2::ZERO, rect);
+    let at_origin = safe.contains(origin_world_screen);
+    let anchor = if at_origin {
+        origin_world_screen
+    } else {
+        egui::pos2(rect.left() + pad, rect.bottom() - pad)
+    };
+
+    // Colors — matched to the user's SVG (red center, dark gray ring).
+    let red    = egui::Color32::from_rgb(142, 25, 19);   // #8E1913
+    let gray   = egui::Color32::from_rgb(160, 165, 175);
+    let label  = egui::Color32::from_rgb(220, 225, 235);
+    let logo_fill   = egui::Color32::from_rgb(245, 245, 245);
+    let logo_stroke = egui::Color32::from_rgb(120, 120, 120);
+
+    // Center disc + ring.
+    painter.circle_filled(anchor, 8.5, red);
+    painter.circle_stroke(anchor, 12.0, egui::Stroke::new(1.0, gray));
+
+    // 4 small radial ticks at N/S/E/W (just outside the ring).
+    for (dx, dy) in [(13.5, 0.0), (-13.5, 0.0), (0.0, 13.5), (0.0, -13.5)] {
+        let p0 = anchor + egui::vec2(dx, dy);
+        let p1 = anchor + egui::vec2(dx * 0.85, dy * 0.85);
+        painter.line_segment([p0, p1], egui::Stroke::new(1.0, gray));
+    }
+
+    // Axis lengths in pixels.
+    let axis_len = 58.0;
+    let arrow   = 7.0;
+    let pen     = egui::Stroke::new(1.2, label);
+
+    // X axis — to the right.
+    let x_tip = anchor + egui::vec2(axis_len, 0.0);
+    let x_tail = anchor + egui::vec2(14.5, 0.0);
+    painter.line_segment([x_tail, x_tip], pen);
+    painter.line_segment([x_tip, x_tip + egui::vec2(-arrow,  arrow * 0.65)], pen);
+    painter.line_segment([x_tip, x_tip + egui::vec2(-arrow, -arrow * 0.65)], pen);
+    painter.text(
+        x_tip + egui::vec2(4.0, -4.0),
+        egui::Align2::LEFT_BOTTOM,
+        "X",
+        egui::FontId::monospace(12.0),
+        label,
+    );
+
+    // Y axis — upward (screen-up is -y).
+    let y_tip = anchor + egui::vec2(0.0, -axis_len);
+    let y_tail = anchor + egui::vec2(0.0, -14.5);
+    painter.line_segment([y_tail, y_tip], pen);
+    painter.line_segment([y_tip, y_tip + egui::vec2( arrow * 0.65, arrow)], pen);
+    painter.line_segment([y_tip, y_tip + egui::vec2(-arrow * 0.65, arrow)], pen);
+    painter.text(
+        y_tip + egui::vec2(-4.0, -2.0),
+        egui::Align2::RIGHT_BOTTOM,
+        "Y",
+        egui::FontId::monospace(12.0),
+        label,
+    );
+
+    // "User logo" placeholder box on the X axis — sits roughly
+    // half-way along, above the axis line. Replaced by a real
+    // avatar image once env.UcsAvP loading lands.
+    let logo_w = 30.0;
+    let logo_h = 16.0;
+    let logo_center = anchor + egui::vec2(axis_len * 0.55, -logo_h * 0.5 - 3.0);
+    let logo_rect = egui::Rect::from_center_size(
+        logo_center, egui::vec2(logo_w, logo_h));
+    painter.rect(
+        logo_rect, 3.0, logo_fill,
+        egui::Stroke::new(0.8, logo_stroke));
+    painter.text(
+        logo_center,
+        egui::Align2::CENTER_CENTER,
+        if app.env.UcsAvP.is_empty() { "User\nlogo" } else { "User\nlogo" },
+        egui::FontId::proportional(7.0),
+        egui::Color32::from_rgb(80, 80, 80),
+    );
+
+    // When pinned at the corner (origin off-screen), append a small
+    // delta-from-origin hint so the user knows the marker is a
+    // reference, not the actual position of (0,0).
+    if !at_origin {
+        let dx = origin_world_screen.x - anchor.x;
+        let dy = origin_world_screen.y - anchor.y;
+        painter.text(
+            anchor + egui::vec2(0.0, 18.0),
+            egui::Align2::LEFT_TOP,
+            format!("(origin off-screen Δ=({:+.0},{:+.0}) px)", dx, -dy),
+            egui::FontId::monospace(9.0),
+            egui::Color32::from_rgb(150, 160, 175),
+        );
+    }
+}
+
 fn distance_world_to_geom(g: &Geom, p: Vec2) -> f64 {
     match g {
         Geom::Line(l) => {

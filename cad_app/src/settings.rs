@@ -127,6 +127,19 @@ pub struct UserEnv {
     /// pure horizontal or vertical move. F8 toggles.
     pub OrtEnb: bool,
 
+    // ---- UCS indicator (origin marker) ----
+    /// User Coordinate System indicator on/off (AutoCAD `UCSICON`).
+    /// When true, the canvas renders a small origin marker (red dot
+    /// + X / Y axis arrows). If world (0,0) is inside the visible
+    /// canvas, the marker anchors there. Otherwise it pins to the
+    /// bottom-left corner of the canvas as a reference legend.
+    pub UcsIcn: bool,
+    /// Path to a PNG/SVG used as the user's avatar on the X-axis of
+    /// the UCS icon. Empty string → fall back to the "User logo"
+    /// placeholder rectangle. Persisted across sessions so the user
+    /// only sets it once.
+    pub UcsAvP: String,
+
     // ---- selection ----
     /// Selection-drag activation hold time, in milliseconds. In
     /// select-mode, a press becomes a window-drag ONLY after the user
@@ -188,6 +201,8 @@ impl Default for UserEnv {
             GrdSnp: false,
             GrdSpc: 10.0,
             OrtEnb: false,
+            UcsIcn: true,
+            UcsAvP: String::new(),
             SelDmTm: 250,
             LodAnc: 0,
             XrLdMd: 2,
@@ -266,6 +281,8 @@ impl UserEnv {
         push_f64(&mut s, "GrdSpc", self.GrdSpc);
         push_bool(&mut s, "OrtEnb", self.OrtEnb);
         let push_u16_dec = |s: &mut String, k: &str, v: u16| s.push_str(&format!("{} = {}\n", k, v));
+        push_bool(&mut s, "UcsIcn", self.UcsIcn);
+        push_str(&mut s, "UcsAvP", &self.UcsAvP);
         push_u16_dec(&mut s, "SelDmTm", self.SelDmTm);
         push_u8(&mut s, "LodAnc", self.LodAnc);
         push_u8(&mut s, "XrLdMd", self.XrLdMd);
@@ -322,6 +339,8 @@ impl UserEnv {
             "GrdSnp" => if let Some(v) = parse_bool(val) { self.GrdSnp = v; }
             "GrdSpc" => if let Ok(v) = val.parse() { self.GrdSpc = v; }
             "OrtEnb" => if let Some(v) = parse_bool(val) { self.OrtEnb = v; }
+            "UcsIcn" => if let Some(v) = parse_bool(val) { self.UcsIcn = v; }
+            "UcsAvP" => self.UcsAvP = val.to_string(),
             "SelDmTm" => if let Ok(v) = val.parse() { self.SelDmTm = v; }
             "LodAnc" => if let Ok(v) = val.parse() { self.LodAnc = v; }
             "XrLdMd" => if let Ok(v) = val.parse() { self.XrLdMd = v; }
