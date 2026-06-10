@@ -551,6 +551,49 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document) {
                 pair_f(s, 11, r.b.x); pair_f(s, 21, r.b.y); pair_f(s, 31, 0.0);
             }
         }
+        // DXF TEXT entity. Codes 10/20/30 = insertion point;
+        // 40 = height; 1 = text string; 50 = rotation degrees;
+        // 72 = HAlign (0/1/2 = Left/Center/Right); 73 not emitted
+        // (vertical alignment requires the second alignment point
+        // at code 11/21/31 — skip for v1, defaults to Baseline).
+        Geom::Text(t) => {
+            common(s, "TEXT");
+            pair_f(s, 10, t.position.x);
+            pair_f(s, 20, t.position.y);
+            pair_f(s, 30, 0.0);
+            pair_f(s, 40, t.height);
+            pair(s, 1, &t.text);
+            if t.angle.abs() > 1e-12 {
+                pair_f(s, 50, t.angle.to_degrees());
+            }
+            let halign_code = match t.h_align {
+                cad_kernel::TextHAlign::Left   => 0,
+                cad_kernel::TextHAlign::Center => 1,
+                cad_kernel::TextHAlign::Right  => 2,
+            };
+            if halign_code != 0 { pair_i(s, 72, halign_code); }
+        }
+        Geom::Dimension(d) => {
+            // V1 DXF: dimensions are written as exploded geometry —
+            // the kernel's def points become a simple polyline + text
+            // so other CAD packages can read the document. Full
+            // AutoCAD DIMENSION entity round-trip (with all DIMVARs)
+            // ships in a follow-up slice.
+            use cad_kernel::DimKind;
+            common(s, "TEXT");
+            let pos = match &d.kind {
+                DimKind::Linear { dimline_pos, .. } => *dimline_pos,
+                DimKind::Radius { leader_end, .. } |
+                DimKind::Diameter { leader_end, .. } => *leader_end,
+            };
+            pair_f(s, 10, pos.x);
+            pair_f(s, 20, pos.y);
+            pair_f(s, 30, 0.0);
+            pair_f(s, 40, 0.18);  // placeholder text height
+            let st = doc.dim_styles.get(d.style)
+                .unwrap_or(doc.dim_styles.get(0).unwrap());
+            pair(s, 1, &d.formatted_text(st));
+        }
     }
 }
 

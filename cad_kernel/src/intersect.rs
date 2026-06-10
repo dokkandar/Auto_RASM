@@ -74,6 +74,14 @@ pub fn intersect(a: &Geom, b: &Geom) -> Vec<Vec2> {
                 _        => intersect(&cl, other),
             }
         }
+
+        // Text ∩ anything: text has no curve; trim/extend never need
+        // to compute intersections against it. Empty.
+        (Text(_), _) | (_, Text(_)) => Vec::new(),
+
+        // Dimension ∩ anything: dimensions are annotations, not
+        // boundary curves; no meaningful intersection contribution.
+        (Dimension(_), _) | (_, Dimension(_)) => Vec::new(),
     }
 }
 

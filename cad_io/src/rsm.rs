@@ -270,6 +270,62 @@ fn write_geom(w: &mut Vec<u8>, g: &Geom) {
             write_vec2(w, wall.end);
             write_f64(w, wall.thickness);
         }
+        Geom::Text(t) => {
+            // tag 10 = Text.
+            write_u8(w, 10);
+            write_vec2(w, t.position);
+            write_f64(w, t.height);
+            write_f64(w, t.angle);
+            write_str(w, &t.text);
+            write_u8(w, match t.h_align {
+                cad_kernel::TextHAlign::Left   => 0,
+                cad_kernel::TextHAlign::Center => 1,
+                cad_kernel::TextHAlign::Right  => 2,
+            });
+            write_u8(w, match t.v_align {
+                cad_kernel::TextVAlign::Baseline => 0,
+                cad_kernel::TextVAlign::Bottom   => 1,
+                cad_kernel::TextVAlign::Middle   => 2,
+                cad_kernel::TextVAlign::Top      => 3,
+            });
+            write_u32(w, t.style);
+        }
+        Geom::Dimension(d) => {
+            // tag 11 = Dimension. Encoding:
+            //   u8   kind (0=Linear, 1=Radius, 2=Diameter)
+            //   per-kind def points
+            //   u32  style id
+            //   str  text_override ("" = None)
+            use cad_kernel::DimKind;
+            write_u8(w, 11);
+            match &d.kind {
+                DimKind::Linear { p1, p2, dimline_pos, ortho } => {
+                    write_u8(w, 0);
+                    write_vec2(w, *p1);
+                    write_vec2(w, *p2);
+                    write_vec2(w, *dimline_pos);
+                    write_u8(w, match ortho {
+                        cad_kernel::LinearOrtho::Horizontal => 0,
+                        cad_kernel::LinearOrtho::Vertical   => 1,
+                        cad_kernel::LinearOrtho::Aligned    => 2,
+                    });
+                }
+                DimKind::Radius { center, on_circle, leader_end } => {
+                    write_u8(w, 1);
+                    write_vec2(w, *center);
+                    write_vec2(w, *on_circle);
+                    write_vec2(w, *leader_end);
+                }
+                DimKind::Diameter { center, on_circle, leader_end } => {
+                    write_u8(w, 2);
+                    write_vec2(w, *center);
+                    write_vec2(w, *on_circle);
+                    write_vec2(w, *leader_end);
+                }
+            }
+            write_u32(w, d.style);
+            write_str(w, d.text_override.as_deref().unwrap_or(""));
+        }
     }
 }
 
@@ -340,7 +396,16 @@ pub fn read_rsm(bytes: &[u8]) -> Result<Document, String> {
     let pens      = read_pen_table(&mut r, &mut truecolors)?;
     let dobjects  = read_dobjects(&mut r, &mut truecolors)?;
 
-    Ok(Document { dobjects, layers, linetypes, pens, truecolors })
+    // text_styles not yet round-tripped in RSM — initialise to defaults.
+    // Whole-table serialisation lands when TextStyle gets DXF mapping.
+    let text_styles = cad_kernel::TextStyleTable::with_defaults();
+    Ok(Document {
+        dobjects, layers, linetypes, pens, truecolors, text_styles,
+        // dim_styles: not yet round-tripped in the RSM binary format.
+        // Persisting the full ~70-DIMVAR table will land with the DXF
+        // serializer pass.
+        dim_styles: Default::default(),
+    })
 }
 
 fn read_color(r: &mut R, tc: &mut cad_kernel::TrueColorTable) -> Result<Color, String> {
@@ -495,6 +560,59 @@ fn read_geom(r: &mut R) -> Result<Geom, String> {
         9 => Geom::Wall(Wall {
             start: r.vec2()?, end: r.vec2()?, thickness: r.f64()?,
         }),
+        10 => {
+            let position = r.vec2()?;
+            let height   = r.f64()?;
+            let angle    = r.f64()?;
+            let text     = r.str()?;
+            let h_align  = match r.u8()? {
+                1 => cad_kernel::TextHAlign::Center,
+                2 => cad_kernel::TextHAlign::Right,
+                _ => cad_kernel::TextHAlign::Left,
+            };
+            let v_align  = match r.u8()? {
+                1 => cad_kernel::TextVAlign::Bottom,
+                2 => cad_kernel::TextVAlign::Middle,
+                3 => cad_kernel::TextVAlign::Top,
+                _ => cad_kernel::TextVAlign::Baseline,
+            };
+            let style    = r.u32()?;
+            Geom::Text(cad_kernel::Text {
+                position, height, angle, text, h_align, v_align, style,
+            })
+        }
+        11 => {
+            use cad_kernel::{Dim, DimKind, LinearOrtho};
+            let kind = match r.u8()? {
+                0 => {
+                    let p1          = r.vec2()?;
+                    let p2          = r.vec2()?;
+                    let dimline_pos = r.vec2()?;
+                    let ortho = match r.u8()? {
+                        0 => LinearOrtho::Horizontal,
+                        1 => LinearOrtho::Vertical,
+                        _ => LinearOrtho::Aligned,
+                    };
+                    DimKind::Linear { p1, p2, dimline_pos, ortho }
+                }
+                1 => {
+                    let center     = r.vec2()?;
+                    let on_circle  = r.vec2()?;
+                    let leader_end = r.vec2()?;
+                    DimKind::Radius { center, on_circle, leader_end }
+                }
+                _ => {
+                    let center     = r.vec2()?;
+                    let on_circle  = r.vec2()?;
+                    let leader_end = r.vec2()?;
+                    DimKind::Diameter { center, on_circle, leader_end }
+                }
+            };
+            let style    = r.u32()?;
+            let override_s = r.str()?;
+            let text_override = if override_s.is_empty() { None } else { Some(override_s) };
+            Geom::Dimension(Dim { kind, style, text_override })
+        }
         t => return Err(format!("RSM: unknown geom tag {}", t)),
     })
 }

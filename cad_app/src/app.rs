@@ -34,7 +34,7 @@ fn aci_mapping_path() -> std::path::PathBuf {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Tool { None, Line, Circle, Arc, Ellipse, EllipseArc, Point, Polyline, Spline, Wall }
+enum Tool { None, Line, Circle, Arc, Ellipse, EllipseArc, Point, Polyline, Spline, Wall, Text, Dim }
 
 /// Sub-mode for the polyline draw tool — mirrors AutoCAD PLINE's Line /
 /// Arc toggle. `a` (or `arc`) switches Line→Arc; `l` (or `line`)
@@ -133,6 +133,8 @@ fn current_hint(tool: Tool, arc_method: ArcMethod, n: usize) -> &'static str {
         (Tool::Line,   _) => "line: click second endpoint    [Esc cancels]",
         (Tool::Wall,   0) => "wall: click first centerline endpoint",
         (Tool::Wall,   _) => "wall: click second centerline endpoint    [Esc cancels]",
+        (Tool::Text,   _) => "text: click anchor position    [Esc cancels]",
+        (Tool::Dim,    _) => "dim: click defining point (D toggles radius/diameter, Esc cancels)",
         (Tool::Circle, 0) => "circle: click center",
         (Tool::Circle, _) => "circle: click point on circumference    [Esc cancels]",
         (Tool::Ellipse, 0) => "ellipse: click CENTER",
@@ -259,6 +261,14 @@ pub struct CadApp {
     /// been held longer than `env.SelDmTm`. Without this gate, fast
     /// accidental drags during a click registered as windows.
     press_time: Option<f64>,
+    /// Screen + world position of the most recent primary-button press
+    /// on the canvas. Reset to None on release. We stash this because
+    /// `egui::Pointer::press_origin()` is cleared by the time
+    /// `drag_stopped()` fires on the release frame — relying on it
+    /// makes press_release_dist read 0, which silently kills every
+    /// window-drag gesture. Read by the unified click/drag classifier,
+    /// the window-drag application, and the rubber-band preview.
+    press_pos: Option<(egui::Pos2, Vec2)>,
     /// Screen-space rect of the canvas (central panel) from the last
     /// frame. Docking uses this — NOT `ctx.screen_rect()` — so docked
     /// strips align with the canvas area instead of overlapping the
@@ -498,6 +508,73 @@ pub struct CadApp {
     // ---- Slice L: medium editing actions ----
     offset_state:   OffsetState,
     dist_state:     DistState,
+    /// Text drafting state. While `WaitingForString`, the next cmd-line
+    /// input is captured as the text body (NOT parsed as a command).
+    text_draft:     TextDraftState,
+    /// Smart-dim drafting state. Drives the 2/3-click flow for the
+    /// `dim` command; sub-kind auto-decided at the first click.
+    dim_draft:      DimDraftState,
+    /// When `text "Hello"` is run inline, the string is captured here so
+    /// the next click commits Text without re-prompting for the body.
+    pending_text:   Option<String>,
+    /// When the user types `H` alone during the text tool, this flag
+    /// arms; the NEXT cmd-line input is consumed as the height value
+    /// (NOT passed to the main parser). Mirrors `fillet_waiting_radius`.
+    text_waiting_height: bool,
+    /// Text Style dialog state — Add / Edit a TextStyle entry. None
+    /// while the dialog is closed; Some when it's open and editing
+    /// the given style id (or `None` inside to indicate "new style").
+    text_style_dialog: Option<TextStyleDialog>,
+    dim_style_dialog:  Option<DimStyleDialog>,
+    /// Dimension Style Manager (the `dimstyle` page) — list + preview +
+    /// Set Current / New / Modify buttons. The `dim_style_dialog` above
+    /// is the New/Edit sub-form it launches.
+    dim_style_manager_open: bool,
+    /// Style id highlighted in the manager's Styles list (drives the
+    /// preview + Modify/Set-Current targets). Not necessarily current.
+    dim_style_manager_sel:  u32,
+    /// The "current" dim style — new dims are created with this id.
+    /// Mirrors AutoCAD's DIMSTYLE current. Defaults to STANDARD (0).
+    current_dim_style:      u32,
+    /// Text input popup — drives the discoverable Enter-Text dialog
+    /// that opens at the click anchor when the user picks a text
+    /// position. Without this the body capture happens silently in
+    /// the cmd line; new users can't find it.
+    text_input_dialog_open:     bool,
+    text_input_dialog_buf:      String,
+    text_input_dialog_anchor:   Option<Vec2>,
+    text_input_dialog_focus:    bool,
+    text_input_dialog_height:   f64,
+    text_input_dialog_style_id: u32,
+    /// Style-table length captured right before the "+ New…" button
+    /// launches the TextStyleDialog. If the count grows by the next
+    /// frame, the dialog committed a new style — auto-select it in
+    /// the text input dialog. Sentinel `usize::MAX` = not armed.
+    text_input_dialog_style_count_before: usize,
+    /// Session Recorder — captures every user action / state transition
+    /// / doc mutation when armed. OFF by default; user pushes Start in
+    /// the Recorder window before a debug session. See
+    /// `dbg_recorder.rs` for the data model.
+    pub dbg: crate::dbg_recorder::DbgRecorder,
+    pub dbg_window_open: bool,
+    pub dbg_note_buf:    String,
+    /// Last-frame snapshot of every "watched" state field. The frame
+    /// hook compares this to the current frame and emits a
+    /// `StateChange` event for each field that differs — no need to
+    /// wrap every assignment with a setter. Gives the recorder
+    /// agent-inspector behaviour: it sees EVERY state transition
+    /// automatically, including ones we haven't yet identified.
+    dbg_last_watched: Option<crate::dbg_recorder::WatchedState>,
+    /// Last press position + selection snapshot, captured on every
+    /// CanvasPress and read on the matching release to derive the
+    /// GestureClassification. Without this the drag distance reads 0
+    /// (egui clears press_origin by release time).
+    dbg_press_pos:       Option<(f32, f32, Vec2)>,
+    dbg_press_hit:       Option<usize>,
+    dbg_press_sel:       Vec<usize>,
+    /// Captured at release; promoted to GestureClassification once the
+    /// click handlers below have a chance to mutate selection / state.
+    dbg_pending_gesture: Option<PendingGesture>,
     /// AutoCAD offset Erase mode (transient — resets per command).
     /// When true, the source dobject is deleted right after the offset
     /// completes. Toggle with `e`.
@@ -729,6 +806,187 @@ pub enum DistState { Off, WaitingForP1, WaitingForP2(Vec2) }
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum BreakState    { Off, WaitingForPoint }
 
+/// Text drafting flow:
+///   Off                          — tool inactive
+///   WaitingForPosition           — user clicks; anchor captured
+///   WaitingForString(anchor)     — user types the string in the cmd
+///                                  line; Enter commits the Text dobject
+#[derive(Clone, PartialEq, Debug)]
+pub enum TextDraftState {
+    Off,
+    WaitingForPosition,
+    WaitingForString(Vec2),
+}
+
+/// Drafting state for the smart `dim` command. Single-tool flow that
+/// auto-decides the sub-kind based on what the first click hits:
+///
+///   Off                                   — tool inactive
+///   WaitingForP1                          — first click; circle/arc → radius;
+///                                           point → linear, store as p1
+///   WaitingForP2 { p1 }                   — linear only; click p2
+///   WaitingForDimLinePos { kind, p1, p2 } — click anywhere through which the
+///                                           dim line / leader should pass;
+///                                           commits the Dim dobject
+///
+/// `RadiusPending { center, on_circle }` is a transient flavor of
+/// WaitingForDimLinePos that lets the user press 'D' to flip the kind
+/// to Diameter before the second click.
+#[derive(Clone, PartialEq, Debug)]
+pub enum DimDraftState {
+    Off,
+    WaitingForP1,
+    WaitingForP2 { p1: Vec2 },
+    WaitingForDimLinePos {
+        /// Encoded as one of the kernel `DimKind` variants with the
+        /// final leader/dimline_pos NOT yet set — that comes from the
+        /// upcoming click.
+        kind: DimDraftKind,
+    },
+}
+
+/// The half-built kind during `WaitingForDimLinePos`. Last click fills
+/// in the dimline_pos / leader_end.
+#[derive(Clone, PartialEq, Debug)]
+pub enum DimDraftKind {
+    Linear   { p1: Vec2, p2: Vec2, ortho: cad_kernel::LinearOrtho },
+    Radius   { center: Vec2, on_circle: Vec2 },
+    Diameter { center: Vec2, on_circle: Vec2 },
+}
+
+/// Captured-at-release scratch data used by the canvas update block to
+/// emit a single `GestureClassification` event AFTER the click handlers
+/// have had their chance to mutate selection/state. Promoted to the
+/// recorder at the bottom of the canvas update.
+#[derive(Clone, Debug)]
+pub struct PendingGesture {
+    pub press_screen:     (f32, f32),
+    pub release_screen:   (f32, f32),
+    pub press_world:      Vec2,
+    pub release_world:    Vec2,
+    pub motion_px:        f32,
+    pub hit_at_press:     Option<usize>,
+    pub selection_before: Vec<usize>,
+}
+
+/// Editable state for the "New / Edit Text Style" dialog. When
+/// `editing_id` is `Some`, the dialog UPDATES that style on OK;
+/// when `None`, it CREATES a new style.
+#[derive(Clone, Debug)]
+pub struct TextStyleDialog {
+    pub editing_id:     Option<u32>,
+    pub name:           String,
+    pub font_name:      String,
+    pub default_height: f64,
+    /// Per-style color used for new Text dobjects created on this
+    /// style. When `None` the style defers to ByLayer (the dobject's
+    /// layer color wins). When `Some(aci)` the style supplies the ACI.
+    /// Stored on the style as metadata; the kernel's `TextStyle`
+    /// itself doesn't carry color today (LibreCAD doesn't either —
+    /// it's an app-level convention). For v1 we surface the picker
+    /// in the dialog but DON'T persist it on the kernel side —
+    /// follow-up slice when the field lands.
+    pub color_aci:      Option<u8>,
+}
+
+impl TextStyleDialog {
+    pub fn new_blank() -> Self {
+        Self {
+            editing_id:     None,
+            name:           String::new(),
+            font_name:      "standard".into(),
+            default_height: 0.25,
+            color_aci:      None,        // ByLayer
+        }
+    }
+    pub fn from_existing(id: u32, s: &cad_kernel::TextStyle) -> Self {
+        Self {
+            editing_id:     Some(id),
+            name:           s.name.clone(),
+            font_name:      s.font_name.clone(),
+            default_height: s.default_height,
+            color_aci:      None,
+        }
+    }
+}
+
+/// Arrowhead style chosen in the Dim Style form. Maps to DimStyle's
+/// `arrow_filled` + `tick_size` on OK.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ArrowKind { Filled, Hollow, Tick }
+
+/// Which element color the shared ACI wheel is editing for the Dim Style
+/// form. Carried on `AciPickRequest::DimStyleForm`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DimColorSlot { DimLine, ExtLine, Text }
+
+/// Add/Edit form for a `cad_kernel::DimStyle` — parallel to
+/// `TextStyleDialog`. Surfaces the most-used style fields across Lines /
+/// Arrows / Text / Units. On OK the full DimStyle is built by cloning the
+/// source style (STANDARD for new, the edited style for edit) and patching
+/// only these fields, so the other DIMVARs survive untouched. Each color
+/// is an independent ACI; `None` = ByBlock (0).
+pub struct DimStyleDialog {
+    pub editing_id:     Option<u32>,
+    pub name:           String,
+    pub arrow_size:     f64,
+    pub text_height:    f64,
+    pub decimal_places: i32,
+    /// Dim-line color. `None` = ByBlock; `Some(aci)` = ACI 1..=255.
+    pub color_aci:      Option<u8>,
+    /// Extension-line color.
+    pub ext_color_aci:  Option<u8>,
+    /// Text color.
+    pub text_color_aci: Option<u8>,
+    /// Text vertical position (DIMTAD): 0 = centered on line, 1 = above,
+    /// 4 = below.
+    pub text_vert_pos:  i32,
+    /// Rotate text to align with the dim line (vs always horizontal).
+    pub text_aligned:   bool,
+    pub arrow_kind:     ArrowKind,
+}
+
+impl DimStyleDialog {
+    pub fn new_blank() -> Self {
+        let s = cad_kernel::DimStyle::standard();
+        Self {
+            editing_id:     None,
+            name:           String::new(),
+            arrow_size:     s.arrow_size,
+            text_height:    s.text_height,
+            decimal_places: s.decimal_places,
+            color_aci:      None,
+            ext_color_aci:  None,
+            text_color_aci: None,
+            text_vert_pos:  s.text_vert_pos,
+            text_aligned:   !s.text_inside_horiz,
+            arrow_kind:     ArrowKind::Filled,
+        }
+    }
+    pub fn from_existing(id: u32, s: &cad_kernel::DimStyle) -> Self {
+        let aci = |c: u32| if c == 0 { None } else { Some(c.min(255) as u8) };
+        Self {
+            editing_id:     Some(id),
+            name:           s.name.clone(),
+            arrow_size:     s.arrow_size,
+            text_height:    s.text_height,
+            decimal_places: s.decimal_places,
+            color_aci:      aci(s.color_dim_line),
+            ext_color_aci:  aci(s.color_ext_line),
+            text_color_aci: aci(s.color_text),
+            text_vert_pos:  s.text_vert_pos,
+            text_aligned:   !s.text_inside_horiz,
+            arrow_kind:     if s.tick_size > 0.0 {
+                ArrowKind::Tick
+            } else if s.arrow_filled {
+                ArrowKind::Filled
+            } else {
+                ArrowKind::Hollow
+            },
+        }
+    }
+}
+
 /// Grip drag — recorded when the user grabs a grip handle of a selected
 /// dobject (either by pressing+dragging OR clicking on it). v2: each grip
 /// has a role (`GripRole`) that decides what changes when the user moves
@@ -916,6 +1174,9 @@ pub enum AciPickRequest {
     Layer(LayerId),
     /// Picker is editing a dobject's color (Info palette dobject edit).
     Dobject(usize),
+    /// Picker is editing one of the Dim Style add/edit form's element
+    /// colors (`dim_style_dialog`). The slot says which one.
+    DimStyleForm(DimColorSlot),
 }
 
 impl Default for CadApp {
@@ -940,6 +1201,7 @@ impl Default for CadApp {
             dock_dragging:       std::collections::HashSet::new(),
             canvas_screen_rect:  None,
             press_time:          None,
+            press_pos:           None,
             cmd_window_open:     true,
             layers_window_open:  true,
             pens_window_open:    false,
@@ -1025,6 +1287,30 @@ impl Default for CadApp {
             matchprops_state: MatchPropsState::Off,
             offset_state:   OffsetState::Off,
             dist_state:     DistState::Off,
+            text_draft:     TextDraftState::Off,
+            dim_draft:      DimDraftState::Off,
+            pending_text:   None,
+            text_waiting_height: false,
+            text_style_dialog: None,
+            dim_style_dialog:  None,
+            dim_style_manager_open: false,
+            dim_style_manager_sel:  0,
+            current_dim_style:      0,
+            text_input_dialog_open:     false,
+            text_input_dialog_buf:      String::new(),
+            text_input_dialog_anchor:   None,
+            text_input_dialog_focus:    false,
+            text_input_dialog_height:   0.0,
+            text_input_dialog_style_id: cad_kernel::TextStyleTable::STANDARD,
+            text_input_dialog_style_count_before: usize::MAX,
+            dbg: crate::dbg_recorder::DbgRecorder::default(),
+            dbg_window_open: false,
+            dbg_note_buf:    String::new(),
+            dbg_last_watched: None,
+            dbg_press_pos:       None,
+            dbg_press_hit:       None,
+            dbg_press_sel:       Vec::new(),
+            dbg_pending_gesture: None,
             offset_erase:        false,
             offset_layer_src:    false,
             offset_applied_count: 0,
@@ -1136,11 +1422,123 @@ impl CadApp {
         self.empty_enter_count_in_select = 0;
     }
 
+    #[track_caller]
     fn run_command(&mut self, raw: &str) {
         self.history.push(format!("> {}", raw));
         let trimmed = raw.trim();
         // Any non-empty input cancels the 2-stage-Enter notice.
         self.empty_enter_count_in_select = 0;
+        // SESSION RECORDER — capture every cmd-line invocation BEFORE
+        // the intercepts run. The parsed result is recorded only after
+        // parsing succeeds; pre-parser intercepts (text body, fillet
+        // radius, etc.) emit their own events from within their arms.
+        crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::CmdRun {
+            raw:           raw.to_string(),
+            parsed_debug:  match cad_kernel::parser::parse(trimmed) {
+                Ok(c)  => format!("{:?}", c),
+                Err(e) => format!("ParseErr({})", e),
+            },
+            source:        crate::dbg_recorder::CmdSource::Typed,
+        });
+
+        // ---- Text-tool sub-command intercepts (must run FIRST) ----
+        // The `text` tool consumes the cmd line until the user clicks
+        // a position OR presses Esc. Without this intercept, typing
+        // `H` (intent: set height) leaks through to the main parser
+        // which matches `h` as the Hatch command — wrong tool fires.
+
+        // (a) `text_waiting_height` was armed by a prior `H` with no
+        //     argument; this input IS the height value.
+        if self.text_waiting_height {
+            self.text_waiting_height = false;
+            if trimmed.is_empty() {
+                self.history.push(format!(
+                    "  text: height kept at {}", self.env.TxHt));
+            } else {
+                match trimmed.parse::<f64>() {
+                    Ok(v) if v > 1e-9 => {
+                        self.env.TxHt = v;
+                        let _ = self.env.save();
+                        self.history.push(format!(
+                            "  text: height → {}", v));
+                    }
+                    Ok(_) => self.history.push(
+                        "  ! text: height must be positive".into()),
+                    Err(_) => self.history.push(format!(
+                        "  ! text: '{}' is not a number", trimmed)),
+                }
+            }
+            self.set_prompt(format!(
+                "text: click anchor (H for height={}, Esc cancels)",
+                self.env.TxHt));
+            return;
+        }
+
+        // (b) Text body capture — after the user clicked a position,
+        //     the next non-empty input IS the text string. NOT a cmd.
+        //     Skipped when the popup dialog owns body entry; otherwise
+        //     both paths would race for the same keystrokes.
+        if let TextDraftState::WaitingForString(pos) = self.text_draft.clone() {
+            if self.text_input_dialog_open {
+                // Dialog handles body — don't consume cmd input here.
+                // Let the input fall through to the global parser so
+                // the user can still issue commands while the dialog
+                // is open (e.g. zoom, snap toggle).
+            } else {
+                if trimmed.is_empty() {
+                    // Empty Enter — cancel the draft.
+                    self.text_draft = TextDraftState::Off;
+                    self.tool = Tool::None;
+                    self.clear_prompt();
+                    self.history.push("  text: cancelled (empty input)".into());
+                    return;
+                }
+                let body = trimmed.to_string();
+                let height = self.env.TxHt;
+                self.commit_text_at(pos, &body, height);
+                self.text_draft = TextDraftState::Off;
+                self.tool = Tool::None;
+                return;
+            }
+        }
+
+        // (c) Text tool is active + waiting for a position click. Allow
+        //     sub-options inline:
+        //       `H`             — arm height capture (next input → value)
+        //       `H 5` / `h 0.3` — set height immediately
+        //       `height 5`      — long form, same as above
+        //     Anything else with the text tool active just falls through
+        //     to the global parser (user might want to switch tools).
+        if self.text_draft == TextDraftState::WaitingForPosition {
+            let lc = trimmed.to_ascii_lowercase();
+            let toks: Vec<&str> = lc.split_whitespace().collect();
+            if !toks.is_empty() && (toks[0] == "h" || toks[0] == "height") {
+                if toks.len() == 1 {
+                    // Bare H — arm the next input as the value.
+                    self.text_waiting_height = true;
+                    self.set_prompt(format!(
+                        "text: enter height <{}>:  [Enter to keep]",
+                        self.env.TxHt));
+                } else {
+                    match toks[1].parse::<f64>() {
+                        Ok(v) if v > 1e-9 => {
+                            self.env.TxHt = v;
+                            let _ = self.env.save();
+                            self.history.push(format!(
+                                "  text: height → {}", v));
+                            self.set_prompt(format!(
+                                "text: click anchor (H for height={}, Esc cancels)",
+                                self.env.TxHt));
+                        }
+                        Ok(_) => self.history.push(
+                            "  ! text: height must be positive".into()),
+                        Err(_) => self.history.push(format!(
+                            "  ! text: '{}' is not a number", toks[1])),
+                    }
+                }
+                return;
+            }
+        }
 
         // ---- Pending-sub-arg intercepts (must run FIRST) ----------
         // When a fillet/chamfer sub-option has prompted for a numeric
@@ -1713,6 +2111,7 @@ impl CadApp {
                 self.tool = match kind {
                     ToolKind::Line       => Tool::Line,
                     ToolKind::Wall       => Tool::Wall,
+                    ToolKind::Text       => Tool::Text,
                     ToolKind::Circle     => Tool::Circle,
                     ToolKind::Arc        => Tool::Arc,
                     ToolKind::Ellipse    => Tool::Ellipse,
@@ -2049,6 +2448,98 @@ impl CadApp {
                         }
                     }
                 }
+            }
+            Ok(Command::DbgRecorder) => {
+                // Toggle the recorder window's visibility. Pure UI —
+                // does NOT auto-start a recording (use the Start button
+                // inside the window).
+                self.dbg_window_open = !self.dbg_window_open;
+                self.history.push(format!(
+                    "  🛰 Session Recorder window {}",
+                    if self.dbg_window_open { "OPENED" } else { "CLOSED" }));
+            }
+            Ok(Command::TextStyle(name_opt)) => {
+                // Open the New / Edit Text Style dialog. With a name,
+                // try to find the existing style and edit it; falling
+                // back to a blank new-style form if the name doesn't
+                // match anything.
+                let dialog = match name_opt {
+                    Some(ref name) => match self.doc.text_styles.find(name) {
+                        Some(id) => {
+                            let style = self.doc.text_styles.get(id).unwrap();
+                            TextStyleDialog::from_existing(id, style)
+                        }
+                        None => {
+                            let mut d = TextStyleDialog::new_blank();
+                            d.name = name.clone();
+                            d
+                        }
+                    },
+                    None => TextStyleDialog::new_blank(),
+                };
+                self.text_style_dialog = Some(dialog);
+                // Surface in history so the user sees the command was
+                // received and the dialog SHOULD be visible.
+                self.history.push(format!(
+                    "  text style dialog opened ({})",
+                    match name_opt {
+                        Some(n) => format!("editing '{}'", n),
+                        None    => "new style".into(),
+                    }));
+            }
+            Ok(Command::Text(s_opt)) => {
+                // `text "Hello"` → enter draft, capture string immediately,
+                // wait for ONE click to commit Text at that anchor with
+                // the persisted height.
+                // `text`          → enter draft, prompt for position first
+                // then capture next non-empty cmd as the string.
+                // `H` sub-option during the draft sets height (intercepted
+                // before the global parser so it doesn't collide with
+                // the Hatch command's `h` alias).
+                self.tool = Tool::Text;
+                self.pending.clear();
+                self.text_draft = TextDraftState::WaitingForPosition;
+                self.text_waiting_height = false;
+                if let Some(string) = s_opt {
+                    self.pending_text = Some(string.clone());
+                    self.set_prompt(format!(
+                        "text: click anchor to place \"{}\"  (H for height={}, Esc cancels)",
+                        string, self.env.TxHt));
+                } else {
+                    self.pending_text = None;
+                    self.set_prompt(format!(
+                        "text: click anchor, then type the string  (H for height={}, Esc cancels)",
+                        self.env.TxHt));
+                }
+            }
+            Ok(Command::Dim) => {
+                // Smart-dim: enter Tool::Dim, wait for first click.
+                // Sub-kind (Linear / Radius / Diameter) decided when
+                // the user clicks: hit a circle/arc → Radius (D to
+                // toggle Diameter); hit empty → Linear waiting for p2.
+                self.tool = Tool::Dim;
+                self.pending.clear();
+                self.dim_draft = DimDraftState::WaitingForP1;
+                self.set_prompt(
+                    "dim: click first point (or click a circle/arc for radius/diameter)  [Esc cancels]"
+                    .to_string());
+            }
+            Ok(Command::DimStyle(name_opt)) => {
+                // Open the Dimension Style Manager (the `dimstyle` page).
+                // With a name, pre-select that style in the list (and
+                // make it current) if it exists.
+                if let Some(ref name) = name_opt {
+                    if let Some(id) = self.doc.dim_styles.find(name) {
+                        self.dim_style_manager_sel = id;
+                        self.current_dim_style     = id;
+                    }
+                } else {
+                    // Default the selection to whatever is current.
+                    self.dim_style_manager_sel = self.current_dim_style;
+                }
+                self.dim_style_manager_open = true;
+                self.history.push(
+                    "  Dimension Style Manager opened".into());
             }
             Ok(Command::Wall(t_opt)) => {
                 // Persist thickness if user supplied one, then enter
@@ -3900,7 +4391,9 @@ impl CadApp {
     /// not in the basket). The persistent `remove` sub-command from the
     /// command line flips the default: while it's on, plain clicks act
     /// like Shift+clicks and Shift+clicks act like plain clicks.
+    #[track_caller]
     fn click_select(&mut self, i: usize, shift: bool) {
+        let basket_before = self.selection.clone();
         // Effective intent: Shift inverts whatever the current mode says.
         let want_remove = shift ^ self.select_remove_mode;
         if want_remove {
@@ -3918,6 +4411,12 @@ impl CadApp {
             self.history.push(format!(
                 "    (skip) #{} already in the basket — Shift+click to remove", i));
         }
+        crate::dbg_event!(self,
+            crate::dbg_recorder::DbgEvent::SelectChange {
+                basket_before,
+                basket_after: self.selection.clone(),
+                cause: format!("click_select(i={}, shift={})", i, shift),
+            });
     }
 
     /// Translate every dobject in `self.selection` by `v`. Used by the
@@ -3962,9 +4461,15 @@ impl CadApp {
     ///   R→L drag → "crossing" window (any overlap counts).
     /// Modifier = sign: `shift` (or the persistent `select_remove_mode`)
     /// makes the window SUBTRACT instead of ADD.
+    #[track_caller]
     fn add_window_selection(&mut self, p1: Vec2, p2: Vec2, shift: bool) {
+        let basket_before = self.selection.clone();
         let bbox_min = Vec2::new(p1.x.min(p2.x), p1.y.min(p2.y));
         let bbox_max = Vec2::new(p1.x.max(p2.x), p1.y.max(p2.y));
+        // CAPTURE the armed-window override BEFORE .take() consumes it —
+        // the recorder needs to know whether the mode came from a typed
+        // override (`w`/`c`) or from direction-default.
+        let armed_at_entry = self.armed_window_inside;
         // === Hard rule (feedback_rust_cad_universal_selection_model) ===
         // Typed `w` / `c` ALWAYS beats drag direction. The .take() is
         // critical — the override is consumed by the first completing
@@ -3984,9 +4489,16 @@ impl CadApp {
                 .into_iter().map(|u| u as usize).collect(),
             _ => (0..self.doc.dobjects.len()).collect(),
         };
+        // SESSION RECORDER — record EVERY candidate's verdict so the
+        // user can see exactly which dobjects were considered and why
+        // each one was rejected. This is the diagnostic that nails
+        // "I dragged crossing but got 0 hits" bugs.
+        let cand_count = cands.len();
+        let mut verdicts: Vec<String> = Vec::new();
 
         let mut changed = 0usize;
-        for i in cands {
+        for i in &cands {
+            let i = *i;
             let (emin, emax) = self.doc.dobjects[i].bbox();
             let inside = if crossing {
                 !(emax.x < bbox_min.x || emin.x > bbox_max.x
@@ -3995,6 +4507,13 @@ impl CadApp {
                 emin.x >= bbox_min.x && emax.x <= bbox_max.x
                     && emin.y >= bbox_min.y && emax.y <= bbox_max.y
             };
+            // Recorder verdict (only push first 20 to bound dump size).
+            if verdicts.len() < 20 {
+                verdicts.push(format!(
+                    "#{}: bbox=({:.2},{:.2})→({:.2},{:.2}) → {}",
+                    i, emin.x, emin.y, emax.x, emax.y,
+                    if inside { "HIT" } else { "miss" }));
+            }
             if !inside { continue; }
             if want_remove {
                 if let Some(pos) = self.selection.iter().position(|&x| x == i) {
@@ -4013,6 +4532,43 @@ impl CadApp {
             if crossing { "crossing" } else { "inside" },
             self.selection.len(),
         ));
+        // FULL DIAGNOSTIC — what the classifier saw, what it picked,
+        // why, and what each candidate looked like vs the window.
+        let mode_reason = match armed_at_entry {
+            Some(true)  => "armed_window=inside (typed `w`)".to_string(),
+            Some(false) => "armed_window=crossing (typed `c`)".to_string(),
+            None        => format!(
+                "direction-default (p2.x {} p1.x → {})",
+                if p2.x < p1.x { "<" } else { ">=" },
+                if crossing { "crossing" } else { "inside" }),
+        };
+        let verdict_dump = if verdicts.len() == cand_count {
+            verdicts.join("  ·  ")
+        } else {
+            format!("{}  · …{} more",
+                verdicts.join("  ·  "),
+                cand_count - verdicts.len())
+        };
+        crate::dbg_event!(self,
+            crate::dbg_recorder::DbgEvent::SelectChange {
+                basket_before,
+                basket_after: self.selection.clone(),
+                cause: format!(
+                    "add_window_selection  p1=({:.3},{:.3}) p2=({:.3},{:.3})  \
+                     window_bbox=({:.3},{:.3})→({:.3},{:.3})  shift={} remove_mode={} \
+                     armed_inside_at_entry={:?}  MODE={}  REASON={}  \
+                     candidates({} from {})={{ {} }}",
+                    p1.x, p1.y, p2.x, p2.y,
+                    bbox_min.x, bbox_min.y, bbox_max.x, bbox_max.y,
+                    shift, self.select_remove_mode,
+                    armed_at_entry,
+                    if crossing { "crossing" } else { "inside" },
+                    mode_reason,
+                    cand_count,
+                    if self.index_dirty || self.index.is_none() { "full doc scan" }
+                    else { "spatial index" },
+                    verdict_dump),
+            });
     }
 
     // ===================================================================
@@ -4725,6 +5281,1034 @@ impl CadApp {
             "confirm panel: + Dobject — opened selection for new boundary".to_string());
     }
 
+    /// New / Edit Text Style dialog — small modal-style window for
+    /// managing TextStyleTable entries. Opens via the `style` cmd or
+    /// the future Styles panel. Fields:
+    ///   * Name              (text entry — uppercase canonical)
+    ///   * Font              (combo: "standard" + any future LFF loaded)
+    ///   * Default height    (drag value)
+    ///   * Color             (ByLayer checkbox + ACI picker shortcut)
+    /// OK commits the form into doc.text_styles (add or update).
+    /// Cancel / X dismisses without writes.
+    fn render_text_style_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.text_style_dialog.take() else { return; };
+        let mut open    = true;
+        let mut do_ok   = false;
+        let mut do_cancel = false;
+        // Snapshot available font names. v1 has exactly one ("standard");
+        // when the LFF parser lands every loaded .lff joins this list
+        // and the combo picks up new entries with no UI changes.
+        // Font choices the renderer can actually render today. When the
+        // LFF / SHX font loader lands these get appended automatically.
+        let font_choices: Vec<&'static str> = vec!["standard", "monospace"];
+        egui::Window::new(if dialog.editing_id.is_some() {
+                "Edit Text Style"
+            } else { "New Text Style" })
+            .id(egui::Id::new("text_style_dialog"))
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .default_size(egui::vec2(360.0, 260.0))
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                egui::Grid::new("text_style_form")
+                    .num_columns(2)
+                    .spacing([8.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("Name");
+                        ui.add(egui::TextEdit::singleline(&mut dialog.name)
+                            .desired_width(220.0)
+                            .hint_text("STANDARD, NOTES, TITLE…"));
+                        ui.end_row();
+
+                        ui.label("Font");
+                        egui::ComboBox::from_id_salt("ts_font_combo")
+                            .selected_text(&dialog.font_name)
+                            .width(220.0)
+                            .show_ui(ui, |ui| {
+                                for f in &font_choices {
+                                    ui.selectable_value(
+                                        &mut dialog.font_name,
+                                        (*f).to_string(),
+                                        *f);
+                                }
+                            });
+                        ui.end_row();
+
+                        ui.label("Default height");
+                        ui.add(egui::DragValue::new(&mut dialog.default_height)
+                            .speed(0.05)
+                            .range(0.0..=1000.0)
+                            .min_decimals(3)
+                            .max_decimals(3));
+                        ui.end_row();
+
+                        ui.label("Color");
+                        ui.horizontal(|ui| {
+                            let mut by_layer = dialog.color_aci.is_none();
+                            if ui.checkbox(&mut by_layer, "ByLayer").changed() {
+                                dialog.color_aci = if by_layer { None } else { Some(7) };
+                            }
+                            ui.add_enabled_ui(!by_layer, |ui| {
+                                let mut aci = dialog.color_aci.unwrap_or(7);
+                                if ui.add(egui::DragValue::new(&mut aci)
+                                    .speed(1.0)
+                                    .range(1..=255)
+                                    .prefix("ACI "))
+                                    .changed()
+                                {
+                                    dialog.color_aci = Some(aci);
+                                }
+                                // Swatch preview.
+                                let (r, g, b) = aci_palette(aci);
+                                let rect = ui.allocate_exact_size(
+                                    egui::vec2(28.0, 18.0),
+                                    egui::Sense::hover()).0;
+                                ui.painter().rect_filled(
+                                    rect, 2.0, egui::Color32::from_rgb(r, g, b));
+                                ui.painter().rect_stroke(
+                                    rect, 2.0,
+                                    egui::Stroke::new(0.7,
+                                        egui::Color32::from_rgb(70, 80, 95)));
+                            });
+                        });
+                        ui.end_row();
+                    });
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui|
+                    {
+                        if ui.button("Cancel").clicked() { do_cancel = true; }
+                        if ui.button("OK").clicked()      { do_ok = true; }
+                    });
+                });
+            });
+        // Handle close-via-X (open went false) as cancel.
+        if !open || do_cancel {
+            self.history.push("  text style: cancelled".into());
+            return;
+        }
+        if do_ok {
+            let name = dialog.name.trim().to_string();
+            if name.is_empty() {
+                self.history.push(
+                    "  ! text style: name cannot be empty".into());
+                // Re-open with the edits preserved so the user can fix.
+                self.text_style_dialog = Some(dialog);
+                return;
+            }
+            // Reject duplicate name when CREATING; allow when editing
+            // (the existing id may already own that name).
+            if let Some(found) = self.doc.text_styles.find(&name) {
+                if dialog.editing_id != Some(found) {
+                    self.history.push(format!(
+                        "  ! text style: '{}' already exists", name));
+                    self.text_style_dialog = Some(dialog);
+                    return;
+                }
+            }
+            let new_style = cad_kernel::TextStyle {
+                name:           name.clone(),
+                font_name:      dialog.font_name.clone(),
+                width_factor:   1.0,
+                oblique:        0.0,
+                default_height: dialog.default_height,
+            };
+            match dialog.editing_id {
+                Some(id) => {
+                    if let Some(s) = self.doc.text_styles.styles.get_mut(id as usize) {
+                        *s = new_style;
+                        self.history.push(format!(
+                            "  ⊛ text style #{} '{}' updated", id, name));
+                    }
+                }
+                None => {
+                    let id = self.doc.text_styles.add(new_style);
+                    self.history.push(format!(
+                        "  + text style #{} '{}' created  (font={}, h={})",
+                        id, name, dialog.font_name, dialog.default_height));
+                }
+            }
+            // Color: stored only in the dialog for v1 — the kernel
+            // TextStyle has no color field yet. Document the intent so
+            // the next slice (when the field lands) can flip it on.
+            if let Some(aci) = dialog.color_aci {
+                self.history.push(format!(
+                    "  (color ACI {} selected — kernel field pending; not persisted yet)",
+                    aci));
+            }
+            return;
+        }
+        // Window still open — preserve dialog state for next frame.
+        self.text_style_dialog = Some(dialog);
+    }
+
+    /// Dimension Style Manager — the `dimstyle` page. Styles list + a
+    /// live preview (our OWN sample drawing) + Set Current / New… /
+    /// Modify… / Override… / Compare…. New…/Modify… launch the
+    /// `DimStyleDialog` add/edit sub-form (`render_dim_style_dialog`).
+    fn render_dim_style_manager(&mut self, ctx: &egui::Context) {
+        if !self.dim_style_manager_open { return; }
+        let mut open           = true;
+        let mut do_close       = false;
+        let mut do_new         = false;
+        let mut do_modify      = false;
+        let mut do_set_current = false;
+        let mut do_override    = false;
+        let mut do_compare     = false;
+        let mut do_help        = false;
+        let mut new_sel: Option<u32> = None;
+
+        // Snapshot the table so the Window closure doesn't borrow self.doc.
+        let styles: Vec<(u32, String)> = self.doc.dim_styles.styles.iter()
+            .enumerate()
+            .map(|(i, s)| (i as u32, s.name.clone()))
+            .collect();
+        let max_id  = styles.len().saturating_sub(1) as u32;
+        let sel     = self.dim_style_manager_sel.min(max_id);
+        let current = self.current_dim_style.min(max_id);
+        let name_of = |id: u32| styles.get(id as usize)
+            .map(|(_, n)| n.clone()).unwrap_or_else(|| "STANDARD".into());
+        let cur_name  = name_of(current);
+        let sel_name  = name_of(sel);
+        let sel_style = self.doc.dim_styles.get(sel).cloned()
+            .unwrap_or_else(cad_kernel::DimStyle::standard);
+
+        egui::Window::new("Dimension Style Manager")
+            .id(egui::Id::new("dim_style_manager"))
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .movable(true)
+            .default_size(egui::vec2(720.0, 470.0))
+            .default_pos(egui::pos2(160.0, 70.0))
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new(
+                    format!("Current dimension style:  {}", cur_name)).strong());
+                ui.add_space(6.0);
+                ui.horizontal_top(|ui| {
+                    // ---- Styles list ----
+                    ui.vertical(|ui| {
+                        ui.label("Styles:");
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.set_width(150.0);
+                            egui::ScrollArea::vertical()
+                                .max_height(258.0)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.set_min_height(258.0);
+                                    for (id, nm) in &styles {
+                                        let txt = if *id == current {
+                                            format!("✔  {}", nm)
+                                        } else {
+                                            format!("     {}", nm)
+                                        };
+                                        let r = ui.selectable_label(*id == sel, txt);
+                                        if r.clicked() { new_sel = Some(*id); }
+                                        if r.double_clicked() {
+                                            new_sel = Some(*id);
+                                            do_set_current = true;
+                                        }
+                                    }
+                                });
+                        });
+                    });
+                    // ---- Preview (our own sample drawing) ----
+                    ui.vertical(|ui| {
+                        ui.label(format!("Preview of:  {}", sel_name));
+                        let (resp, painter) = ui.allocate_painter(
+                            egui::vec2(360.0, 284.0), egui::Sense::hover());
+                        painter.rect_filled(resp.rect, 4.0,
+                            egui::Color32::from_rgb(40, 42, 47));
+                        painter.rect_stroke(resp.rect, 4.0,
+                            egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 80, 95)));
+                        draw_dim_style_preview(&painter, resp.rect, &sel_style);
+                    });
+                    // ---- Buttons ----
+                    ui.vertical(|ui| {
+                        ui.add_space(18.0);
+                        let bw = 96.0;
+                        if ui.add_sized([bw, 24.0], egui::Button::new("Set Current")).clicked() { do_set_current = true; }
+                        ui.add_space(8.0);
+                        if ui.add_sized([bw, 24.0], egui::Button::new("New…")).clicked()      { do_new = true; }
+                        ui.add_space(8.0);
+                        if ui.add_sized([bw, 24.0], egui::Button::new("Modify…")).clicked()   { do_modify = true; }
+                        ui.add_space(8.0);
+                        if ui.add_sized([bw, 24.0], egui::Button::new("Override…")).clicked() { do_override = true; }
+                        ui.add_space(8.0);
+                        if ui.add_sized([bw, 24.0], egui::Button::new("Compare…")).clicked()  { do_compare = true; }
+                    });
+                });
+                ui.add_space(8.0);
+                ui.horizontal_top(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label("List:");
+                        egui::ComboBox::from_id_salt("dim_mgr_list")
+                            .selected_text("All styles")
+                            .width(150.0)
+                            .show_ui(ui, |ui| {
+                                let _ = ui.selectable_label(true,  "All styles");
+                                let _ = ui.selectable_label(false, "Styles in use");
+                            });
+                        let mut xref = false;
+                        ui.add_enabled(false,
+                            egui::Checkbox::new(&mut xref, "Don't list styles in Xrefs"));
+                    });
+                    ui.add_space(14.0);
+                    ui.vertical(|ui| {
+                        ui.label("Description");
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.set_width(330.0);
+                            ui.set_min_height(46.0);
+                            ui.label(format!(
+                                "{}\narrow {:.3} · text {:.3} · {} dp · {}",
+                                sel_name,
+                                sel_style.arrow_size,
+                                sel_style.text_height,
+                                sel_style.decimal_places,
+                                if sel_style.color_dim_line == 0 {
+                                    "color ByBlock".to_string()
+                                } else {
+                                    format!("color ACI {}", sel_style.color_dim_line)
+                                }));
+                        });
+                    });
+                });
+                ui.add_space(8.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Close").clicked() { do_close = true; }
+                        if ui.button("Help").clicked()  { do_help  = true; }
+                    });
+                });
+            });
+
+        // ---- apply actions (closure done; free to touch self) ----
+        if let Some(id) = new_sel { self.dim_style_manager_sel = id; }
+        let target = new_sel.unwrap_or(sel);
+        if do_set_current {
+            self.current_dim_style = target;
+            self.history.push(format!(
+                "  dim style: '{}' set current — new dims use it", name_of(target)));
+        }
+        if do_new {
+            self.dim_style_dialog = Some(DimStyleDialog::new_blank());
+        }
+        if do_modify {
+            self.dim_style_dialog = Some(DimStyleDialog::from_existing(sel, &sel_style));
+        }
+        if do_override {
+            self.history.push(
+                "  dim style: Override… not wired yet — use Modify… for now".into());
+        }
+        if do_compare {
+            self.history.push(
+                "  dim style: Compare… not wired yet".into());
+        }
+        if do_help {
+            self.history.push(
+                "  Dimension Style Manager — pick a style, Set Current to make new dims use it; New…/Modify… edit. Preview reflects the selected style.".into());
+        }
+        if !open || do_close {
+            self.dim_style_manager_open = false;
+        }
+    }
+
+    /// Add/Edit Dim Style dialog — parallel to `render_text_style_dialog`.
+    /// On OK the full DimStyle is built by cloning the source style
+    /// (STANDARD for new, the edited style for edit) and patching only
+    /// the four exposed fields + color, so the remaining ~65 DIMVARs are
+    /// preserved untouched.
+    fn render_dim_style_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.dim_style_dialog.take() else { return; };
+        let mut open      = true;
+        let mut do_ok     = false;
+        let mut do_cancel = false;
+        let mut pick_slot: Option<DimColorSlot> = None;
+        egui::Window::new(if dialog.editing_id.is_some() {
+                "Edit Dim Style"
+            } else { "New Dim Style" })
+            .id(egui::Id::new("dim_style_dialog"))
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .default_size(egui::vec2(360.0, 280.0))
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                egui::Grid::new("dim_style_form")
+                    .num_columns(2)
+                    .spacing([8.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("Name");
+                        ui.add(egui::TextEdit::singleline(&mut dialog.name)
+                            .desired_width(220.0)
+                            .hint_text("STANDARD, MM, ARCH…"));
+                        ui.end_row();
+
+                        // ---- Lines & Arrows ------------------------------
+                        ui.label(egui::RichText::new("Lines & Arrows").strong());
+                        ui.end_row();
+
+                        ui.label("Arrow size");
+                        ui.add(egui::DragValue::new(&mut dialog.arrow_size)
+                            .speed(0.01).range(0.0..=1000.0)
+                            .min_decimals(3).max_decimals(3));
+                        ui.end_row();
+
+                        ui.label("Arrow type");
+                        egui::ComboBox::from_id_salt("dim_arrow_kind")
+                            .selected_text(match dialog.arrow_kind {
+                                ArrowKind::Filled => "Filled",
+                                ArrowKind::Hollow => "Hollow",
+                                ArrowKind::Tick   => "Architectural tick",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut dialog.arrow_kind, ArrowKind::Filled, "Filled");
+                                ui.selectable_value(&mut dialog.arrow_kind, ArrowKind::Hollow, "Hollow");
+                                ui.selectable_value(&mut dialog.arrow_kind, ArrowKind::Tick,   "Architectural tick");
+                            });
+                        ui.end_row();
+
+                        ui.label("Dim line color");
+                        ui.horizontal(|ui| {
+                            if dim_color_swatch(ui, &mut dialog.color_aci) {
+                                pick_slot = Some(DimColorSlot::DimLine);
+                            }
+                        });
+                        ui.end_row();
+
+                        ui.label("Ext line color");
+                        ui.horizontal(|ui| {
+                            if dim_color_swatch(ui, &mut dialog.ext_color_aci) {
+                                pick_slot = Some(DimColorSlot::ExtLine);
+                            }
+                        });
+                        ui.end_row();
+
+                        // ---- Text ----------------------------------------
+                        ui.label(egui::RichText::new("Text").strong());
+                        ui.end_row();
+
+                        ui.label("Text height");
+                        ui.add(egui::DragValue::new(&mut dialog.text_height)
+                            .speed(0.01).range(0.0..=1000.0)
+                            .min_decimals(3).max_decimals(3));
+                        ui.end_row();
+
+                        ui.label("Text color");
+                        ui.horizontal(|ui| {
+                            if dim_color_swatch(ui, &mut dialog.text_color_aci) {
+                                pick_slot = Some(DimColorSlot::Text);
+                            }
+                        });
+                        ui.end_row();
+
+                        ui.label("Text placement");
+                        egui::ComboBox::from_id_salt("dim_text_vpos")
+                            .selected_text(match dialog.text_vert_pos {
+                                0 => "Centered (on line)",
+                                4 => "Below line",
+                                _ => "Above line",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut dialog.text_vert_pos, 1, "Above line");
+                                ui.selectable_value(&mut dialog.text_vert_pos, 0, "Centered (on line)");
+                                ui.selectable_value(&mut dialog.text_vert_pos, 4, "Below line");
+                            });
+                        ui.end_row();
+
+                        ui.label("Text alignment");
+                        ui.checkbox(&mut dialog.text_aligned, "Align with dimension line");
+                        ui.end_row();
+
+                        // ---- Units ---------------------------------------
+                        ui.label(egui::RichText::new("Units").strong());
+                        ui.end_row();
+
+                        ui.label("Decimal places");
+                        ui.add(egui::DragValue::new(&mut dialog.decimal_places)
+                            .speed(1.0).range(0..=12));
+                        ui.end_row();
+                    });
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui|
+                    {
+                        if ui.button("Cancel").clicked() { do_cancel = true; }
+                        if ui.button("OK").clicked()      { do_ok = true; }
+                    });
+                });
+            });
+        // Close-via-X (open went false) is treated as cancel.
+        if !open || do_cancel {
+            self.history.push("  dim style: cancelled".into());
+            return;
+        }
+        if do_ok {
+            let name = dialog.name.trim().to_string();
+            if name.is_empty() {
+                self.history.push(
+                    "  ! dim style: name cannot be empty".into());
+                self.dim_style_dialog = Some(dialog);
+                return;
+            }
+            // Reject duplicate name when CREATING; allow when editing
+            // the same id (it already owns that name).
+            if let Some(found) = self.doc.dim_styles.find(&name) {
+                if dialog.editing_id != Some(found) {
+                    self.history.push(format!(
+                        "  ! dim style: '{}' already exists", name));
+                    self.dim_style_dialog = Some(dialog);
+                    return;
+                }
+            }
+            // Build by cloning the source style and patching the exposed
+            // fields, so the other ~65 DIMVARs survive untouched.
+            let mut new_style = match dialog.editing_id {
+                Some(id) => self.doc.dim_styles.get(id)
+                    .cloned()
+                    .unwrap_or_else(cad_kernel::DimStyle::standard),
+                None => cad_kernel::DimStyle::standard(),
+            };
+            new_style.name           = name.clone();
+            new_style.arrow_size     = dialog.arrow_size;
+            new_style.text_height    = dialog.text_height;
+            new_style.decimal_places = dialog.decimal_places;
+            // Per-element colors. None = ByBlock (0); the renderer falls
+            // back to the dobject color when a field is 0.
+            let to_col = |o: Option<u8>| o.map(|a| a as u32).unwrap_or(0);
+            new_style.color_dim_line = to_col(dialog.color_aci);
+            new_style.color_ext_line = to_col(dialog.ext_color_aci);
+            new_style.color_text     = to_col(dialog.text_color_aci);
+            // Text placement (DIMTAD) + alignment (DIMTIH/DIMTOH).
+            new_style.text_vert_pos     = dialog.text_vert_pos;
+            new_style.text_inside_horiz  = !dialog.text_aligned;
+            new_style.text_outside_horiz = !dialog.text_aligned;
+            // Arrowhead kind → arrow_filled + tick_size.
+            match dialog.arrow_kind {
+                ArrowKind::Filled => { new_style.arrow_filled = true;  new_style.tick_size = 0.0; }
+                ArrowKind::Hollow => { new_style.arrow_filled = false; new_style.tick_size = 0.0; }
+                ArrowKind::Tick   => {
+                    // Tick needs a positive size; default it to the arrow size.
+                    if new_style.tick_size <= 0.0 {
+                        new_style.tick_size = dialog.arrow_size;
+                    }
+                }
+            }
+            match dialog.editing_id {
+                Some(id) => {
+                    if let Some(s) = self.doc.dim_styles.styles.get_mut(id as usize) {
+                        *s = new_style;
+                        self.history.push(format!(
+                            "  ⊛ dim style #{} '{}' updated", id, name));
+                    }
+                }
+                None => {
+                    let id = self.doc.dim_styles.add(new_style);
+                    self.history.push(format!(
+                        "  + dim style #{} '{}' created  (arrow={}, txt={}, dec={})",
+                        id, name, dialog.arrow_size,
+                        dialog.text_height, dialog.decimal_places));
+                }
+            }
+            return;
+        }
+        // Window still open — preserve dialog state for next frame.
+        self.dim_style_dialog = Some(dialog);
+        // Defer opening the shared ACI wheel until the dialog is back in
+        // place; the picker writes the chosen ACI into the right slot.
+        if let Some(slot) = pick_slot {
+            self.aci_pick_request = Some(AciPickRequest::DimStyleForm(slot));
+        }
+    }
+
+    // ===================================================================
+    //           Session Recorder helpers — Slice A wiring
+    // ===================================================================
+
+    /// Start a new recording. Snapshots the initial doc state so the
+    /// timeline has an anchor.
+    #[track_caller]
+    pub fn dbg_start(&mut self) {
+        self.dbg.start("user pressed Start");
+        // Initial snapshot — anchor for "doc at session start".
+        let loc = std::panic::Location::caller();
+        let undo_d = self.undo_stack.len();
+        let redo_d = self.redo_stack.len();
+        self.dbg.take_snapshot(&self.doc, "session start", undo_d, redo_d, loc);
+        self.history.push(format!(
+            "  🛰 recording started — every action will be captured"));
+    }
+
+    /// Stop the recording. Returns nothing — output is read via the
+    /// "📋 Copy" button in the Recorder window.
+    pub fn dbg_stop(&mut self) {
+        self.dbg.stop("user pressed Stop");
+        self.history.push(format!(
+            "  🛰 recording stopped — {} events, {} snapshots",
+            self.dbg.events.len(), self.dbg.snapshots.len()));
+    }
+
+    /// Build a `WatchedState` snapshot from current self. Cheap —
+    /// the strings are short-format Debug prints.
+    fn dbg_watched_now(&self) -> crate::dbg_recorder::WatchedState {
+        use crate::dbg_recorder::{WatchedState, WindowFlags};
+        WatchedState {
+            tool:               format!("{:?}", self.tool),
+            select_mode:        format!("{:?}", self.select_mode),
+            trim_state:         format!("{:?}", self.trim_state),
+            extend_state:       format!("{:?}", self.extend_state),
+            fillet_state:       format!("{:?}", self.fillet_state),
+            chamfer_state:      format!("{:?}", self.chamfer_state),
+            offset_state:       format!("{:?}", self.offset_state),
+            dist_state:         format!("{:?}", self.dist_state),
+            text_draft:         format!("{:?}", self.text_draft),
+            matchprops_state:   format!("{:?}", self.matchprops_state),
+            align_state:        format!("{:?}", self.align_state),
+            stretch_state:      format!("{:?}", self.stretch_state),
+            break_state:        format!("{:?}", self.break_state),
+            lengthen_state:     format!("{:?}", self.lengthen_state),
+            grip_drag:          self.grip_drag.is_some(),
+            selection:          self.selection.clone(),
+            queued_op:          format!("{:?}", self.queued_op),
+            armed_window_inside: format!("{:?}", self.armed_window_inside),
+            window_first:       format!("{:?}", self.window_first),
+            doc_dobjects_len:   self.doc.dobjects.len(),
+            undo_depth:         self.undo_stack.len(),
+            redo_depth:         self.redo_stack.len(),
+            window_flags:       WindowFlags {
+                cmd_window:        self.cmd_window_open,
+                layers_window:     self.layers_window_open,
+                pens_window:       self.pens_window_open,
+                info_window:       self.info_window_open,
+                dobjects_window:   self.dobjects_window_open,
+                snap_window:       self.snap_window_open,
+                trim_debug:        self.trim_debug_open,
+                hatch_debug:       self.hatch_debug_open,
+                hatch_dialog:      self.hatch_dialog_open,
+                hatch_confirm:     self.hatch_confirm_open,
+                text_style_dialog: self.text_style_dialog.is_some(),
+                dim_style_dialog:  self.dim_style_dialog.is_some(),
+                dbg_window:        self.dbg_window_open,
+            },
+            // Cherry-pick the SYSVARs most likely to flip user-visibly.
+            // Add more here as bugs lead us to them.
+            sysvar_summary: format!(
+                "TxHt={} WlThk={} WlCnL={} OfsDis={} FltRad={} TrmMd={} EdgMod={} GrpEnb={} LodAnc={} UcsIcn={}",
+                self.env.TxHt, self.env.WlThk, self.env.WlCnL,
+                self.env.OfsDis, self.env.FltRad, self.env.TrmMd,
+                self.env.EdgMod, self.env.GrpEnb, self.env.LodAnc,
+                self.env.UcsIcn),
+        }
+    }
+
+    /// Promote any pending press-release pair into a
+    /// `GestureClassification` event. Runs AFTER the click handlers in
+    /// the canvas update block — so by the time this fires, the
+    /// selection delta + window_first transitions are visible.
+    #[track_caller]
+    pub fn dbg_emit_pending_gesture(&mut self) {
+        let Some(p) = self.dbg_pending_gesture.take() else { return; };
+        if !self.dbg.recording { return; }
+        // Classify the motion vector.
+        let dx = p.release_screen.0 - p.press_screen.0;
+        let dy = p.release_screen.1 - p.press_screen.1;
+        let dir_h = if dx > 0.5 { "L→R" } else if dx < -0.5 { "R→L" }
+                    else { "vertical" };
+        let dir_v = if dy > 0.5 { "↓" } else if dy < -0.5 { "↑" }
+                    else { "horizontal" };
+        let motion_dir = if p.motion_px < 1.0 { "stationary".to_string() }
+                         else { format!("{} {}", dir_h, dir_v) };
+        // Hit-test at release.
+        let tol = 10.0 / self.scale as f64;
+        let hit_at_release = self.nearest_entity_under(p.release_world, tol);
+        // Selection delta.
+        let selection_after = self.selection.clone();
+        let sel_delta = selection_after.len() as i64 - p.selection_before.len() as i64;
+        // Infer what the app actually did. Heuristic:
+        //   - selection grew/shrank/changed → click_select or add_window_selection
+        //   - selection unchanged + window_first set or cleared → 2-click corner capture
+        //   - none of the above → NOOP
+        let in_select_mode = self.select_mode != SelectMode::Off;
+        let action_taken = if selection_after != p.selection_before {
+            format!("selection mutated {}{} ({} → {} items)",
+                if sel_delta > 0 { "+" } else { "" },
+                sel_delta,
+                p.selection_before.len(), selection_after.len())
+        } else if self.window_first.is_some() {
+            format!("window_first captured = {:?}", self.window_first)
+        } else {
+            "NOOP — neither selection nor window_first changed".into()
+        };
+        // Pointer-mode-idle (Tool::None, no select session, no edit phase)
+        // now counts as an implicit select_mode for drag purposes — see
+        // feedback_rust_cad_pointer_is_selector.
+        let pointer_mode_idle = self.tool == Tool::None && !in_select_mode;
+        let drag_window_available = in_select_mode || pointer_mode_idle;
+        // Verdict — the punchline a reader can act on at a glance.
+        let verdict = if p.motion_px > 5.0 && selection_after == p.selection_before
+            && self.window_first.is_some() && drag_window_available
+        {
+            format!(
+                "⚠ {}-px drag DEMOTED TO CLICK. Press position discarded; \
+                 only the release became window_first. Drag-window intent LOST.",
+                p.motion_px as i32)
+        } else if p.motion_px > 5.0 && selection_after == p.selection_before
+            && !drag_window_available
+        {
+            format!(
+                "⚠ {}-px motion produced NO selection change. \
+                 (Drag-window not available in the current phase.)",
+                p.motion_px as i32)
+        } else if p.motion_px <= 1.0 && hit_at_release.is_none() {
+            "click on empty area".into()
+        } else if p.motion_px <= 1.0 && hit_at_release.is_some() {
+            format!("click on dobject #{}", hit_at_release.unwrap())
+        } else if selection_after != p.selection_before {
+            format!("OK — selection updated by {} item(s)", sel_delta.abs())
+        } else {
+            "no change".into()
+        };
+        // What egui thought.
+        let egui_clicked = false;       // by definition; the press/release path doesn't see resp directly here
+        let egui_drag_stopped = p.motion_px > 5.0;
+        crate::dbg_event!(self,
+            crate::dbg_recorder::DbgEvent::GestureClassification {
+                press_screen:     p.press_screen,
+                release_screen:   p.release_screen,
+                press_world:      p.press_world,
+                release_world:    p.release_world,
+                motion_px:        p.motion_px,
+                motion_dir,
+                egui_clicked,
+                egui_drag_stopped,
+                hit_at_press:     p.hit_at_press,
+                hit_at_release,
+                in_select_mode,
+                active_tool:      format!("{:?}", self.tool),
+                selection_before: p.selection_before,
+                selection_after,
+                app_action_taken: action_taken,
+                outcome_summary:  verdict,
+            });
+    }
+
+    /// Frame-end poller — diff watched state vs last frame, emit one
+    /// event per changed field. Agent-inspector behaviour: state
+    /// transitions show up automatically, even ones we haven't yet
+    /// instrumented at the source.
+    #[track_caller]
+    pub fn dbg_poll_state(&mut self) {
+        if !self.dbg.recording { return; }
+        let curr = self.dbg_watched_now();
+        let loc  = std::panic::Location::caller();
+        if let Some(prev) = self.dbg_last_watched.take() {
+            crate::dbg_recorder::diff_watched(&mut self.dbg, &prev, &curr, loc);
+        }
+        self.dbg_last_watched = Some(curr);
+    }
+
+    /// Auto-cadence snapshot — called from the per-frame update hook
+    /// to spot when N events have accumulated since the last snap.
+    /// Pulled out so the call site can attach the right location.
+    #[track_caller]
+    pub fn dbg_maybe_auto_snap(&mut self) {
+        if self.dbg.want_auto_snap() {
+            let undo_d = self.undo_stack.len();
+            let redo_d = self.redo_stack.len();
+            self.dbg.take_snapshot(
+                &self.doc,
+                "auto cadence",
+                undo_d,
+                redo_d,
+                std::panic::Location::caller(),
+            );
+        }
+    }
+
+    /// Discoverable popup for entering the text body after a Text-tool
+    /// click. Without this, body capture happens silently in the cmd
+    /// line and new users can't find it. Positioned near the canvas
+    /// anchor so the dialog reads as "type your text HERE". The cmd-
+    /// line path stays alive in parallel for power users — but only
+    /// when this dialog is closed.
+    fn render_text_input_dialog(&mut self, ctx: &egui::Context) {
+        if !self.text_input_dialog_open { return; }
+        // Auto-select-newest: if "+ New…" armed the count sentinel and
+        // a new style has since been added, pick it. Disarm whether the
+        // count grew or not (Cancel from the style dialog leaves count
+        // unchanged) so we don't keep watching forever.
+        if self.text_input_dialog_style_count_before != usize::MAX
+            && self.text_style_dialog.is_none()
+        {
+            let now = self.doc.text_styles.len();
+            if now > self.text_input_dialog_style_count_before {
+                let new_id = (now - 1) as u32;
+                self.text_input_dialog_style_id = new_id;
+                if let Some(s) = self.doc.text_styles.get(new_id) {
+                    if s.default_height > 1e-9 {
+                        self.text_input_dialog_height = s.default_height;
+                    }
+                }
+            }
+            self.text_input_dialog_style_count_before = usize::MAX;
+        }
+        // Anchor the window near the canvas position the user clicked
+        // — but only on the FIRST frame after open (signaled by the
+        // same `focus` flag that requests TextEdit focus). After that,
+        // the user is free to drag the window anywhere; we don't
+        // override their position every frame.
+        let initial_pos = match (self.text_input_dialog_anchor,
+                                 self.canvas_screen_rect) {
+            (Some(world), Some(rect)) => {
+                let p = self.w2s(world, rect);
+                Some(egui::pos2(p.x + 12.0, p.y + 12.0))
+            }
+            _ => None,
+        };
+        let mut open      = true;
+        let mut do_ok     = false;
+        let mut do_cancel = false;
+        // Snapshot style choices for the combo. We can't borrow
+        // self.doc while the window closure also borrows &mut self —
+        // hand the closure a Vec of (id, name) pairs.
+        let style_choices: Vec<(u32, String)> = self.doc.text_styles.styles
+            .iter().enumerate()
+            .map(|(i, s)| (i as u32, s.name.clone()))
+            .collect();
+        let mut window = egui::Window::new("Enter text")
+            .id(egui::Id::new("text_input_dialog"))
+            .open(&mut open)
+            .resizable(true)
+            .collapsible(false)
+            .movable(true)
+            .default_width(340.0);
+        // Force position only on the just-opened frame so the dialog
+        // appears AT the click anchor. After that we drop .current_pos
+        // and egui remembers the user's drags.
+        if self.text_input_dialog_focus {
+            if let Some(p) = initial_pos {
+                window = window.current_pos(p);
+            }
+        }
+        window.show(ctx, |ui| {
+            ui.label(egui::RichText::new(
+                "Type your text. Enter commits, Esc cancels. Drag the title bar to move.")
+                .small().weak());
+            ui.add_space(6.0);
+            let edit = egui::TextEdit::singleline(&mut self.text_input_dialog_buf)
+                .desired_width(320.0)
+                .hint_text("text...");
+            let resp = ui.add(edit);
+            if self.text_input_dialog_focus {
+                resp.request_focus();
+                self.text_input_dialog_focus = false;
+            }
+            ui.add_space(4.0);
+            // Style picker — pulls from doc.text_styles. Selecting a
+            // style with a non-zero default_height seeds the Height
+            // field below so the dialog reflects the style's choice.
+            // The "+ New…" button opens the standard TextStyleDialog
+            // (the same one the `style` command uses) so the user can
+            // create Title / Dimension / Drawing-Title / etc. without
+            // closing this dialog. After the new style commits, the
+            // combo picks it up automatically next frame.
+            let mut open_new_style = false;
+            ui.horizontal(|ui| {
+                ui.label("Style:");
+                let cur_name = style_choices.iter()
+                    .find(|(i, _)| *i == self.text_input_dialog_style_id)
+                    .map(|(_, n)| n.clone())
+                    .unwrap_or_else(|| "STANDARD".to_string());
+                egui::ComboBox::from_id_salt("text_input_dialog_style")
+                    .selected_text(cur_name)
+                    .show_ui(ui, |ui| {
+                        for (id, name) in &style_choices {
+                            let prev = self.text_input_dialog_style_id;
+                            if ui.selectable_value(
+                                &mut self.text_input_dialog_style_id,
+                                *id, name).changed()
+                                && *id != prev
+                            {
+                                if let Some(s) = self.doc.text_styles.get(*id) {
+                                    if s.default_height > 1e-9 {
+                                        self.text_input_dialog_height = s.default_height;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                if ui.button("+ New…").on_hover_text(
+                    "Create a new text style (name, font, default height). \
+                     The new style will be auto-selected when you save it.")
+                    .clicked()
+                {
+                    open_new_style = true;
+                }
+            });
+            if open_new_style && self.text_style_dialog.is_none() {
+                self.text_style_dialog = Some(TextStyleDialog::new_blank());
+                // Mark the count BEFORE the style dialog runs so that on
+                // a future frame, when count grows, we know which style
+                // was added and can auto-select it.
+                self.text_input_dialog_style_count_before =
+                    self.doc.text_styles.len();
+            }
+            ui.horizontal(|ui| {
+                ui.label("Height:");
+                ui.add(egui::DragValue::new(&mut self.text_input_dialog_height)
+                    .speed(0.05).range(1e-3..=1e6));
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("OK").clicked()     { do_ok = true; }
+                if ui.button("Cancel").clicked() { do_cancel = true; }
+            });
+            if resp.lost_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                do_ok = true;
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                do_cancel = true;
+            }
+        });
+        if !open { do_cancel = true; }
+
+        if do_ok {
+            let body     = self.text_input_dialog_buf.trim().to_string();
+            let anchor   = self.text_input_dialog_anchor;
+            let height   = self.text_input_dialog_height.max(1e-3);
+            let style_id = self.text_input_dialog_style_id;
+            self.text_input_dialog_open = false;
+            self.text_input_dialog_buf.clear();
+            self.text_input_dialog_anchor = None;
+            if body.is_empty() {
+                self.history.push("  text: cancelled (empty body)".into());
+            } else if let Some(pos) = anchor {
+                self.commit_text_at_with_style(pos, &body, height, style_id);
+            }
+            self.text_draft = TextDraftState::Off;
+            self.tool       = Tool::None;
+            self.clear_prompt();
+        } else if do_cancel {
+            self.text_input_dialog_open = false;
+            self.text_input_dialog_buf.clear();
+            self.text_input_dialog_anchor = None;
+            self.text_draft = TextDraftState::Off;
+            self.tool       = Tool::None;
+            self.clear_prompt();
+            self.history.push("  text: cancelled".into());
+        }
+    }
+
+    /// Floating Recorder window. Controls + live counters + buttons
+    /// for Note / Snap-now / Clear / Copy. Inspector / replay UI ships
+    /// in Slice C.
+    fn render_dbg_recorder_window(&mut self, ctx: &egui::Context) {
+        if !self.dbg_window_open { return; }
+        let mut open = self.dbg_window_open;
+        let win = egui::Window::new("🛰 Session Recorder")
+            .open(&mut open)
+            .default_pos(egui::pos2(40.0, 40.0))
+            .default_size(egui::vec2(380.0, 220.0))
+            .resizable(true)
+            .collapsible(true);
+        win.show(ctx, |ui| {
+            let is_recording = self.dbg.recording;
+            ui.horizontal(|ui| {
+                let start_btn = egui::Button::new(
+                    egui::RichText::new("▶ Start")
+                        .strong()
+                        .color(egui::Color32::WHITE))
+                    .fill(if is_recording {
+                        egui::Color32::from_rgb(50, 90, 50)
+                    } else { egui::Color32::from_rgb(40, 130, 50) });
+                if ui.add_enabled(!is_recording, start_btn).clicked() {
+                    self.dbg_start();
+                }
+                let stop_btn = egui::Button::new(
+                    egui::RichText::new("■ Stop")
+                        .strong()
+                        .color(egui::Color32::WHITE))
+                    .fill(if is_recording {
+                        egui::Color32::from_rgb(160, 50, 50)
+                    } else { egui::Color32::from_rgb(80, 50, 50) });
+                if ui.add_enabled(is_recording, stop_btn).clicked() {
+                    self.dbg_stop();
+                }
+                ui.separator();
+                if ui.button("🗑 Clear").clicked() {
+                    self.dbg.clear();
+                    self.history.push("  🛰 recorder cleared".into());
+                }
+                if ui.button("📷 Snap").clicked() {
+                    let undo_d = self.undo_stack.len();
+                    let redo_d = self.redo_stack.len();
+                    self.dbg.take_snapshot(
+                        &self.doc, "manual snap",
+                        undo_d, redo_d,
+                        std::panic::Location::caller());
+                }
+            });
+            ui.add_space(4.0);
+            ui.label(format!(
+                "Status: {}  ·  {} events  ·  {} snapshots",
+                if is_recording { "🔴 RECORDING" } else { "⚪ idle" },
+                self.dbg.events.len(),
+                self.dbg.snapshots.len()));
+            ui.add_space(6.0);
+            ui.separator();
+            ui.label("Annotate (📝 added with current ms):");
+            ui.horizontal(|ui| {
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.dbg_note_buf)
+                        .desired_width(240.0)
+                        .hint_text("bug fired here / picked the wrong dobject / etc."));
+                if (ui.button("Drop note").clicked()
+                    || (resp.lost_focus()
+                        && ctx.input(|i| i.key_pressed(egui::Key::Enter))))
+                    && !self.dbg_note_buf.is_empty()
+                {
+                    let msg = std::mem::take(&mut self.dbg_note_buf);
+                    crate::dbg_event!(self,
+                        crate::dbg_recorder::DbgEvent::Note { message: msg });
+                }
+            });
+            ui.add_space(6.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("📋 Copy timeline").clicked() {
+                    let dump = self.dbg.dump_text();
+                    ctx.copy_text(dump);
+                    self.history.push(
+                        "  🛰 timeline copied to clipboard".into());
+                }
+                ui.checkbox(&mut self.dbg.capture_backtrace,
+                    "Capture backtrace (slow)");
+            });
+            ui.horizontal(|ui| {
+                ui.label("Auto-snap every:");
+                ui.add(egui::DragValue::new(&mut self.dbg.auto_snap_every)
+                    .speed(1.0)
+                    .range(0..=10_000)
+                    .suffix(" events"));
+            });
+        });
+        self.dbg_window_open = open;
+    }
+
     /// Trim Debug floating window — instrumented log of every trim /
     /// extend state transition + canvas click. User pastes the log back
     /// when reporting a bug.
@@ -5402,6 +6986,14 @@ impl CadApp {
                     .unwrap_or_else(|| "dobject".to_string());
                 format!("ACI color — {} #{}", kind, ix)
             }
+            AciPickRequest::DimStyleForm(slot) => {
+                let which = match slot {
+                    DimColorSlot::DimLine => "dim line",
+                    DimColorSlot::ExtLine => "extension lines",
+                    DimColorSlot::Text    => "text",
+                };
+                format!("ACI color — dimension {}", which)
+            }
         };
 
         let mut open = true;
@@ -5518,6 +7110,17 @@ impl CadApp {
                         d.style.color = Color::Aci(aci);
                     }
                     self.gpu_dirty = true;
+                }
+                AciPickRequest::DimStyleForm(slot) => {
+                    // The Dim Style form is restored to `Some` by the time
+                    // this picker render runs (it precedes us each frame).
+                    if let Some(d) = self.dim_style_dialog.as_mut() {
+                        match slot {
+                            DimColorSlot::DimLine => d.color_aci      = Some(aci),
+                            DimColorSlot::ExtLine => d.ext_color_aci  = Some(aci),
+                            DimColorSlot::Text    => d.text_color_aci = Some(aci),
+                        }
+                    }
                 }
             }
             self.aci_pick_request = None;
@@ -5848,6 +7451,8 @@ impl CadApp {
         let (mut nl, mut nc, mut na, mut ne, mut nea, mut npt, mut npl, mut nh, mut nsp) =
             (0, 0, 0, 0, 0, 0, 0, 0, 0);
         let mut nw = 0_usize;
+        let mut ntx = 0_usize;
+        let mut ndim = 0_usize;
         for &i in &self.selection {
             if let Some(d) = self.doc.dobjects.get(i) {
                 match &d.geom {
@@ -5861,13 +7466,15 @@ impl CadApp {
                     Geom::Hatch(_)      => nh  += 1,
                     Geom::Spline(_)     => nsp += 1,
                     Geom::Wall(_)       => nw  += 1,
+                    Geom::Text(_)       => ntx += 1,
+                    Geom::Dimension(_)  => ndim += 1,
                 }
             }
         }
         ui.monospace(format!(
             "  lines: {}\n  circles: {}\n  arcs: {}\n  ellipses: {}\n  \
-             ellipse-arcs: {}\n  points: {}\n  polylines: {}\n  hatches: {}\n  splines: {}\n  walls: {}",
-            nl, nc, na, ne, nea, npt, npl, nh, nsp, nw
+             ellipse-arcs: {}\n  points: {}\n  polylines: {}\n  hatches: {}\n  splines: {}\n  walls: {}\n  texts: {}\n  dims: {}",
+            nl, nc, na, ne, nea, npt, npl, nh, nsp, nw, ntx, ndim
         ));
         ui.add_space(8.0);
 
@@ -6028,7 +7635,9 @@ impl CadApp {
     // roll back. The snapshot stack is bounded (UNDO_STACK_CAP) — oldest
     // snapshots fall off when the stack is full.
 
+    #[track_caller]
     fn snapshot_doc(&mut self) {
+        let t = std::time::Instant::now();
         if self.undo_stack.len() >= UNDO_STACK_CAP {
             self.undo_stack.remove(0);
         }
@@ -6036,9 +7645,29 @@ impl CadApp {
         // A new editing op invalidates the redo branch — once you diverge
         // from the previously-redoable history you can't return to it.
         self.redo_stack.clear();
+        // Recorder — undo snapshot is a major memory event (Document
+        // clone). Capture both the new depth + a rough byte estimate
+        // (per-dobject ~200B is the ballpark for our current variants).
+        let elapsed_us = t.elapsed().as_micros() as u64;
+        let bytes_estimate = self.doc.dobjects.len() * 200
+            + self.doc.layers.len() * 64
+            + self.doc.linetypes.len() * 64;
+        crate::dbg_event!(self,
+            crate::dbg_recorder::DbgEvent::UndoSnapshotTaken {
+                undo_depth_after: self.undo_stack.len(),
+                bytes_estimate,
+            });
+        crate::dbg_event!(self,
+            crate::dbg_recorder::DbgEvent::MemoryEvent {
+                name: "snapshot_doc (Document clone)".into(),
+                bytes: bytes_estimate,
+                elapsed_us,
+            });
     }
 
+    #[track_caller]
     fn do_undo(&mut self) {
+        let from_depth = self.undo_stack.len();
         match self.undo_stack.pop() {
             Some(prev) => {
                 // Stash current state on the redo stack before restoring.
@@ -6052,6 +7681,11 @@ impl CadApp {
                 self.intersections.clear();
                 self.index_dirty = true;
                 self.gpu_dirty = true;
+                crate::dbg_event!(self,
+                    crate::dbg_recorder::DbgEvent::UndoFired {
+                        from_depth,
+                        to_depth: self.undo_stack.len(),
+                    });
                 self.history.push(format!(
                     "  ↶ undo  (undo: {}  redo: {})",
                     self.undo_stack.len(), self.redo_stack.len()
@@ -6061,7 +7695,9 @@ impl CadApp {
         }
     }
 
+    #[track_caller]
     fn do_redo(&mut self) {
+        let from_depth = self.redo_stack.len();
         match self.redo_stack.pop() {
             Some(next) => {
                 // Stash current state back on the undo stack — symmetric.
@@ -6075,6 +7711,11 @@ impl CadApp {
                 self.intersections.clear();
                 self.index_dirty = true;
                 self.gpu_dirty = true;
+                crate::dbg_event!(self,
+                    crate::dbg_recorder::DbgEvent::RedoFired {
+                        from_depth,
+                        to_depth: self.redo_stack.len(),
+                    });
                 self.history.push(format!(
                     "  ↷ redo  (undo: {}  redo: {})",
                     self.undo_stack.len(), self.redo_stack.len()
@@ -6532,7 +8173,10 @@ impl CadApp {
     /// caller uses this to gate cutter-list index patching — patching
     /// when the doc didn't change corrupts the list silently (the bug
     /// the user caught in commit ae54eef's debug log).
+    #[track_caller]
     fn apply_trim_pick(&mut self, cutters: &[usize], target_idx: usize, pick: Vec2) -> bool {
+        let before_dobj_count = self.doc.dobjects.len();
+        let _trim_pick_dbg = (cutters.to_vec(), target_idx, pick);
         // Snapshot ONCE per click so undo rolls back this single trim.
         self.snapshot_doc();
         let edge_mode = self.env.EdgMod;
@@ -6572,6 +8216,16 @@ impl CadApp {
                 self.intersections.clear();
                 self.index_dirty = true;
                 self.gpu_dirty = true;
+                crate::dbg_event!(self,
+                    crate::dbg_recorder::DbgEvent::ApplyOp {
+                        name: "apply_trim_pick".into(),
+                        before_dobj_count,
+                        after_dobj_count: self.doc.dobjects.len(),
+                        success: true,
+                        detail: format!(
+                            "target #{}, cutters={:?}, pick=({:.3},{:.3}), n_pieces={}, EdgMod={}",
+                            target_idx, cutters, pick.x, pick.y, n_pieces, edge_mode),
+                    });
                 true
             }
             Err(msg) => {
@@ -6592,11 +8246,23 @@ impl CadApp {
                     Some(Geom::Hatch(_))      => "Hatch",
                     Some(Geom::Spline(_))     => "Spline",
                     Some(Geom::Wall(_))       => "Wall",
+                    Some(Geom::Text(_))       => "Text",
+                    Some(Geom::Dimension(_))  => "Dimension",
                     None                      => "<gone>",
                 };
                 self.history.push(format!("  ! trim #{}: {}", target_idx, msg));
                 self.trim_dbg(format!(
                     "  ! trim_at Err on #{} ({}): {}", target_idx, kind, msg));
+                crate::dbg_event!(self,
+                    crate::dbg_recorder::DbgEvent::ApplyOp {
+                        name: "apply_trim_pick".into(),
+                        before_dobj_count,
+                        after_dobj_count: self.doc.dobjects.len(),
+                        success: false,
+                        detail: format!(
+                            "target #{} ({}) Err: {}",
+                            target_idx, kind, msg),
+                    });
                 false
             }
         }
@@ -6989,9 +8655,151 @@ impl CadApp {
         self.gpu_dirty = true;
     }
 
+    /// Commit a Text dobject at `pos` with the given string + height.
+    /// Defaults: angle=0, h_align=Left, v_align=Baseline, style=STANDARD.
+    fn commit_text_at(&mut self, pos: Vec2, string: &str, height: f64) {
+        self.commit_text_at_with_style(
+            pos, string, height, cad_kernel::TextStyleTable::STANDARD);
+    }
+
+    /// Smart-dim click handler. Drives the 2- or 3-click flow
+    /// based on `self.dim_draft`.
+    ///
+    ///   1. `WaitingForP1` + click on Circle/Arc → Radius (jumps to
+    ///                                              WaitingForDimLinePos)
+    ///   1. `WaitingForP1` + click on empty/other → store as p1,
+    ///                                              transition to
+    ///                                              WaitingForP2
+    ///   2. `WaitingForP2 { p1 }` → store as p2, ortho = Aligned,
+    ///                              transition to WaitingForDimLinePos
+    ///   3. `WaitingForDimLinePos { kind }` → fill leader/dimline pos,
+    ///                                        commit Dimension, exit
+    ///
+    /// Ortho selection (Linear): auto-detected from the dimline_pos
+    /// click — if the perpendicular offset from p1→p2 is mostly Y,
+    /// the dim line is HORIZONTAL (measures Δx); mostly X →
+    /// VERTICAL (measures Δy); ALIGNED is the fallback when the click
+    /// sits closer to the chord-perp than to either axis. v1: just
+    /// always use Aligned and let the user re-pick via grips later.
+    fn handle_dim_click(&mut self, click: Vec2) {
+        use cad_kernel::{Dim, DimKind, LinearOrtho};
+        let tol = (self.env.PkBxSz.max(8) as f64) / (self.scale as f64).max(1e-6);
+        match self.dim_draft.clone() {
+            DimDraftState::Off => {
+                // Defensive — shouldn't reach here unless Tool::Dim
+                // got armed without the command. Reset.
+                self.tool = Tool::None;
+            }
+            DimDraftState::WaitingForP1 => {
+                // Check the click against existing dobjects. If it
+                // hits a Circle or Arc, jump straight to Radius
+                // drafting; otherwise treat the click as P1 of a
+                // linear dim.
+                let hit_circ = self.nearest_entity_under(click, tol)
+                    .and_then(|i| self.doc.dobjects.get(i))
+                    .and_then(|d| match &d.geom {
+                        Geom::Circle(c) => Some((c.center,
+                            c.center + (click - c.center).normalized() * c.radius)),
+                        Geom::Arc(a) => Some((a.center,
+                            a.center + (click - a.center).normalized() * a.radius)),
+                        _ => None,
+                    });
+                if let Some((center, on_circle)) = hit_circ {
+                    self.dim_draft = DimDraftState::WaitingForDimLinePos {
+                        kind: DimDraftKind::Radius { center, on_circle },
+                    };
+                    self.set_prompt(
+                        "dim: click leader position  (D toggles to Diameter, Esc cancels)"
+                        .to_string());
+                } else {
+                    self.dim_draft = DimDraftState::WaitingForP2 { p1: click };
+                    self.set_prompt(
+                        "dim: click second point  [Esc cancels]".to_string());
+                }
+            }
+            DimDraftState::WaitingForP2 { p1 } => {
+                self.dim_draft = DimDraftState::WaitingForDimLinePos {
+                    kind: DimDraftKind::Linear {
+                        p1, p2: click, ortho: LinearOrtho::Aligned,
+                    },
+                };
+                self.set_prompt(
+                    "dim: click dim line position  [Esc cancels]".to_string());
+            }
+            DimDraftState::WaitingForDimLinePos { kind } => {
+                let dim_kind = match kind {
+                    DimDraftKind::Linear { p1, p2, ortho } => DimKind::Linear {
+                        p1, p2, dimline_pos: click, ortho,
+                    },
+                    DimDraftKind::Radius { center, on_circle } => DimKind::Radius {
+                        center, on_circle, leader_end: click,
+                    },
+                    DimDraftKind::Diameter { center, on_circle } => DimKind::Diameter {
+                        center, on_circle, leader_end: click,
+                    },
+                };
+                self.add_dobject(
+                    Geom::Dimension(Dim {
+                        kind: dim_kind,
+                        style: self.current_dim_style,
+                        text_override: None,
+                    }),
+                    "canvas");
+                self.dim_draft = DimDraftState::Off;
+                self.tool = Tool::None;
+                self.clear_prompt();
+            }
+        }
+    }
+
+    fn commit_text_at_with_style(
+        &mut self, pos: Vec2, string: &str, height: f64, style_id: u32,
+    ) {
+        if string.is_empty() {
+            self.history.push("  ! text: empty string skipped".into());
+            return;
+        }
+        if height <= 1e-9 {
+            self.history.push(
+                "  ! text: non-positive height (set TxHt)".into());
+            return;
+        }
+        // Clamp style id to the table — guard against stale dialog ids
+        // after a style was deleted between open + commit.
+        let style = if (style_id as usize) < self.doc.text_styles.len() {
+            style_id
+        } else {
+            cad_kernel::TextStyleTable::STANDARD
+        };
+        self.add_dobject(
+            Geom::Text(cad_kernel::Text {
+                position: pos,
+                height,
+                angle:   0.0,
+                text:    string.into(),
+                h_align: cad_kernel::TextHAlign::Left,
+                v_align: cad_kernel::TextVAlign::Baseline,
+                style,
+            }),
+            "canvas");
+        self.history.push(format!(
+            "  + text: \"{}\" @ ({:.3},{:.3}) h={}",
+            string, pos.x, pos.y, height));
+        self.clear_prompt();
+    }
+
+    #[track_caller]
     fn add_dobject(&mut self, geom: Geom, origin: &str) {
         let d = describe(&geom);
+        let kind = dobject_kind_name(&geom).to_string();
         let i = self.doc.push(DObject::new(geom));
+        let handle = self.doc.dobjects[i].handle;
+        crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::DocPush {
+            index:     i,
+            geom_kind: kind,
+            handle,
+            summary:   format!("{}  [{}]", d, origin),
+        });
         self.history.push(format!(
             "  + #{} {}  [{}]", i, d, origin
         ));
@@ -7362,7 +9170,7 @@ impl CadApp {
         if let StretchState::WaitingForDest(_, _, base) = self.stretch_state { return Some(base); }
         // Polyline / Line / Arc draw tools: the last captured point is
         // the ortho anchor for the next click.
-        if matches!(self.tool, Tool::Line | Tool::Polyline | Tool::Spline | Tool::Arc | Tool::Ellipse | Tool::EllipseArc | Tool::Wall) {
+        if matches!(self.tool, Tool::Line | Tool::Polyline | Tool::Spline | Tool::Arc | Tool::Ellipse | Tool::EllipseArc | Tool::Wall | Tool::Text) {
             if let Some(p) = self.pending.last().copied() { return Some(p); }
         }
         None
@@ -7486,6 +9294,40 @@ impl CadApp {
                         "canvas");
                     self.history.push(format!(
                         "  + wall: thickness={}", thk));
+                }
+            }
+            (Tool::Text, 1) => {
+                // Position captured. If `pending_text` is set, commit
+                // Text immediately. Otherwise enter WaitingForString —
+                // the next cmd-line input is consumed as the body.
+                let pos = self.pending[0];
+                self.pending.clear();
+                let height = self.env.TxHt;
+                if let Some(string) = self.pending_text.take() {
+                    self.commit_text_at(pos, &string, height);
+                    self.text_draft = TextDraftState::Off;
+                    self.tool = Tool::None;
+                } else {
+                    self.text_draft = TextDraftState::WaitingForString(pos);
+                    // Open the discoverable popup dialog at the anchor.
+                    // Cmd-line capture (set_prompt below) is kept as a
+                    // secondary path for power users who close the
+                    // dialog and type into the cmd line instead.
+                    self.text_input_dialog_open   = true;
+                    self.text_input_dialog_buf.clear();
+                    self.text_input_dialog_anchor = Some(pos);
+                    self.text_input_dialog_focus  = true;
+                    self.text_input_dialog_height = height;
+                    // Seed style from the last selection (sticky across
+                    // texts); fall back to STANDARD if it's been deleted.
+                    if (self.text_input_dialog_style_id as usize)
+                        >= self.doc.text_styles.len()
+                    {
+                        self.text_input_dialog_style_id =
+                            cad_kernel::TextStyleTable::STANDARD;
+                    }
+                    self.set_prompt(
+                        "text: type in popup or cmd line, Enter to commit  [Esc cancels]".to_string());
                 }
             }
             (Tool::Point, 1) => {
@@ -8351,6 +10193,8 @@ fn dobject_kind_name(g: &Geom) -> &'static str {
         Geom::Hatch(_)      => "Hatch",
         Geom::Spline(_)     => "Spline",
         Geom::Wall(_)       => "Wall",
+        Geom::Text(_)       => "Text",
+        Geom::Dimension(_)  => "Dimension",
     }
 }
 
@@ -8406,6 +10250,23 @@ fn describe(g: &Geom) -> String {
             "wall ({:.2},{:.2}) → ({:.2},{:.2}) thk={:.3} len={:.3}",
             w.start.x, w.start.y, w.end.x, w.end.y, w.thickness, w.length()
         ),
+        Geom::Text(t) => format!(
+            "text \"{}\" @ ({:.2},{:.2}) h={:.3}",
+            t.text, t.position.x, t.position.y, t.height
+        ),
+        Geom::Dimension(d) => {
+            use cad_kernel::DimKind;
+            let kind_name = match &d.kind {
+                DimKind::Linear { ortho, .. } => match ortho {
+                    cad_kernel::LinearOrtho::Horizontal => "dim h",
+                    cad_kernel::LinearOrtho::Vertical   => "dim v",
+                    cad_kernel::LinearOrtho::Aligned    => "dim aligned",
+                },
+                DimKind::Radius { .. }   => "dim radius",
+                DimKind::Diameter { .. } => "dim diameter",
+            };
+            format!("{} = {:.3} style={}", kind_name, d.measured_value(), d.style)
+        }
     }
 }
 
@@ -8564,6 +10425,51 @@ fn list_full_details(g: &Geom) -> Vec<String> {
             out.push(format!("length         : {:.6}", len));
             out.push(format!("thickness      : {:.6}", w.thickness));
         }
+        Geom::Text(t) => {
+            out.push(format!("type           : text"));
+            out.push(format!("string         : \"{}\"", t.text));
+            out.push(format!("position       : ({:.4}, {:.4})",
+                t.position.x, t.position.y));
+            out.push(format!("height         : {:.6}", t.height));
+            out.push(format!("angle          : {:+.4}°", t.angle.to_degrees()));
+            out.push(format!("h_align        : {:?}", t.h_align));
+            out.push(format!("v_align        : {:?}", t.v_align));
+            out.push(format!("style id       : {}", t.style));
+        }
+        Geom::Dimension(d) => {
+            use cad_kernel::DimKind;
+            out.push(format!("type           : dimension"));
+            match &d.kind {
+                DimKind::Linear { p1, p2, dimline_pos, ortho } => {
+                    out.push(format!("kind           : linear ({:?})", ortho));
+                    out.push(format!("p1             : ({:.4}, {:.4})", p1.x, p1.y));
+                    out.push(format!("p2             : ({:.4}, {:.4})", p2.x, p2.y));
+                    out.push(format!("dimline_pos    : ({:.4}, {:.4})",
+                        dimline_pos.x, dimline_pos.y));
+                }
+                DimKind::Radius { center, on_circle, leader_end } => {
+                    out.push(format!("kind           : radius"));
+                    out.push(format!("center         : ({:.4}, {:.4})", center.x, center.y));
+                    out.push(format!("on_circle      : ({:.4}, {:.4})",
+                        on_circle.x, on_circle.y));
+                    out.push(format!("leader_end     : ({:.4}, {:.4})",
+                        leader_end.x, leader_end.y));
+                }
+                DimKind::Diameter { center, on_circle, leader_end } => {
+                    out.push(format!("kind           : diameter"));
+                    out.push(format!("center         : ({:.4}, {:.4})", center.x, center.y));
+                    out.push(format!("on_circle      : ({:.4}, {:.4})",
+                        on_circle.x, on_circle.y));
+                    out.push(format!("leader_end     : ({:.4}, {:.4})",
+                        leader_end.x, leader_end.y));
+                }
+            }
+            out.push(format!("measured value : {:.6}", d.measured_value()));
+            out.push(format!("style id       : {}", d.style));
+            if let Some(s) = &d.text_override {
+                out.push(format!("text override  : \"{}\"", s));
+            }
+        }
     }
     out
 }
@@ -8648,6 +10554,14 @@ fn describe_verbose(g: &Geom) -> String {
         Geom::Wall(w) => format!(
             "wall  start=({:.3},{:.3})  end=({:.3},{:.3})  thk={:.3}  len={:.3}",
             w.start.x, w.start.y, w.end.x, w.end.y, w.thickness, w.length(),
+        ),
+        Geom::Text(t) => format!(
+            "text  pos=({:.3},{:.3})  h={:.3}  ang={:+.2}°  \"{}\"",
+            t.position.x, t.position.y, t.height, t.angle.to_degrees(), t.text,
+        ),
+        Geom::Dimension(d) => format!(
+            "dimension  measured={:.4}  style=#{}  override={:?}",
+            d.measured_value(), d.style, d.text_override,
         ),
     }
 }
@@ -9204,6 +11118,39 @@ fn tool_button(ui: &mut egui::Ui, current: &mut Tool, this: Tool, label: &str) -
             dot(c + egui::vec2(-14.0, 0.0));
             dot(c + egui::vec2( 14.0, 0.0));
         }
+        Tool::Text => {
+            // Big "A" — universal text icon. Built from 3 line strokes
+            // so it scales with the toolbar text pen.
+            painter.line_segment(
+                [c + egui::vec2(-8.0,  8.0), c + egui::vec2( 0.0, -10.0)], pen);
+            painter.line_segment(
+                [c + egui::vec2( 0.0, -10.0), c + egui::vec2( 8.0,  8.0)], pen);
+            painter.line_segment(
+                [c + egui::vec2(-5.0,  2.0), c + egui::vec2( 5.0,  2.0)], pen);
+            dot(c + egui::vec2(0.0, 10.0));   // baseline anchor hint
+        }
+        Tool::Dim => {
+            // Horizontal dim line with two arrows + two extension lines.
+            // Compact CAD-icon language for "dimension".
+            // Dim line
+            painter.line_segment(
+                [c + egui::vec2(-10.0, 0.0), c + egui::vec2(10.0, 0.0)], pen);
+            // Left arrowhead
+            painter.line_segment(
+                [c + egui::vec2(-10.0, 0.0), c + egui::vec2(-6.0, -3.0)], pen);
+            painter.line_segment(
+                [c + egui::vec2(-10.0, 0.0), c + egui::vec2(-6.0,  3.0)], pen);
+            // Right arrowhead
+            painter.line_segment(
+                [c + egui::vec2( 10.0, 0.0), c + egui::vec2( 6.0, -3.0)], pen);
+            painter.line_segment(
+                [c + egui::vec2( 10.0, 0.0), c + egui::vec2( 6.0,  3.0)], pen);
+            // Two extension lines
+            painter.line_segment(
+                [c + egui::vec2(-10.0, 8.0), c + egui::vec2(-10.0, -3.0)], pen);
+            painter.line_segment(
+                [c + egui::vec2( 10.0, 8.0), c + egui::vec2( 10.0, -3.0)], pen);
+        }
     }
 
     painter.text(
@@ -9668,9 +11615,20 @@ impl eframe::App for CadApp {
                 self.chamfer_dist_wait = ChamferDistWait::Off;
                 self.history.push("  chamfer cancelled".into());
             }
+            if self.dim_draft != DimDraftState::Off {
+                self.dim_draft = DimDraftState::Off;
+                self.history.push("  dim cancelled".into());
+            }
             if self.grip_drag.is_some() {
                 self.grip_drag = None;
                 self.history.push("  grip drag cancelled".into());
+            }
+            if self.text_draft != TextDraftState::Off {
+                self.text_draft   = TextDraftState::Off;
+                self.pending_text = None;
+                self.text_waiting_height = false;
+                self.tool = Tool::None;
+                self.history.push("  text cancelled".into());
             }
             if self.stretch_state != StretchState::Off {
                 self.stretch_state = StretchState::Off;
@@ -9712,11 +11670,19 @@ impl eframe::App for CadApp {
         let enter_now  = ctx.input(|i| i.key_pressed(egui::Key::Enter));
         let space_now  = ctx.input(|i| i.key_pressed(egui::Key::Space));
         let cmd_is_empty = self.cmd.trim().is_empty();
+        // Same gate as the cmd-line space-submit: while typing a text
+        // body (or entering text height), Space is a LITERAL space —
+        // never Enter. Without this gate, the empty-cmd Space trigger
+        // would cancel the draft on the very first space character.
+        let in_text_body = matches!(self.text_draft,
+            TextDraftState::WaitingForString(_))
+            || self.text_waiting_height;
         // Item 4 — Space on a truly empty cmd line acts like Enter for the
         // repeat-last + 2-stage cancel logic below. We let the TextEdit
         // also see the space (harmless: cmd stays "trim-empty"), then
         // strip any leading whitespace at the end of this block.
-        let trigger = enter_now || (space_now && cmd_is_empty);
+        let trigger = enter_now
+            || (space_now && cmd_is_empty && !in_text_body);
         // Persistent hatch pick-point — Enter ends the session.
         // Sits at the top of the cascade so it consumes Enter before
         // any of the other handlers (which might re-run the last
@@ -9811,6 +11777,31 @@ impl eframe::App for CadApp {
             // box stays empty.
             if space_now { self.cmd.clear(); }
         }
+        // Dim sub-option: typing `D` (or `dia`/`diameter`) during a
+        // Radius draft flips the kind to Diameter (and vice versa with
+        // `R`/`rad`/`radius`). Lets the user switch sub-kind on the
+        // fly without restarting the command. Eaten before the main
+        // parser so it doesn't collide with the global `dim` keyword.
+        if self.tool == Tool::Dim && enter_now && !cmd_is_empty {
+            if let DimDraftState::WaitingForDimLinePos { kind } = self.dim_draft.clone() {
+                let t = self.cmd.trim().to_ascii_lowercase();
+                let flip_to_dia = matches!(t.as_str(), "d" | "dia" | "diameter");
+                let flip_to_rad = matches!(t.as_str(), "r" | "rad" | "radius");
+                let new_kind = match (&kind, flip_to_dia, flip_to_rad) {
+                    (DimDraftKind::Radius { center, on_circle }, true, _) =>
+                        Some(DimDraftKind::Diameter { center: *center, on_circle: *on_circle }),
+                    (DimDraftKind::Diameter { center, on_circle }, _, true) =>
+                        Some(DimDraftKind::Radius { center: *center, on_circle: *on_circle }),
+                    _ => None,
+                };
+                if let Some(k) = new_kind {
+                    self.dim_draft = DimDraftState::WaitingForDimLinePos { kind: k };
+                    self.cmd.clear();
+                    self.history.push("  dim: kind toggled".into());
+                }
+            }
+        }
+
         // Polyline `c`/`close` then Enter — handled separately because
         // it consumes a non-empty cmd line, so it doesn't collide with
         // the empty-Enter cascade above.
@@ -9991,6 +11982,29 @@ impl eframe::App for CadApp {
                         ui.close_menu();
                     }
                 });
+                ui.menu_button("Dimension", |ui| {
+                    // Smart dim auto-decides Linear / Radius / Diameter
+                    // from what the first click hits (single `dim`
+                    // command — no separate dimlinear/dimradius words).
+                    if ui.button("Dimension  (smart: linear · radius · diameter)")
+                        .on_hover_text(
+                            "Click a defining point for a linear dim, or a \
+                             circle/arc for radius (press D for diameter)")
+                        .clicked()
+                    {
+                        self.run_command("dim");
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Dimension Style…")
+                        .on_hover_text("Add or edit a dimension style \
+                                        (arrow size, text height, decimals, color)")
+                        .clicked()
+                    {
+                        self.run_command("dimstyle");
+                        ui.close_menu();
+                    }
+                });
                 ui.menu_button("Tools", |ui| {
                     ui.label(egui::RichText::new("Palettes").small().color(
                         egui::Color32::from_rgb(150, 165, 185)));
@@ -10007,6 +12021,23 @@ impl eframe::App for CadApp {
                     if ui.button("Toggle Grips").clicked() {
                         self.env.GrpEnb = !self.env.GrpEnb;
                         let _ = self.env.save();
+                        ui.close_menu();
+                    }
+                    if ui.button("Text Style…").clicked() {
+                        crate::dbg_event!(self,
+                            crate::dbg_recorder::DbgEvent::MenuClick {
+                                path: "Tools → Text Style…".into() });
+                        self.run_command("style");
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.checkbox(&mut self.dbg_window_open,
+                        "🛰 Session Recorder").clicked() {
+                        crate::dbg_event!(self,
+                            crate::dbg_recorder::DbgEvent::MenuClick {
+                                path: format!(
+                                    "Tools → 🛰 Session Recorder ({})",
+                                    if self.dbg_window_open { "open" } else { "close" }) });
                         ui.close_menu();
                     }
                     ui.separator();
@@ -10117,6 +12148,8 @@ impl eframe::App for CadApp {
                 tool_button(ui, &mut self.tool, Tool::Polyline, "pline");
                 tool_button(ui, &mut self.tool, Tool::Spline,   "spline");
                 tool_button(ui, &mut self.tool, Tool::Wall,     "wall");
+                tool_button(ui, &mut self.tool, Tool::Text,     "text");
+                tool_button(ui, &mut self.tool, Tool::Dim,      "dim");
                 // Three quick-access buttons for the functional arc methods.
                 let prev_method = self.arc_method;
                 arc_tool_button(ui, &mut self.tool, &mut self.arc_method,
@@ -10133,6 +12166,17 @@ impl eframe::App for CadApp {
                 }
                 if self.tool != prev || self.arc_method != prev_method {
                     self.pending.clear();
+                }
+                // The Dim toolbar button only flips `self.tool`; route
+                // entry through the `dim` command so the draft state +
+                // prompt get set up exactly as if it were typed. Leaving
+                // Dim for another tool clears the lingering draft.
+                if self.tool != prev {
+                    if self.tool == Tool::Dim {
+                        self.run_command("dim");
+                    } else if prev == Tool::Dim {
+                        self.dim_draft = DimDraftState::Off;
+                    }
                 }
                 ui.add_space(20.0);
                 // ---- User-facing panel toggles ---------------------------
@@ -10189,6 +12233,16 @@ impl eframe::App for CadApp {
                     Tool::Arc     => (format!("DRAWING ARC ({})",
                         self.arc_method.name()), green),
                     Tool::Wall    => (format!("DRAWING WALL (thickness={})", self.env.WlThk), green),
+                    Tool::Text    => (format!("PLACING TEXT (height={})", self.env.TxHt), green),
+                    Tool::Dim     => {
+                        let phase = match &self.dim_draft {
+                            DimDraftState::Off => "idle",
+                            DimDraftState::WaitingForP1 => "click first point",
+                            DimDraftState::WaitingForP2 { .. } => "click second point",
+                            DimDraftState::WaitingForDimLinePos { .. } => "click dim line / leader position",
+                        };
+                        (format!("DRAWING DIMENSION — {}", phase), green)
+                    }
                 };
                 ui.colored_label(color, egui::RichText::new(label_s)
                     .monospace().size(14.0).strong());
@@ -10691,6 +12745,23 @@ impl eframe::App for CadApp {
         // Modal-ish (resizable=false, collapsible=false), opens when
         // bare `hatch` is typed; closes on OK / Cancel / X.
         self.render_hatch_dialog(ctx);
+        self.render_text_style_dialog(ctx);
+        self.render_dim_style_manager(ctx);
+        self.render_dim_style_dialog(ctx);
+        self.render_text_input_dialog(ctx);
+        self.render_dbg_recorder_window(ctx);
+        // FRAME-END STATE POLL — capture every transition that wasn't
+        // explicitly wired. Tools, state machines, window open/close,
+        // SYSVAR flips, undo depth — all get StateChange/ToolChange/
+        // WindowToggle events automatically. Agent-inspector behaviour.
+        // Promote any pending GestureClassification — the click
+        // handlers in the canvas update have now had their turn, so
+        // we can read the resulting selection/state delta + classify.
+        self.dbg_emit_pending_gesture();
+        self.dbg_poll_state();
+        // Auto-cadence doc snapshot — fires AFTER the per-frame UI
+        // has had its turn so any mutations are already recorded.
+        self.dbg_maybe_auto_snap();
         self.render_hatch_confirm_panel(ctx);
 
         // ---- floating: Hatch Debug Log (instrumentation) ---------------
@@ -11019,8 +13090,18 @@ impl eframe::App for CadApp {
                     // prompt (the AutoCAD interaction model).
                     let space_pressed = text_resp.has_focus()
                         && ui.input(|i| i.key_pressed(egui::Key::Space));
+                    // CRITICAL: while typing a text body, Space is a
+                    // literal space character — NOT a submit. Otherwise
+                    // "Hello world" gets committed as "Hello" on the
+                    // first space, and Backspace can't recover it
+                    // (commit already happened). Same gate applies to
+                    // the height-entry sub-state.
+                    let in_text_body = matches!(self.text_draft,
+                        TextDraftState::WaitingForString(_))
+                        || self.text_waiting_height;
                     let submit_via_space = space_pressed
-                        && !self.cmd.trim_end_matches(' ').is_empty();
+                        && !self.cmd.trim_end_matches(' ').is_empty()
+                        && !in_text_body;
                     if submit_via_space {
                         // Strip the trailing space the TextEdit already
                         // appended to self.cmd before we got control.
@@ -11242,17 +13323,133 @@ impl eframe::App for CadApp {
             // ends a drag — including a "click" that egui saw as a tiny drag.
             let click_now    = resp.clicked();
             let drag_stopped = resp.drag_stopped();
+            // SESSION RECORDER — every mouse press/release with the
+            // FULL gesture context. Press position is stashed on self
+            // and re-read at release time to derive the real drag
+            // distance + emit a GestureClassification event with both
+            // egui's classification AND the app's outcome.
+            {
+                let primary_press = ctx.input(|i|
+                    i.pointer.button_pressed(egui::PointerButton::Primary));
+                let secondary_press = ctx.input(|i|
+                    i.pointer.button_pressed(egui::PointerButton::Secondary));
+                let primary_release = ctx.input(|i|
+                    i.pointer.button_released(egui::PointerButton::Primary));
+                let secondary_release = ctx.input(|i|
+                    i.pointer.button_released(egui::PointerButton::Secondary));
+                if primary_press || secondary_press {
+                    if let Some(pos) = resp.hover_pos() {
+                        if rect.contains(pos) {
+                            let world = self.s2w(pos, rect);
+                            let tol = 10.0 / self.scale as f64;
+                            let hit = self.nearest_entity_under(world, tol);
+                            self.dbg_press_pos = Some((pos.x, pos.y, world));
+                            self.dbg_press_hit = hit;
+                            self.dbg_press_sel = self.selection.clone();
+                            let button = if primary_press { "Primary" } else { "Secondary" };
+                            crate::dbg_event!(self,
+                                crate::dbg_recorder::DbgEvent::CanvasPress {
+                                    screen: (pos.x, pos.y),
+                                    world,
+                                    button: button.to_string(),
+                                });
+                        }
+                    }
+                }
+                if primary_release || secondary_release {
+                    if let Some(pos) = resp.hover_pos() {
+                        if rect.contains(pos) {
+                            let world_r = self.s2w(pos, rect);
+                            let button = if primary_release { "Primary" } else { "Secondary" };
+                            // Pull from self — the press handler above
+                            // already stashed it.
+                            let (press_screen, press_world) = self.dbg_press_pos
+                                .map(|(sx, sy, w)| ((sx, sy), w))
+                                .unwrap_or(((pos.x, pos.y), world_r));
+                            let dx = pos.x - press_screen.0;
+                            let dy = pos.y - press_screen.1;
+                            let dist = (dx*dx + dy*dy).sqrt();
+                            crate::dbg_event!(self,
+                                crate::dbg_recorder::DbgEvent::CanvasRelease {
+                                    screen:  (pos.x, pos.y),
+                                    world:   world_r,
+                                    button:  button.to_string(),
+                                    drag_px: dist,
+                                });
+                            // Cache the values we need for the after-
+                            // app-handler GestureClassification event.
+                            // We can't emit it here because the click
+                            // handlers below haven't run yet — the
+                            // outcome (click_select / window_first /
+                            // add_window_selection / NOOP) is unknown.
+                            // Emit at the end of the canvas update block.
+                            self.dbg_pending_gesture = Some(PendingGesture {
+                                press_screen,
+                                release_screen: (pos.x, pos.y),
+                                press_world,
+                                release_world:  world_r,
+                                motion_px:      dist,
+                                hit_at_press:   self.dbg_press_hit,
+                                selection_before: std::mem::take(&mut self.dbg_press_sel),
+                            });
+                            self.dbg_press_pos = None;
+                        }
+                    }
+                }
+            }
+            // Capture every drag release with full direction info.
+            // The drag classifier below uses the same points; we just
+            // dump them to the recorder too so the timeline shows
+            // "drag (L→R), 142 px, primary button".
+            if drag_stopped {
+                if let (Some(p), Some(r)) = (
+                    ctx.input(|i| i.pointer.press_origin()),
+                    resp.interact_pointer_pos(),
+                ) {
+                    let p_w = self.s2w(p, rect);
+                    let r_w = self.s2w(r, rect);
+                    let dx = r.x - p.x;
+                    let dy = r.y - p.y;
+                    let dist = (dx*dx + dy*dy).sqrt();
+                    let dir_h = if dx > 0.5 { "L→R" }
+                              else if dx < -0.5 { "R→L" }
+                              else { "vertical" };
+                    let dir_v = if dy > 0.5 { "↓" }
+                              else if dy < -0.5 { "↑" }
+                              else { "horizontal" };
+                    let primary = ctx.input(|i|
+                        i.pointer.button_down(egui::PointerButton::Primary)
+                        || i.pointer.button_clicked(egui::PointerButton::Primary));
+                    let button = if primary { "Primary" } else { "Secondary" };
+                    crate::dbg_event!(self,
+                        crate::dbg_recorder::DbgEvent::CanvasDrag {
+                            from_screen: (p.x, p.y),
+                            to_screen:   (r.x, r.y),
+                            from_world:  p_w,
+                            to_world:    r_w,
+                            button:      format!("{} ({} {} {:.1}px)",
+                                button, dir_h, dir_v, dist),
+                        });
+                }
+            }
             // Unified click/drag classifier:
             //   1. select mode is active → DRAG is the rubber-band window
-            //   2. Shift held during press → DRAG is an ad-hoc window
-            //   3. anything else → press-release is ALWAYS a click
+            //   2. pointer-mode-idle → DRAG is the rubber-band window
+            //   3. Shift held during press → DRAG is an ad-hoc window
+            //   4. anything else → press-release is ALWAYS a click
             // The 5-px motion heuristic is gone — egui's idea of "this was
             // a tiny drag" doesn't get a vote.
+            //
+            // Read press position from self.press_pos (stashed at press
+            // time), NOT from egui's press_origin() — egui clears that
+            // by the time drag_stopped() fires on the release frame, so
+            // press_release_dist would always read 0 and the classifier
+            // would silently demote every drag to a click.
             let press_release_dist = match (
-                ctx.input(|i| i.pointer.press_origin()),
+                self.press_pos,
                 resp.interact_pointer_pos(),
             ) {
-                (Some(p), Some(r)) => (r - p).length(),
+                (Some((p, _)), Some(r)) => (r - p).length(),
                 _ => 0.0,
             };
             let shift_held = ctx.input(|i| i.modifiers.shift);
@@ -11272,12 +13469,25 @@ impl eframe::App for CadApp {
             let hold_thresh_secs = (self.env.SelDmTm as f64) / 1000.0;
             let press_held_secs = self.press_time.map(|t0| now - t0).unwrap_or(0.0);
             let hold_threshold_passed = press_held_secs >= hold_thresh_secs;
-            // Now update press_time for next frame.
+            // Now update press_time + press_pos for next frame. press_pos
+            // is our own copy of the press position, kept because
+            // egui::Pointer::press_origin() is cleared by drag_stopped()
+            // and the classifier above needs it on the release frame.
+            //
+            // Order matters: capture the snapshot BEFORE the release
+            // handler clears self.press_pos, so the window-drag handler
+            // and the rubber-band preview further down can still read it.
+            let press_pos_this_frame = self.press_pos;
             if ctx.input(|i| i.pointer.primary_pressed()) && resp.contains_pointer() {
                 self.press_time = Some(now);
+                if let Some(pos) = resp.hover_pos() {
+                    let world = self.s2w(pos, rect);
+                    self.press_pos = Some((pos, world));
+                }
             }
             if ctx.input(|i| i.pointer.primary_released()) {
                 self.press_time = None;
+                self.press_pos  = None;
             }
             let in_click_only_phase =
                 self.tool != Tool::None
@@ -11301,16 +13511,25 @@ impl eframe::App for CadApp {
                 || self.dist_state       != DistState::Off
                 || self.picking_source
                 || self.intersect_pending_click;
-            // Drag is the rubber-band window only when (a) we're in
-            // select mode, or (b) the user explicitly held Shift to
-            // request a window drag. Edit phases (trim/draw/move/…)
-            // keep the "always click" semantic too.
+            // Pointer mode (Tool::None, no edit phase, no active select
+            // session) is the always-on selection tool per
+            // feedback_rust_cad_pointer_is_selector — a drag on the bare
+            // canvas should rubber-band the same as if a SelectMode were
+            // active. Without this, naked-canvas drags get demoted to
+            // clicks and the user's window-selection intent is lost.
+            // This var also gets reused by the grip-drag handler below.
+            let pointer_mode_idle = !in_click_only_phase && !in_select;
+            // Drag is the rubber-band window when (a) we're in select
+            // mode, (b) we're in pointer-mode-idle (the always-on
+            // selector), or (c) the user held Shift to request a
+            // window drag. Edit phases (trim/draw/move/…) keep the
+            // "always click" semantic.
             //
             // Time-gated activation: the press must have been held
             // longer than env.SelDmTm (default 250 ms) before a drag
             // counts as a window. A fast accidental drag during a
             // click = still a click. The rubber-band preview honors
-            // the same gate (see ~10333). Reference:
+            // the same gate. Reference:
             // feedback_rust_cad_universal_selection_model.
             //
             // Shift-drag is exempt from the time gate — when the user
@@ -11318,6 +13537,7 @@ impl eframe::App for CadApp {
             // they don't need to also hold the button to "prove" it.
             let drag_intent_is_window =
                 ((in_select && hold_threshold_passed)
+                 || (pointer_mode_idle && hold_threshold_passed)
                  || (shift_held && !in_click_only_phase))
                 && press_release_dist > 1.0;     // any real motion at all
             let drag_was_a_click = drag_stopped && !drag_intent_is_window;
@@ -11348,7 +13568,6 @@ impl eframe::App for CadApp {
             // Both paths set self.grip_drag with the GripRole; the kernel's
             // Geom::with_grip_moved() decides what changes (e.g. circle
             // quadrant → radius; line midpoint → translate whole line).
-            let pointer_mode_idle = !in_click_only_phase && self.select_mode == SelectMode::Off;
             let mut grip_drag_consumed_click = false;
             if pointer_mode_idle && self.env.GrpEnb {
                 let drag_started = resp.drag_started_by(egui::PointerButton::Primary);
@@ -11426,11 +13645,14 @@ impl eframe::App for CadApp {
             // immediately so the basket persists.
             let mut window_drag_consumed_click = false;
             if drag_stopped && drag_intent_is_window && !grip_drag_consumed_click {
-                if let (Some(p), Some(r)) = (
-                    ctx.input(|i| i.pointer.press_origin()),
+                // Read press from our stashed snapshot — egui's
+                // press_origin() is cleared by the time drag_stopped()
+                // fires, which is exactly now.
+                if let (Some((_p_screen, press_world_stashed)), Some(r)) = (
+                    press_pos_this_frame,
                     resp.interact_pointer_pos(),
                 ) {
-                    let press_world   = self.s2w(p, rect);
+                    let press_world   = press_world_stashed;
                     let release_world = self.s2w(r, rect);
                     let was_off = self.select_mode == SelectMode::Off;
                     if was_off {
@@ -11502,6 +13724,37 @@ impl eframe::App for CadApp {
                     // point (line endpoint, move base/dest, …).
                     let click_world = snap_hit.map(|h| h.point)
                         .unwrap_or_else(|| self.apply_constraints(world));
+                    // SESSION RECORDER — every canvas click is captured
+                    // with screen + world coords, hit-test result, tool,
+                    // and a one-line state summary so the reader can
+                    // see WHY the click triggered what it did.
+                    {
+                        let modifiers = ctx.input(|i| i.modifiers);
+                        let mods = crate::dbg_recorder::KeyModifiers {
+                            shift: modifiers.shift,
+                            ctrl:  modifiers.ctrl,
+                            alt:   modifiers.alt,
+                        };
+                        let hit = self.nearest_entity_under(
+                            click_world, 10.0 / self.scale as f64);
+                        let active_state = format!(
+                            "tool={:?} sel_mode={:?} trim={:?} ext={:?} fillet={:?} chamfer={:?} offset={:?} dist={:?} text_draft={:?} grip={}",
+                            self.tool, self.select_mode,
+                            self.trim_state, self.extend_state,
+                            self.fillet_state, self.chamfer_state,
+                            self.offset_state, self.dist_state,
+                            self.text_draft,
+                            self.grip_drag.is_some());
+                        crate::dbg_event!(self,
+                            crate::dbg_recorder::DbgEvent::CanvasClick {
+                                screen:       (pos.x, pos.y),
+                                world:        click_world,
+                                modifiers:    mods,
+                                hit_dobject:  hit,
+                                active_tool:  format!("{:?}", self.tool),
+                                active_state,
+                            });
+                    }
 
                     // Hatch pick-point — consumes the click before any
                     // other handler. BPOLY-style pipeline: tries a
@@ -12173,11 +14426,22 @@ impl eframe::App for CadApp {
                                     };
                                     self.pending_bulges.push(new_bulge);
                                 }
-                                self.pending.push(click_world);
-                                if self.tool == Tool::Polyline {
-                                    self.update_pline_prompt();
+                                // Smart-dim flow: handle the click via
+                                // dim_draft instead of pending so the
+                                // sub-kind branching is explicit and
+                                // doesn't fight the count-based
+                                // try_finalise dispatch.
+                                let dim_handled = if self.tool == Tool::Dim {
+                                    self.handle_dim_click(click_world);
+                                    true
+                                } else { false };
+                                if !dim_handled {
+                                    self.pending.push(click_world);
+                                    if self.tool == Tool::Polyline {
+                                        self.update_pline_prompt();
+                                    }
+                                    self.try_finalise();
                                 }
-                                self.try_finalise();
                             }
                         }
                         // canvas click steals focus away from the command box;
@@ -12294,12 +14558,15 @@ impl eframe::App for CadApp {
             let offset_picked = matches!(
                 self.offset_state, OffsetState::WaitingForSide(..));
             let dist_picked = matches!(self.dist_state, DistState::WaitingForP2(_));
+            let text_typing = matches!(self.text_draft,
+                TextDraftState::WaitingForString(_));
             let pulse_animation_active =
                 cutter_or_bound_active
                 || !self.selection.is_empty()
                 || fillet_or_chamfer_picked
                 || offset_picked
-                || dist_picked;
+                || dist_picked
+                || text_typing;
             if pulse_animation_active {
                 ctx.request_repaint_after(std::time::Duration::from_millis(80));
             }
@@ -12946,21 +15213,28 @@ impl eframe::App for CadApp {
                 }
             }
 
-            // Live rubber-band preview while a window-drag is in progress
-            // (select mode active OR Shift held in any other phase except
-            // edit-active phases). L→R draws BLUE (window — fully-inside);
+            // Live rubber-band preview while a window-drag is in progress.
+            // Mirrors the classifier triggers: select-mode active, OR
+            // pointer-mode-idle (always-on selector), OR Shift held in
+            // a non-edit phase. L→R draws BLUE (window — fully-inside);
             // R→L draws GREEN (crossing — anything touching).
             //
             // Time-gated to match the classifier: no preview until the
             // user has held the button past env.SelDmTm. Without this
             // the visual would lie — preview appears, but the gesture
             // gets discarded as a click on release.
+            let preview_pointer_mode_idle = !in_click_only_phase && !in_select;
             if resp.dragged()
                 && ((in_select && hold_threshold_passed)
+                    || (preview_pointer_mode_idle && hold_threshold_passed)
                     || (shift_held && !in_click_only_phase))
             {
-                if let (Some(p), Some(c)) = (
-                    ctx.input(|i| i.pointer.press_origin()),
+                // Read press from our stashed snapshot so the preview
+                // stays correct even on the release frame (egui clears
+                // press_origin() by drag_stopped()). press_pos_this_frame
+                // is the screen+world position of the active press.
+                if let (Some((p, _)), Some(c)) = (
+                    press_pos_this_frame,
                     resp.hover_pos(),
                 ) {
                     let r = egui::Rect::from_two_pos(p, c);
@@ -13020,6 +15294,103 @@ impl eframe::App for CadApp {
                             d, dx, dy, ang),
                         egui::FontId::monospace(11.0),
                         egui::Color32::from_rgb(255, 220, 140));
+                }
+            }
+
+            // ---- Text live preview --------------------------------
+            // While the text tool is WaitingForString, render whatever
+            // the user is typing AT the anchor in the actual style +
+            // height — so they see the final size/font BEFORE
+            // committing. Source of truth:
+            //   1. text_input_dialog_open  → text_input_dialog_buf
+            //                                + dialog height + dialog
+            //                                style's font
+            //   2. else (cmd-line path)    → self.cmd  + env.TxHt
+            //                                + STANDARD font
+            if let TextDraftState::WaitingForString(pos) = &self.text_draft {
+                let (body, height, font_name) = if self.text_input_dialog_open {
+                    let f = self.doc.text_styles
+                        .get(self.text_input_dialog_style_id)
+                        .map(|s| s.font_name.clone())
+                        .unwrap_or_else(|| "standard".into());
+                    (self.text_input_dialog_buf.clone(),
+                     self.text_input_dialog_height,
+                     f)
+                } else {
+                    (self.cmd.trim_end_matches('\n').to_string(),
+                     self.env.TxHt,
+                     "standard".into())
+                };
+                let size_px = (height * self.scale as f64) as f32;
+                if size_px >= 4.0 {
+                    let anchor = self.w2s(*pos, rect);
+                    // Half-alpha pulse so it reads as a preview, not a
+                    // committed dobject.
+                    let preview_col = egui::Color32::from_rgba_unmultiplied(
+                        200, 230, 255, pulse_alpha);
+                    if !body.is_empty() {
+                        let font_id = font_id_for_font_name(&font_name, size_px);
+                        painter.text(
+                            anchor,
+                            egui::Align2::LEFT_BOTTOM,
+                            &body,
+                            font_id,
+                            preview_col,
+                        );
+                    }
+                    // Caret marker — always drawn so the user sees the
+                    // anchor location even with an empty buffer.
+                    let caret_col = egui::Color32::from_rgba_unmultiplied(
+                        255, 220, 140, pulse_alpha);
+                    painter.line_segment(
+                        [anchor + egui::vec2(0.0, -size_px),
+                         anchor + egui::vec2(0.0,  2.0)],
+                        egui::Stroke::new(1.5, caret_col));
+                }
+            }
+
+            // ---- Dim live ghost preview ------------------------------------
+            // During WaitingForDimLinePos, build a ghost Dim with the
+            // cursor as the dimline_pos / leader_end and render it via
+            // the real draw_dimension fn. Half-alpha so the user reads
+            // it as "preview, not committed yet". Also draws a small
+            // marker between p1 and p2 during WaitingForP2 so the
+            // chord direction is visible while picking.
+            if matches!(self.tool, Tool::Dim) {
+                use cad_kernel::{Dim, DimKind};
+                if let Some(cur_s) = ctx.input(|i| i.pointer.hover_pos()) {
+                    let cur_w = self.s2w(cur_s, rect);
+                    match &self.dim_draft {
+                        DimDraftState::WaitingForP2 { p1 } => {
+                            let stroke = egui::Stroke::new(1.0,
+                                egui::Color32::from_rgba_unmultiplied(
+                                    200, 230, 255, pulse_alpha));
+                            painter.line_segment(
+                                [self.w2s(*p1, rect), cur_s], stroke);
+                        }
+                        DimDraftState::WaitingForDimLinePos { kind } => {
+                            let preview_kind = match kind {
+                                DimDraftKind::Linear { p1, p2, ortho } => DimKind::Linear {
+                                    p1: *p1, p2: *p2, dimline_pos: cur_w, ortho: *ortho,
+                                },
+                                DimDraftKind::Radius { center, on_circle } => DimKind::Radius {
+                                    center: *center, on_circle: *on_circle, leader_end: cur_w,
+                                },
+                                DimDraftKind::Diameter { center, on_circle } => DimKind::Diameter {
+                                    center: *center, on_circle: *on_circle, leader_end: cur_w,
+                                },
+                            };
+                            let ghost = Dim {
+                                kind: preview_kind,
+                                style: self.current_dim_style,
+                                text_override: None,
+                            };
+                            let preview_col = egui::Color32::from_rgba_unmultiplied(
+                                200, 230, 255, pulse_alpha);
+                            draw_dimension(&painter, rect, self, &ghost, preview_col);
+                        }
+                        _ => {}
+                    }
                 }
             }
 
@@ -14012,6 +16383,27 @@ fn draw_grips(painter: &egui::Painter, rect: egui::Rect, app: &CadApp, g: &Geom)
             draw(w.end);
             draw((w.start + w.end) * 0.5);
         }
+        Geom::Text(t) => {
+            // Text — single anchor grip.
+            draw(t.position);
+        }
+        Geom::Dimension(d) => {
+            // Dimension — three grips: the two def points + the
+            // dim-line / leader anchor.
+            for gp in d.grip_points() { draw(gp); }
+        }
+    }
+}
+
+/// Map a TextStyle font_name to the egui FontId the renderer uses.
+/// V1 supports two built-in fonts (`standard` → proportional sans-serif,
+/// `monospace` → monospace); anything else falls back to proportional so
+/// styles loaded from DXF with custom font names keep rendering. When
+/// LFF / SHX font loading lands the swap-in happens here only.
+fn font_id_for_font_name(name: &str, size_px: f32) -> egui::FontId {
+    match name.to_ascii_lowercase().as_str() {
+        "monospace" | "hack" | "mono" => egui::FontId::monospace(size_px),
+        _ => egui::FontId::proportional(size_px),
     }
 }
 
@@ -14437,6 +16829,560 @@ fn draw_dobject_thick(
                 }
             }
         }
+        Geom::Text(t) => {
+            // V1: render via egui's bundled fonts. Future LFF / SHX
+            // stroke-font swap-in will use the same Text data fields.
+            // Skip empty strings — egui::Painter::text on "" still
+            // allocates a layout.
+            if t.text.is_empty() { return; }
+            // Map world-space height → screen pixels via the camera scale.
+            // Below ~4 px the text is illegible anyway; skip the layout.
+            let size_px = (t.height * app.scale as f64) as f32;
+            if size_px < 4.0 { return; }
+            let anchor = app.w2s(t.position, rect);
+            let align = match (t.h_align, t.v_align) {
+                (cad_kernel::TextHAlign::Left,   cad_kernel::TextVAlign::Top)      => egui::Align2::LEFT_TOP,
+                (cad_kernel::TextHAlign::Left,   cad_kernel::TextVAlign::Middle)   => egui::Align2::LEFT_CENTER,
+                (cad_kernel::TextHAlign::Left,   _)                                => egui::Align2::LEFT_BOTTOM,
+                (cad_kernel::TextHAlign::Center, cad_kernel::TextVAlign::Top)      => egui::Align2::CENTER_TOP,
+                (cad_kernel::TextHAlign::Center, cad_kernel::TextVAlign::Middle)   => egui::Align2::CENTER_CENTER,
+                (cad_kernel::TextHAlign::Center, _)                                => egui::Align2::CENTER_BOTTOM,
+                (cad_kernel::TextHAlign::Right,  cad_kernel::TextVAlign::Top)      => egui::Align2::RIGHT_TOP,
+                (cad_kernel::TextHAlign::Right,  cad_kernel::TextVAlign::Middle)   => egui::Align2::RIGHT_CENTER,
+                (cad_kernel::TextHAlign::Right,  _)                                => egui::Align2::RIGHT_BOTTOM,
+            };
+            // Resolve font: look up the style's font_name and pick the
+            // matching egui FontId. Unknown names fall back to
+            // proportional so old DXF files keep rendering.
+            let font_name = app.doc.text_styles.get(t.style)
+                .map(|s| s.font_name.as_str())
+                .unwrap_or("standard");
+            let font_id = font_id_for_font_name(font_name, size_px);
+            // Rotation: egui's `text` doesn't support angles directly.
+            // Use a Galley + manual transform if we ever need rotated
+            // text. v1: ignore the angle and warn only when non-zero
+            // would be visually wrong (deferred — most CAD text is at
+            // angle 0 anyway).
+            let _ = t.angle;
+            painter.text(anchor, align, &t.text, font_id, color);
+        }
+        Geom::Dimension(d) => {
+            draw_dimension(painter, rect, app, d, color);
+        }
+    }
+}
+
+/// Minimum on-screen size for dimension annotations so arrowheads and
+/// the text never vanish when the dim is small relative to the geometry
+/// it measures (the classic "DIMSCALE too small" problem — annotation
+/// elements are 0.18 world units by default). World-space sizing still
+/// applies ABOVE these floors, so zooming in / raising `overall_scale`
+/// grows them normally.
+const DIM_MIN_ARROW_PX: f32 = 8.0;
+const DIM_MIN_TEXT_PX:  f32 = 11.0;
+
+/// Role-tagged world-space geometry for a dimension. SINGLE source of
+/// truth shared by the solid renderer (`draw_dimension`) and the dashed
+/// selection overlay so the two can't drift. Lines are split by role so
+/// the renderer can color extension vs dim lines independently.
+struct DimGeo {
+    /// Extension lines — drawn in the EXT-line color.
+    ext_lines: Vec<(Vec2, Vec2)>,
+    /// The Linear dim line (None for radius/diameter) — gap-trim candidate.
+    dim_line:  Option<(Vec2, Vec2)>,
+    /// Radius/diameter leader legs — drawn in the DIM-line color.
+    leaders:   Vec<(Vec2, Vec2)>,
+    /// Arrowheads as `(tip, inward_dir)`.
+    arrows:    Vec<(Vec2, Vec2)>,
+    text_pos:  Vec2,
+    /// World rotation for the text (0 = horizontal). Aligned linear dims
+    /// set this to the readability-corrected dim-line angle.
+    text_angle: f64,
+    /// True when text sits centered ON the dim line (DIMTAD 0) — the
+    /// renderer breaks the dim line to leave a gap for it.
+    text_on_dim_line: bool,
+}
+
+impl DimGeo {
+    /// Every structural line, role-agnostic — for the dashed overlay.
+    fn all_lines(&self) -> Vec<(Vec2, Vec2)> {
+        let mut v = self.ext_lines.clone();
+        if let Some(dl) = self.dim_line { v.push(dl); }
+        v.extend(self.leaders.iter().copied());
+        v
+    }
+}
+
+fn dim_render_geometry(d: &cad_kernel::Dim, style: &cad_kernel::DimStyle) -> DimGeo {
+    use cad_kernel::{DimKind, LinearOrtho};
+    let ext_extend_w = style.ext_line_extend * style.overall_scale;
+    let ext_offset_w = style.ext_line_offset * style.overall_scale;
+    let text_gap_w   = style.text_gap        * style.overall_scale;
+    let text_h_w     = style.text_height     * style.overall_scale;
+    let mut g = DimGeo {
+        ext_lines: Vec::new(), dim_line: None, leaders: Vec::new(),
+        arrows: Vec::new(), text_pos: Vec2::new(0.0, 0.0),
+        text_angle: 0.0, text_on_dim_line: false,
+    };
+    match &d.kind {
+        DimKind::Linear { p1, p2, dimline_pos, ortho } => {
+            let chord = *p2 - *p1;
+            if chord.len() < 1e-9 { g.text_pos = *p1; return g; }
+            let (u, n) = match ortho {
+                LinearOrtho::Aligned => {
+                    let u = chord.normalized();
+                    (u, Vec2::new(-u.y, u.x))
+                }
+                LinearOrtho::Horizontal => (Vec2::new(1.0, 0.0), Vec2::new(0.0, 1.0)),
+                LinearOrtho::Vertical   => (Vec2::new(0.0, 1.0), Vec2::new(1.0, 0.0)),
+            };
+            let dim_offset = (*dimline_pos - *p1).dot(n);
+            let n_signed = if dim_offset >= 0.0 { n } else { -n };
+            let off_mag  = dim_offset.abs();
+            let (a, b) = match ortho {
+                LinearOrtho::Aligned => (
+                    *p1 + n_signed * off_mag,
+                    *p2 + n_signed * off_mag,
+                ),
+                LinearOrtho::Horizontal => (
+                    Vec2::new(p1.x, dimline_pos.y),
+                    Vec2::new(p2.x, dimline_pos.y),
+                ),
+                LinearOrtho::Vertical => (
+                    Vec2::new(dimline_pos.x, p1.y),
+                    Vec2::new(dimline_pos.x, p2.y),
+                ),
+            };
+            let n_from_p1 = (a - *p1).normalized();
+            let n_from_p2 = (b - *p2).normalized();
+            if !style.ext_suppress_1 {
+                g.ext_lines.push((
+                    *p1 + n_from_p1 * ext_offset_w,
+                    a   + n_from_p1 * ext_extend_w,
+                ));
+            }
+            if !style.ext_suppress_2 {
+                g.ext_lines.push((
+                    *p2 + n_from_p2 * ext_offset_w,
+                    b   + n_from_p2 * ext_extend_w,
+                ));
+            }
+            g.dim_line = Some((a, b));
+            let dim_dir = (b - a).normalized();
+            g.arrows.push((a,  dim_dir));
+            g.arrows.push((b, -dim_dir));
+            // Text placement from DIMTAD (text_vert_pos): 0 = on the line
+            // (line gets trimmed), 4 = below, else above.
+            let mid  = (a + b) * 0.5;
+            let lift = text_gap_w + text_h_w * 0.5;
+            let (pos, on_line) = match style.text_vert_pos {
+                0 => (mid, true),
+                4 => (mid - n_signed * lift, false),
+                _ => (mid + n_signed * lift, false),
+            };
+            g.text_pos = pos;
+            g.text_on_dim_line = on_line;
+            // Aligned dims rotate the text with the line; horizontal
+            // otherwise (DIMTIH). Keep it upright (no upside-down text).
+            if !style.text_inside_horiz {
+                let mut ang = u.y.atan2(u.x);
+                if ang >  std::f64::consts::FRAC_PI_2 { ang -= std::f64::consts::PI; }
+                if ang < -std::f64::consts::FRAC_PI_2 { ang += std::f64::consts::PI; }
+                g.text_angle = ang;
+            }
+            g
+        }
+        DimKind::Radius { center, on_circle, leader_end } => {
+            g.leaders.push((*center, *on_circle));
+            g.leaders.push((*on_circle, *leader_end));
+            let radial = (*on_circle - *center).normalized();
+            g.arrows.push((*on_circle, -radial));
+            let outward = (*leader_end - *center).normalized();
+            g.text_pos = *leader_end + outward * (text_gap_w + text_h_w * 0.5);
+            g
+        }
+        DimKind::Diameter { center, on_circle, leader_end } => {
+            let opp = *center * 2.0 - *on_circle;
+            g.leaders.push((*on_circle, opp));
+            g.leaders.push((*on_circle, *leader_end));
+            let radial = (*on_circle - *center).normalized();
+            g.arrows.push((*on_circle, -radial));
+            g.arrows.push((opp,         radial));
+            let outward = (*leader_end - *center).normalized();
+            g.text_pos = *leader_end + outward * (text_gap_w + text_h_w * 0.5);
+            g
+        }
+    }
+}
+
+/// Full dimension renderer — extension lines (ext color), dim line /
+/// leaders (dim color), arrowheads (filled / hollow / architectural tick),
+/// and the text label (text color, optional alignment with the line, and
+/// a line-gap when centered on the dim line). Per-element colors fall back
+/// to the dobject's resolved `color` when the style field is 0 (ByBlock).
+/// Annotation sizes clamp to a screen-space floor so they never vanish.
+fn draw_dimension(
+    painter: &egui::Painter,
+    rect:    egui::Rect,
+    app:     &CadApp,
+    d:       &cad_kernel::Dim,
+    color:   egui::Color32,
+) {
+    let style = app.doc.dim_styles.get(d.style)
+        .or_else(|| app.doc.dim_styles.get(0))
+        .cloned()
+        .unwrap_or_else(cad_kernel::DimStyle::standard);
+    let scale = app.scale.max(1e-6);
+    // Per-element color: a non-zero (non-ByBlock) style field wins,
+    // otherwise the dobject's resolved color.
+    let resolve = |aci: u32| if aci != 0 {
+        let (r, g, b) = aci_palette(aci.min(255) as u8);
+        egui::Color32::from_rgb(r, g, b)
+    } else {
+        color
+    };
+    let dim_col  = resolve(style.color_dim_line);
+    let ext_col  = resolve(style.color_ext_line);
+    let text_col = resolve(style.color_text);
+    let dim_stroke = egui::Stroke::new(1.2, dim_col);
+    let ext_stroke = egui::Stroke::new(1.2, ext_col);
+
+    let geo = dim_render_geometry(d, &style);
+
+    // Extension lines + leaders.
+    for (a, b) in &geo.ext_lines {
+        painter.line_segment([app.w2s(*a, rect), app.w2s(*b, rect)], ext_stroke);
+    }
+    for (a, b) in &geo.leaders {
+        painter.line_segment([app.w2s(*a, rect), app.w2s(*b, rect)], dim_stroke);
+    }
+
+    // Lay out the text once — its width drives the dim-line gap.
+    let text = d.formatted_text(&style);
+    let size_px = ((style.text_height * style.overall_scale * scale as f64) as f32)
+        .max(DIM_MIN_TEXT_PX);
+    let galley = if text.is_empty() {
+        None
+    } else {
+        Some(painter.layout_no_wrap(
+            text.clone(), egui::FontId::proportional(size_px), text_col))
+    };
+
+    // Dim line (Linear), broken around centered text.
+    if let Some((a, b)) = geo.dim_line {
+        let gap_w = if geo.text_on_dim_line {
+            galley.as_ref().map(|g| {
+                g.size().x as f64 / scale as f64 * 0.5
+                    + style.text_gap * style.overall_scale
+            })
+        } else {
+            None
+        };
+        match gap_w {
+            Some(hw) => {
+                let u   = (b - a).normalized();
+                let len = (b - a).len();
+                let g1  = geo.text_pos - u * hw;
+                let g2  = geo.text_pos + u * hw;
+                let da  = (g1 - a).dot(u);
+                let db  = (g2 - a).dot(u);
+                if da > 0.0 && db < len && da < db {
+                    painter.line_segment([app.w2s(a, rect),  app.w2s(g1, rect)], dim_stroke);
+                    painter.line_segment([app.w2s(g2, rect), app.w2s(b, rect)],  dim_stroke);
+                } else {
+                    painter.line_segment([app.w2s(a, rect), app.w2s(b, rect)], dim_stroke);
+                }
+            }
+            None => {
+                painter.line_segment([app.w2s(a, rect), app.w2s(b, rect)], dim_stroke);
+            }
+        }
+    }
+
+    // Arrowheads / ticks — world-sized, floored so they never vanish.
+    let arrow_size_w = (style.arrow_size * style.overall_scale)
+        .max(DIM_MIN_ARROW_PX as f64 / scale as f64);
+    let tick_w = (style.tick_size * style.overall_scale)
+        .max(DIM_MIN_ARROW_PX as f64 / scale as f64);
+    for (tip, dir) in &geo.arrows {
+        if style.tick_size > 0.0 {
+            // Architectural tick — a 45° slash centered on the def point.
+            let dn = dir.normalized();
+            let c  = std::f64::consts::FRAC_1_SQRT_2;
+            let t  = Vec2::new(dn.x * c - dn.y * c, dn.x * c + dn.y * c);
+            painter.line_segment(
+                [app.w2s(*tip + t * tick_w, rect), app.w2s(*tip - t * tick_w, rect)],
+                egui::Stroke::new(1.6, dim_col));
+        } else if style.arrow_filled {
+            draw_filled_arrow(painter, rect, app, *tip, *dir, arrow_size_w, dim_col);
+        } else {
+            // Hollow arrowhead — outline only.
+            let dn   = dir.normalized();
+            let perp = Vec2::new(-dn.y, dn.x);
+            let base = *tip + dn * arrow_size_w;
+            let b1   = base + perp * (arrow_size_w * 0.35);
+            let b2   = base - perp * (arrow_size_w * 0.35);
+            let ts = app.w2s(*tip, rect);
+            let b1s = app.w2s(b1, rect);
+            let b2s = app.w2s(b2, rect);
+            let s = egui::Stroke::new(1.4, dim_col);
+            painter.line_segment([ts, b1s], s);
+            painter.line_segment([b1s, b2s], s);
+            painter.line_segment([b2s, ts], s);
+        }
+    }
+
+    // Text — centered at text_pos, rotated by text_angle (world → screen
+    // needs the Y flip).
+    if let Some(galley) = galley {
+        let anchor = app.w2s(geo.text_pos, rect);
+        let screen_angle = -geo.text_angle as f32;
+        let sz  = galley.size();
+        let rot = egui::emath::Rot2::from_angle(screen_angle);
+        let pos = anchor - rot * (sz * 0.5);
+        let mut shape = egui::epaint::TextShape::new(pos, galley, text_col);
+        shape.angle = screen_angle;
+        painter.add(shape);
+    }
+}
+
+/// Filled triangle arrowhead. The arrow's TIP is at `tip_w`; the base
+/// runs perpendicular to `dir_w` and the arrow stretches `size_w` back
+/// along `-dir_w`. `dir_w` is the unit vector pointing INTO the arrow
+/// (i.e. the direction the dim/leader line is travelling at the tip).
+fn draw_filled_arrow(
+    painter: &egui::Painter,
+    rect:    egui::Rect,
+    app:     &CadApp,
+    tip_w:   Vec2,
+    dir_w:   Vec2,
+    size_w:  f64,
+    color:   egui::Color32,
+) {
+    if size_w < 1e-9 { return; }
+    let perp = Vec2::new(-dir_w.y, dir_w.x);
+    let base_center = tip_w + dir_w * size_w;
+    let half_base   = size_w * 0.35;     // ~20° half-angle, AutoCAD default
+    let b1 = base_center + perp * half_base;
+    let b2 = base_center - perp * half_base;
+    let tip_s = app.w2s(tip_w, rect);
+    let b1_s  = app.w2s(b1, rect);
+    let b2_s  = app.w2s(b2, rect);
+    painter.add(egui::Shape::convex_polygon(
+        vec![tip_s, b1_s, b2_s],
+        color,
+        egui::Stroke::NONE,
+    ));
+}
+
+/// Compact color chip for the Dim Style form: swatch + ACI/ByBlock label
+/// + "Pick…" button + a ByBlock checkbox. Mutates `val` for ByBlock and
+/// returns `true` when the user asks to open the shared polar ACI wheel
+/// (the caller then sets the appropriate `AciPickRequest::DimStyleForm`).
+fn dim_color_swatch(ui: &mut egui::Ui, val: &mut Option<u8>) -> bool {
+    let mut want = false;
+    let (r, g, b) = match *val { Some(a) => aci_palette(a), None => (140, 140, 160) };
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(24.0, 18.0), egui::Sense::click());
+    ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(r, g, b));
+    ui.painter().rect_stroke(rect, 2.0,
+        egui::Stroke::new(0.7, egui::Color32::from_rgb(70, 80, 95)));
+    if resp.on_hover_text("Click to pick an ACI color").clicked() { want = true; }
+    ui.label(match *val { Some(a) => format!("ACI {}", a), None => "ByBlock".to_string() });
+    if ui.small_button("Pick…").clicked() { want = true; }
+    let mut bb = val.is_none();
+    if ui.checkbox(&mut bb, "ByBlock").changed() {
+        *val = if bb { None } else { Some(7) };
+    }
+    want
+}
+
+/// Sample preview for the Dimension Style Manager. Renders OUR OWN
+/// reference drawing — a rounded-corner plate with a bolt hole — annotated
+/// with a horizontal + vertical linear dim, a diameter, and a radius, each
+/// drawn from the given style's arrow size / text height / decimals /
+/// color. Deliberately NOT AutoCAD's L-bracket sample. Self-contained:
+/// maps a fixed sample-world box into `rect` (no global camera).
+fn draw_dim_style_preview(
+    painter: &egui::Painter,
+    rect:    egui::Rect,
+    style:   &cad_kernel::DimStyle,
+) {
+    let pad = 16.0_f32;
+    let (xmin, xmax, ymin, ymax) = (-5.0_f32, 44.0, -3.0, 31.0);
+    let ww = xmax - xmin;
+    let wh = ymax - ymin;
+    let s  = ((rect.width() - 2.0 * pad) / ww)
+        .min((rect.height() - 2.0 * pad) / wh)
+        .max(0.1);
+    let ox = rect.center().x - s * (xmin + xmax) / 2.0;
+    let oy = rect.center().y + s * (ymin + ymax) / 2.0;   // y-up world
+    let w2p = |x: f32, y: f32| egui::pos2(ox + x * s, oy - y * s);
+
+    let obj_col = egui::Color32::from_rgb(232, 176, 86);
+    let resolve = |c: u32, fallback: egui::Color32| if c != 0 {
+        let (r, g, b) = aci_palette(c.min(255) as u8);
+        egui::Color32::from_rgb(r, g, b)
+    } else { fallback };
+    let dim_col  = resolve(style.color_dim_line, egui::Color32::from_rgb(236, 241, 248));
+    let ext_col  = resolve(style.color_ext_line, egui::Color32::from_rgb(150, 170, 200));
+    let text_col = resolve(style.color_text,     egui::Color32::from_rgb(236, 241, 248));
+    let obj_stroke = egui::Stroke::new(1.6, obj_col);
+    let dim_stroke = egui::Stroke::new(1.3, dim_col);
+    let ext_stroke = egui::Stroke::new(1.1, ext_col);
+
+    // Annotation sizes derive from the style but clamp so the preview is
+    // always legible (default 0.18-ish would be sub-pixel vs the sample).
+    let annot    = 64.0_f32;
+    let arrow_px = (style.arrow_size  as f32 * annot).clamp(6.0, 17.0);
+    let text_px  = (style.text_height as f32 * annot).clamp(9.0, 26.0);
+
+    let fmt = |v: f64| {
+        let dp = style.decimal_places.max(0) as usize;
+        let mut t = format!("{:.*}", dp, v);
+        if style.decimal_separator != '.' {
+            t = t.replace('.', &style.decimal_separator.to_string());
+        }
+        t
+    };
+    // Arrowhead honoring filled / hollow / architectural tick. `dir` is the
+    // screen-space unit pointing INTO the arrow (along the dim line).
+    let arrow = |tip: egui::Pos2, dir: egui::Vec2| {
+        if dir.length() < 1e-3 { return; }
+        let d = dir.normalized();
+        if style.tick_size > 0.0 {
+            let c = std::f32::consts::FRAC_1_SQRT_2;
+            let t = egui::vec2(d.x * c - d.y * c, d.x * c + d.y * c);
+            painter.line_segment([tip + t * arrow_px, tip - t * arrow_px],
+                egui::Stroke::new(1.6, dim_col));
+        } else {
+            let perp = egui::vec2(-d.y, d.x);
+            let base = tip + d * arrow_px;
+            let b1   = base + perp * (arrow_px * 0.34);
+            let b2   = base - perp * (arrow_px * 0.34);
+            if style.arrow_filled {
+                painter.add(egui::Shape::convex_polygon(
+                    vec![tip, b1, b2], dim_col, egui::Stroke::NONE));
+            } else {
+                painter.line_segment([tip, b1], dim_stroke);
+                painter.line_segment([b1, b2], dim_stroke);
+                painter.line_segment([b2, tip], dim_stroke);
+            }
+        }
+    };
+    // Rotated, centered text. `angle` is world radians (0 = horizontal).
+    // Returns the galley size in sample-world units (for line-gap math).
+    let draw_label = |cx: f32, cy: f32, angle: f32, txt: &str| -> egui::Vec2 {
+        let galley = painter.layout_no_wrap(
+            txt.to_string(), egui::FontId::proportional(text_px), text_col);
+        let sz = galley.size();
+        let anchor = w2p(cx, cy);
+        let sa = -angle;
+        let rot = egui::emath::Rot2::from_angle(sa);
+        let pos = anchor - rot * (sz * 0.5);
+        let mut shape = egui::epaint::TextShape::new(pos, galley, text_col);
+        shape.angle = sa;
+        painter.add(shape);
+        egui::vec2(sz.x / s, sz.y / s)
+    };
+
+    // ---- object: rounded-corner plate + bolt hole -------------------
+    let mut outline = vec![
+        w2p(4.0, 4.0), w2p(40.0, 4.0), w2p(40.0, 24.0), w2p(10.0, 24.0),
+    ];
+    for i in 0..=12 {
+        let deg = 90.0 + (i as f32 / 12.0) * 90.0;       // top-left fillet
+        let r = deg.to_radians();
+        outline.push(w2p(10.0 + 6.0 * r.cos(), 18.0 + 6.0 * r.sin()));
+    }
+    outline.push(w2p(4.0, 4.0));
+    painter.add(egui::Shape::line(outline, obj_stroke));
+
+    let mut hole = Vec::with_capacity(41);
+    for i in 0..=40 {
+        let a = (i as f32 / 40.0) * std::f32::consts::TAU;
+        hole.push(w2p(28.0 + 5.0 * a.cos(), 12.0 + 5.0 * a.sin()));
+    }
+    painter.add(egui::Shape::line(hole, obj_stroke));
+
+    let lift = 1.6_f32;   // sample-world text offset for above/below
+
+    // ---- top horizontal linear dim (shows text placement) -----------
+    {
+        let (ax, bx, ay) = (10.0_f32, 40.0_f32, 27.0_f32);
+        painter.line_segment([w2p(10.0, 24.3), w2p(10.0, ay + 0.6)], ext_stroke);
+        painter.line_segment([w2p(40.0, 24.3), w2p(40.0, ay + 0.6)], ext_stroke);
+        let mid = ((ax + bx) * 0.5, ay);
+        let (tx, ty, on_line) = match style.text_vert_pos {
+            0 => (mid.0, mid.1,        true),
+            4 => (mid.0, mid.1 - lift, false),
+            _ => (mid.0, mid.1 + lift, false),
+        };
+        let sz = draw_label(tx, ty, 0.0, &fmt(30.0));  // horizontal line → text upright
+        let a_s = w2p(ax, ay);
+        let b_s = w2p(bx, ay);
+        if on_line {
+            let hw = sz.x * 0.5 + 0.4;
+            painter.line_segment([a_s, w2p(tx - hw, ay)], dim_stroke);
+            painter.line_segment([w2p(tx + hw, ay), b_s], dim_stroke);
+        } else {
+            painter.line_segment([a_s, b_s], dim_stroke);
+        }
+        arrow(a_s, egui::vec2(b_s.x - a_s.x, b_s.y - a_s.y));
+        arrow(b_s, egui::vec2(a_s.x - b_s.x, a_s.y - b_s.y));
+    }
+    // ---- left vertical linear dim (shows aligned vs horizontal) -----
+    {
+        let (ax, ay, by) = (0.0_f32, 4.0_f32, 24.0_f32);
+        painter.line_segment([w2p(3.6, 4.0),  w2p(ax - 0.6, 4.0)],  ext_stroke);
+        painter.line_segment([w2p(3.6, 24.0), w2p(ax - 0.6, 24.0)], ext_stroke);
+        let mid_y = (ay + by) * 0.5;
+        let aligned = !style.text_inside_horiz;
+        let angle = if aligned { std::f32::consts::FRAC_PI_2 } else { 0.0 };
+        let (tx, ty, on_line) = match style.text_vert_pos {
+            0 => (ax,        mid_y, true),
+            4 => (ax + lift, mid_y, false),
+            _ => (ax - lift, mid_y, false),
+        };
+        let sz = draw_label(tx, ty, angle, &fmt(20.0));
+        // extent along the (vertical) line: text width if aligned, else height
+        let along = if aligned { sz.x } else { sz.y };
+        let a_s = w2p(ax, ay);
+        let b_s = w2p(ax, by);
+        if on_line {
+            let hw = along * 0.5 + 0.4;
+            painter.line_segment([a_s, w2p(ax, ty - hw)], dim_stroke);
+            painter.line_segment([w2p(ax, ty + hw), b_s], dim_stroke);
+        } else {
+            painter.line_segment([a_s, b_s], dim_stroke);
+        }
+        arrow(a_s, egui::vec2(b_s.x - a_s.x, b_s.y - a_s.y));
+        arrow(b_s, egui::vec2(a_s.x - b_s.x, a_s.y - b_s.y));
+    }
+    // ---- diameter through the hole ----------------------------------
+    {
+        let (cx, cy) = (28.0_f32, 12.0_f32);
+        let (dx, dy) = (0.70711_f32, 0.70711_f32);
+        let pa = w2p(cx - 5.0 * dx, cy - 5.0 * dy);
+        let pb = w2p(cx + 5.0 * dx, cy + 5.0 * dy);
+        let cs = w2p(cx, cy);
+        painter.line_segment([pa, pb], dim_stroke);
+        arrow(pa, cs - pa);
+        arrow(pb, cs - pb);
+        draw_label(cx + 5.0 * dx + 2.0, cy + 5.0 * dy + 2.0, 0.0, &format!("⌀{}", fmt(10.0)));
+    }
+    // ---- radius on the rounded corner -------------------------------
+    {
+        let (ccx, ccy) = (10.0_f32, 18.0_f32);
+        let ang = 135.0_f32.to_radians();
+        let (apx, apy) = (ccx + 6.0 * ang.cos(), ccy + 6.0 * ang.sin());
+        let (lex, ley) = (apx - 3.6, apy + 3.6);
+        let aps = w2p(apx, apy);
+        let les = w2p(lex, ley);
+        let ccs = w2p(ccx, ccy);
+        painter.line_segment([aps, les], dim_stroke);
+        arrow(aps, ccs - aps);
+        draw_label(lex - 2.0, ley + 1.0, 0.0, &format!("R{}", fmt(6.0)));
     }
 }
 
@@ -14557,6 +17503,43 @@ fn draw_dobject_dashed(
             }
             if let Some(r) = w.right_line() {
                 push_dashed(vec![app.w2s(r.a, rect), app.w2s(r.b, rect)]);
+            }
+        }
+        Geom::Text(t) => {
+            // Dashed-selection overlay on Text isn't a dashed string
+            // (egui can't dash glyph outlines); draw a small dashed
+            // rectangle around the anchor so the user sees it's
+            // selected. The actual text underneath stays visible from
+            // the regular render pass.
+            let half = (t.height as f32 * app.scale * 0.5).max(3.0);
+            let p = app.w2s(t.position, rect);
+            let r = egui::Rect::from_center_size(
+                p, egui::vec2(half * 2.0, half * 2.0));
+            let _ = push_dashed;   // closure available; we use lines directly
+            for s in egui::Shape::dashed_line(
+                &[r.left_top(), r.right_top(), r.right_bottom(),
+                  r.left_bottom(), r.left_top()],
+                stroke, dash, gap)
+            {
+                painter.add(s);
+            }
+        }
+        Geom::Dimension(d) => {
+            // Dashed-selection overlay — dash the dim's REAL structural
+            // lines (extension + dim line, or the leader legs) via the
+            // shared `dim_render_geometry`, so the highlight matches what
+            // is actually drawn instead of a placeholder triangle.
+            let style = app.doc.dim_styles.get(d.style)
+                .or_else(|| app.doc.dim_styles.get(0))
+                .cloned()
+                .unwrap_or_else(cad_kernel::DimStyle::standard);
+            let geo = dim_render_geometry(d, &style);
+            for (a, b) in &geo.all_lines() {
+                for s in egui::Shape::dashed_line(
+                    &[app.w2s(*a, rect), app.w2s(*b, rect)], stroke, dash, gap)
+                {
+                    painter.add(s);
+                }
             }
         }
     }

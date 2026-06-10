@@ -388,6 +388,17 @@ pub enum Geom {
     /// operate on the centerline; the visible side lines re-derive
     /// automatically.
     Wall(Wall),
+    /// Single-line text. Stored as data (position + height + angle +
+    /// string + alignment + style ref); rendered by the app via
+    /// `egui::Painter::text`. MText and special escape codes are
+    /// deferred. See `text::Text` for the data definition.
+    Text(crate::text::Text),
+    /// Dimension entity. The `Dim` carries a `DimKind` (Linear /
+    /// Aligned / Radius / Diameter for slice 1) plus a style id. The
+    /// renderer derives extension lines, dim line, arrows, and text
+    /// from the def points + DimStyle every frame; the kernel stores
+    /// only the inputs. See `dim::Dim` for the full data model.
+    Dimension(crate::dim::Dim),
 }
 
 impl Geom {
@@ -462,6 +473,16 @@ impl Geom {
                 end:       rot(w.end),
                 thickness: w.thickness,
             }),
+            // Text — rotate the anchor + bump the text's own angle.
+            Geom::Text(t) => {
+                let mut nt = t.clone();
+                nt.position = rot(t.position);
+                nt.angle    = t.angle + angle;
+                Geom::Text(nt)
+            }
+            // Dimension — rotate every def point. Text orientation
+            // re-derives at render time from the dim-line direction.
+            Geom::Dimension(d) => Geom::Dimension(d.with_points_mapped(rot)),
         }
     }
 
@@ -517,6 +538,18 @@ impl Geom {
                 end:       sc(w.end),
                 thickness: w.thickness * f_abs,
             }),
+            // Text — scale anchor + height (angle invariant under
+            // uniform scale).
+            Geom::Text(t) => {
+                let mut nt = t.clone();
+                nt.position = sc(t.position);
+                nt.height   = t.height * f_abs;
+                Geom::Text(nt)
+            }
+            // Dimension — scale every def point. Renderer uses the
+            // current DimStyle's text_height + arrow_size; those are
+            // already in world units so they scale with the camera.
+            Geom::Dimension(d) => Geom::Dimension(d.with_points_mapped(sc)),
         }
     }
 
@@ -590,6 +623,23 @@ impl Geom {
                 end:       mirror(w.end),
                 thickness: w.thickness,
             }),
+            // Text — mirror the anchor; reflect the text angle by the
+            // mirror axis. Text content remains readable (would appear
+            // BACKWARDS without the `TextGeneration::Backward` flag we
+            // haven't modelled yet — defer to MText slice).
+            Geom::Text(t) => {
+                let mut nt = t.clone();
+                nt.position = mirror(t.position);
+                // Mirror axis angle: atan2(b-a).y, x). Reflected angle
+                // = 2*axis_angle - angle.
+                let axis_angle = (b - a).angle();
+                nt.angle = 2.0 * axis_angle - t.angle;
+                Geom::Text(nt)
+            }
+            // Dimension — mirror every def point. Text reads naturally
+            // because the dim line direction is recomputed; no need to
+            // flip the text angle separately.
+            Geom::Dimension(d) => Geom::Dimension(d.with_points_mapped(mirror)),
         }
     }
 
@@ -983,6 +1033,10 @@ impl Geom {
                     } else { None }
                 }).collect())
             }
+            Geom::Text(_) =>
+                Err("trim: text entities have no curve to cut"),
+            Geom::Dimension(_) =>
+                Err("trim: dimensions have no curve to cut"),
         }
     }
 
@@ -1190,6 +1244,10 @@ impl Geom {
                     _ => Err("split wall: unexpected non-Line result"),
                 }
             }
+            Geom::Text(_) =>
+                Err("split: cannot split a text entity"),
+            Geom::Dimension(_) =>
+                Err("split: cannot split a dimension entity"),
         }
     }
 
@@ -1279,6 +1337,10 @@ impl Geom {
                     }))
                 } else { Err("offset wall: unexpected non-Line result") }
             }
+            Geom::Text(_) =>
+                Err("offset on text is undefined"),
+            Geom::Dimension(_) =>
+                Err("offset on dimension is undefined"),
         }
     }
 
@@ -1353,6 +1415,10 @@ impl Geom {
             Geom::Wall(w) => Geom::Wall(Wall {
                 start: w.end, end: w.start, thickness: w.thickness,
             }),
+            // Text — reversal has no geometric meaning. Clone.
+            Geom::Text(t) => Geom::Text(t.clone()),
+            // Dimension — direction-agnostic; clone.
+            Geom::Dimension(d) => Geom::Dimension(d.clone()),
         }
     }
 
@@ -1406,6 +1472,12 @@ impl Geom {
             Geom::Wall(w) => Geom::Wall(Wall {
                 start: w.start + off, end: w.end + off, thickness: w.thickness,
             }),
+            Geom::Text(t) => {
+                let mut nt = t.clone();
+                nt.position = t.position + off;
+                Geom::Text(nt)
+            }
+            Geom::Dimension(d) => Geom::Dimension(d.with_points_mapped(|p| p + off)),
         }
     }
 
@@ -1432,6 +1504,22 @@ impl Geom {
                         l.distance_to_point(p).min(r.distance_to_point(p)),
                     _ => f64::INFINITY,
                 }
+            }
+            // Text — distance to the anchor point. Good enough for
+            // click-pick; refine to bbox-distance when text starts
+            // occupying significant screen area.
+            Geom::Text(t) => t.position.dist(p),
+            // Dimension — min distance to the dimension's def points.
+            // The renderer's extension/dim lines are derived state;
+            // picking on those would require re-running the renderer
+            // for hit-test. v1 picks on the def points; refine later.
+            Geom::Dimension(d) => {
+                let mut best = f64::INFINITY;
+                for gp in d.grip_points() {
+                    let dist = gp.dist(p);
+                    if dist < best { best = dist; }
+                }
+                best
             }
         }
     }
@@ -1512,6 +1600,13 @@ impl Geom {
                 );
                 (min, max)
             }
+            // Text — unrotated bbox (loose; ignores `angle`). Same
+            // approximation Wall uses for its rotated side-line corners.
+            Geom::Text(t) => t.bbox_unrotated(),
+            // Dimension — bbox of the def points. The renderer's text
+            // and extension lines can fall slightly outside this; v1
+            // accepts the loose bbox.
+            Geom::Dimension(d) => d.bbox(),
         }
     }
 
@@ -2178,6 +2273,15 @@ pub enum GripRole {
     /// reshapes the curve via control-point edit (the dragged point
     /// stays put; the curve bends towards it).
     SplineCtrlPt(usize),
+    /// Dimension def-point grips. Three per Dim:
+    ///   * `DimP1`     — Linear.p1, or Radius/Diameter.center
+    ///   * `DimP2`     — Linear.p2, or Radius/Diameter.on_circle
+    ///   * `DimLeader` — Linear.dimline_pos, or Radius/Diameter.leader_end
+    /// `with_grip_moved` interprets the role against the current
+    /// DimKind.
+    DimP1,
+    DimP2,
+    DimLeader,
 }
 
 impl Geom {
@@ -2256,6 +2360,29 @@ impl Geom {
                 (w.end,   GripRole::LineEndB),
                 ((w.start + w.end) * 0.5, GripRole::LineMid),
             ],
+            // Text — one grip at the anchor position. Re-uses PointLoc
+            // role so `with_grip_moved` repositions text the same way
+            // it repositions Points.
+            Geom::Text(t) => vec![(t.position, GripRole::PointLoc)],
+            // Dimension — three role-tagged grips matching the def
+            // points. Roles are uniform across kinds so the renderer
+            // can treat them generically.
+            Geom::Dimension(d) => {
+                use crate::dim::DimKind;
+                match &d.kind {
+                    DimKind::Linear { p1, p2, dimline_pos, .. } => vec![
+                        (*p1,          GripRole::DimP1),
+                        (*p2,          GripRole::DimP2),
+                        (*dimline_pos, GripRole::DimLeader),
+                    ],
+                    DimKind::Radius { center, on_circle, leader_end } |
+                    DimKind::Diameter { center, on_circle, leader_end } => vec![
+                        (*center,     GripRole::DimP1),
+                        (*on_circle,  GripRole::DimP2),
+                        (*leader_end, GripRole::DimLeader),
+                    ],
+                }
+            }
         }
     }
 
@@ -2422,6 +2549,12 @@ impl Geom {
             // ---- Point -------------------------------------------------
             (Geom::Point(p), GripRole::PointLoc) =>
                 Geom::Point(Point { location: new_pos, style: p.style, size: p.size }),
+            // ---- Text — re-uses PointLoc role for its single anchor grip.
+            (Geom::Text(t), GripRole::PointLoc) => {
+                let mut nt = t.clone();
+                nt.position = new_pos;
+                Geom::Text(nt)
+            }
             // ---- Wall — re-uses Line grip roles --------------------------
             // Grip drags reshape the centerline; both side lines re-derive
             // on render so the wall moves coherently as one entity.
@@ -2438,6 +2571,61 @@ impl Geom {
                 Geom::Wall(Wall {
                     start: w.start + off, end: w.end + off,
                     thickness: w.thickness,
+                })
+            }
+            // ---- Dimension --------------------------------------------------
+            // DimP1/P2/Leader move whichever def point corresponds to
+            // the role for the current DimKind. Renderer re-derives
+            // extension lines, dim line, and arrows on the next frame.
+            (Geom::Dimension(d), GripRole::DimP1) => {
+                use crate::dim::DimKind;
+                let new_kind = match &d.kind {
+                    DimKind::Linear { p2, dimline_pos, ortho, .. } => DimKind::Linear {
+                        p1: new_pos, p2: *p2, dimline_pos: *dimline_pos, ortho: *ortho,
+                    },
+                    DimKind::Radius { on_circle, leader_end, .. } => DimKind::Radius {
+                        center: new_pos, on_circle: *on_circle, leader_end: *leader_end,
+                    },
+                    DimKind::Diameter { on_circle, leader_end, .. } => DimKind::Diameter {
+                        center: new_pos, on_circle: *on_circle, leader_end: *leader_end,
+                    },
+                };
+                Geom::Dimension(crate::dim::Dim {
+                    kind: new_kind, style: d.style, text_override: d.text_override.clone(),
+                })
+            }
+            (Geom::Dimension(d), GripRole::DimP2) => {
+                use crate::dim::DimKind;
+                let new_kind = match &d.kind {
+                    DimKind::Linear { p1, dimline_pos, ortho, .. } => DimKind::Linear {
+                        p1: *p1, p2: new_pos, dimline_pos: *dimline_pos, ortho: *ortho,
+                    },
+                    DimKind::Radius { center, leader_end, .. } => DimKind::Radius {
+                        center: *center, on_circle: new_pos, leader_end: *leader_end,
+                    },
+                    DimKind::Diameter { center, leader_end, .. } => DimKind::Diameter {
+                        center: *center, on_circle: new_pos, leader_end: *leader_end,
+                    },
+                };
+                Geom::Dimension(crate::dim::Dim {
+                    kind: new_kind, style: d.style, text_override: d.text_override.clone(),
+                })
+            }
+            (Geom::Dimension(d), GripRole::DimLeader) => {
+                use crate::dim::DimKind;
+                let new_kind = match &d.kind {
+                    DimKind::Linear { p1, p2, ortho, .. } => DimKind::Linear {
+                        p1: *p1, p2: *p2, dimline_pos: new_pos, ortho: *ortho,
+                    },
+                    DimKind::Radius { center, on_circle, .. } => DimKind::Radius {
+                        center: *center, on_circle: *on_circle, leader_end: new_pos,
+                    },
+                    DimKind::Diameter { center, on_circle, .. } => DimKind::Diameter {
+                        center: *center, on_circle: *on_circle, leader_end: new_pos,
+                    },
+                };
+                Geom::Dimension(crate::dim::Dim {
+                    kind: new_kind, style: d.style, text_override: d.text_override.clone(),
                 })
             }
             // Mismatched (role, geom) — return unchanged.

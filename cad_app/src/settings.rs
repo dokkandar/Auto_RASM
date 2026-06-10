@@ -69,6 +69,10 @@ pub struct UserEnv {
     /// between the user's two clicks. Set inline with `wall <t>`;
     /// persists across sessions. Initial default 0.20 (200mm).
     pub WlThk: f64,
+    /// Default text height for the `text` drafting command, in world
+    /// units. Persists across sessions (mirrors WlThk/OfsDis). Initial
+    /// 0.25 — a sensible default for typical drawings.
+    pub TxHt:  f64,
     /// Wall Centerline visible. Renders the implicit centerline of
     /// every `Geom::Wall` as a dashed half-alpha overlay on top of
     /// the two solid side lines. Useful while developing the wall-
@@ -201,6 +205,7 @@ impl Default for UserEnv {
             ChmDs2: 0.0,
             OfsDis: 1.0,
             WlThk:  0.20,
+            TxHt:   0.25,
             WlCnL:  true,
             TrmMd: true,
             DrDspM: 2,
@@ -283,6 +288,7 @@ impl UserEnv {
         push_f64(&mut s, "ChmDs2", self.ChmDs2);
         push_f64(&mut s, "OfsDis", self.OfsDis);
         push_f64(&mut s, "WlThk",  self.WlThk);
+        push_f64(&mut s, "TxHt",   self.TxHt);
         push_bool(&mut s, "WlCnL", self.WlCnL);
         push_bool(&mut s, "TrmMd", self.TrmMd);
         push_u8(&mut s, "DrDspM", self.DrDspM);
@@ -345,6 +351,7 @@ impl UserEnv {
             "ChmDs2" => if let Ok(v) = val.parse() { self.ChmDs2 = v; }
             "OfsDis" => if let Ok(v) = val.parse() { self.OfsDis = v; }
             "WlThk"  => if let Ok(v) = val.parse() { self.WlThk  = v; }
+            "TxHt"   => if let Ok(v) = val.parse() { self.TxHt   = v; }
             "WlCnL"  => if let Some(v) = parse_bool(val) { self.WlCnL = v; }
             "TrmMd"  => if let Some(v) = parse_bool(val) { self.TrmMd = v; }
             "DrDspM" => if let Ok(v) = val.parse() { self.DrDspM = v; }

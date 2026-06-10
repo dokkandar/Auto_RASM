@@ -22,6 +22,7 @@ use crate::geom::*;
 use crate::math::Vec2;
 use crate::snap::SnapKind;
 
+#[derive(Debug)]
 pub enum Command {
     Add(Geom),
     Delete(usize),
@@ -105,12 +106,36 @@ pub enum Command {
     /// `layer`'s shape: `linetype` (list) / `linetype <name>` (set).
     /// Unknown name → app responds with a hint listing valid names.
     Linetype(Option<String>),
+    /// Open the Session Recorder window. Pure UI toggle — does NOT
+    /// start recording on its own. Use the Start button inside the
+    /// window once it's open.
+    DbgRecorder,
+    /// Open the Text Style dialog (manage TextStyleTable entries —
+    /// name, font, default height, optional color). With no args opens
+    /// the dialog for a NEW style; with `style <name>` opens it on the
+    /// existing style (case-insensitive lookup). Mirrors AutoCAD STYLE.
+    TextStyle(Option<String>),
+    /// Draw single-line text. Args: `text <string>` to inline the
+    /// string; bare `text` opens a click-then-prompt flow (click
+    /// position, then type the string). Heights default to the
+    /// persisted SYSVAR `TxHt` (mirrors offset/wall sysvar pattern).
+    /// Multi-word strings need quoting: `text "Hello world"`.
+    Text(Option<String>),
     /// Draw a wall — two parallel lines spaced `thickness` apart,
     /// symmetric about the centerline between the two user clicks.
     /// `None` means "use the persistent default" (`env.WlThk`).
     /// Produces two normal `Line` dobjects so existing trim/extend/
     /// fillet operations work on the side lines directly.
     Wall(Option<f64>),
+    /// AutoCAD-style smart dimension. No args — the app drives a
+    /// 2- or 3-click flow with sub-kind auto-decided from the first
+    /// click target (circle/arc → radius; key 'D' → diameter; point
+    /// → linear, ortho inferred from the dimline drag direction).
+    Dim,
+    /// Open the Dim Style dialog. Bare `dimstyle` opens it for a NEW
+    /// style; `dimstyle <name>` opens it on the existing style
+    /// (case-insensitive). Mirrors AutoCAD DDIM / DIMSTYLE.
+    DimStyle(Option<String>),
     /// Lengthen every selected Line / Arc / EllipseArc by a signed delta.
     /// App captures a click on the end to extend.
     Lengthen(f64),
@@ -188,6 +213,11 @@ impl Command {
             Command::ChangeLayer        => "ChangeLayer",
             Command::Offset(_)          => "Offset",
             Command::Wall(_)            => "Wall",
+            Command::Text(_)            => "Text",
+            Command::TextStyle(_)       => "TextStyle",
+            Command::Dim                => "Dim",
+            Command::DimStyle(_)        => "DimStyle",
+            Command::DbgRecorder        => "DbgRecorder",
             Command::Linetype(_)        => "Linetype",
             Command::ChProp(_)          => "ChProp",
             Command::Lengthen(_)        => "Lengthen",
@@ -220,6 +250,7 @@ pub enum ToolKind {
     Polyline,
     Spline,
     Wall,
+    Text,
 }
 
 pub fn parse(line: &str) -> Result<Command, String> {
@@ -331,6 +362,42 @@ pub fn parse(line: &str) -> Result<Command, String> {
             match toks.get(1) {
                 None    => Ok(Command::Linetype(None)),
                 Some(s) => Ok(Command::Linetype(Some((*s).to_string()))),
+            }
+        }
+        "dbg" | "rec" | "recorder" => Ok(Command::DbgRecorder),
+        "style" | "txtstyle" | "textstyle" => {
+            // `style`        → open dialog for a NEW style
+            // `style <name>` → open dialog editing the named style
+            Ok(Command::TextStyle(toks.get(1).map(|s| (*s).to_string())))
+        }
+        "dim" | "dimension" => {
+            // AutoCAD smart dimension. No args — app drives the
+            // 2/3-click flow; sub-kind decided at first click.
+            Ok(Command::Dim)
+        }
+        "dimstyle" | "ddim" => {
+            // `dimstyle`        → open dialog for a NEW dim style
+            // `dimstyle <name>` → open dialog editing the named style
+            Ok(Command::DimStyle(toks.get(1).map(|s| (*s).to_string())))
+        }
+        "text" | "tx" => {
+            // `text`              → click position, then prompt for string
+            // `text Hello`        → use "Hello" as the string (single word)
+            // `text "Hi there"`   → quoted multi-word strings
+            // Parser detail: toks[1..] joined; if the first arg starts
+            // with " and the last ends with ", strip the quotes and use
+            // the rest verbatim.
+            match toks.get(1) {
+                None => Ok(Command::Text(None)),
+                Some(_) => {
+                    let joined = toks[1..].join(" ");
+                    let cleaned = if joined.starts_with('"') && joined.ends_with('"')
+                        && joined.len() >= 2
+                    {
+                        joined[1..joined.len()-1].to_string()
+                    } else { joined };
+                    Ok(Command::Text(Some(cleaned)))
+                }
             }
         }
         "wall" | "w"      => {

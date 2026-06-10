@@ -377,6 +377,10 @@ fn candidate_points(
                 if let Some(r) = w.right_line() { out.push(r.a); out.push(r.b); }
                 plain(out)
             }
+            // Text — anchor point is the only snap "endpoint".
+            Geom::Text(t) => plain([t.position]),
+            // Dimension — its three def points act as snap endpoints.
+            Geom::Dimension(d) => plain(d.grip_points()),
         },
         SnapKind::Mid => match e {
             Geom::Line(l) => plain([(l.a + l.b) * 0.5]),
@@ -408,6 +412,13 @@ fn candidate_points(
                 if let Some(r) = w.right_line() { out.push((r.a + r.b) * 0.5); }
                 plain(out)
             }
+            // Text has no MID concept (no segment); empty.
+            Geom::Text(_) => Vec::new(),
+            // Dimension MID — midpoint between the first two def points.
+            Geom::Dimension(d) => {
+                let g = d.grip_points();
+                if g.len() >= 2 { plain([(g[0] + g[1]) * 0.5]) } else { Vec::new() }
+            }
         },
         SnapKind::Cen => match e {
             Geom::Line(_)        => Vec::new(),
@@ -418,13 +429,25 @@ fn candidate_points(
             Geom::Point(_) | Geom::Polyline(_) | Geom::Hatch(_) | Geom::Spline(_) => Vec::new(),
             // Wall has no canonical centre.
             Geom::Wall(_) => Vec::new(),
+            // Text — anchor doubles as its "centre" for snapping.
+            Geom::Text(t) => plain([t.position]),
+            // Dimension CEN — for radius/diameter, the circle's center
+            // (first grip); for linear, no canonical centre.
+            Geom::Dimension(d) => {
+                use crate::dim::DimKind;
+                match &d.kind {
+                    DimKind::Radius { center, .. } |
+                    DimKind::Diameter { center, .. } => plain([*center]),
+                    DimKind::Linear { .. } => Vec::new(),
+                }
+            }
         },
         // QUA — for circles & arcs, four cardinal compass points; for
         // ellipses & elliptical arcs, the FOUR AXIS-END POINTS (ends of
         // the semi-major axis × 2 and the semi-minor axis × 2). These
         // ROTATE with the ellipse — they are NOT compass E/N/W/S.
         SnapKind::Qua => match e {
-            Geom::Line(_) | Geom::Point(_) | Geom::Polyline(_) | Geom::Hatch(_) | Geom::Spline(_) | Geom::Wall(_) => Vec::new(),
+            Geom::Line(_) | Geom::Point(_) | Geom::Polyline(_) | Geom::Hatch(_) | Geom::Spline(_) | Geom::Wall(_) | Geom::Text(_) | Geom::Dimension(_) => Vec::new(),
             Geom::Circle(c) => plain([
                 c.center + Vec2::new( c.radius, 0.0),    //   0°  east
                 c.center + Vec2::new(0.0,  c.radius),    //  90°  north
@@ -571,6 +594,19 @@ pub fn nearest_point_on(e: &Geom, p: Vec2) -> Option<Vec2> {
                 (None, None) => None,
             }
         }
+        // Text — nearest point on the entity = its anchor.
+        Geom::Text(t) => Some(t.position),
+        // Dimension — nearest def point.
+        Geom::Dimension(d) => {
+            let mut best: Option<(Vec2, f64)> = None;
+            for gp in d.grip_points() {
+                let dist = gp.dist(p);
+                if best.map_or(true, |(_, bd)| dist < bd) {
+                    best = Some((gp, dist));
+                }
+            }
+            best.map(|(pt, _)| pt)
+        }
     }
 }
 
@@ -687,6 +723,10 @@ pub fn perpendicular_extended(from: Vec2, geom: &Geom)
             }
             out
         }
+        // Text — perpendicular foot is just the anchor.
+        Geom::Text(t) => vec![(t.position, None)],
+        // Dimension PER — def points (anchor-less, since they're discrete).
+        Geom::Dimension(d) => d.grip_points().into_iter().map(|p| (p, None)).collect(),
     }
 }
 
@@ -819,6 +859,10 @@ pub fn tangent_points_extended(from: Vec2, e: &Geom, _cursor: Vec2)
             }
             out
         }
+        // Text — no tangent concept; anchor as the only candidate.
+        Geom::Text(t) => vec![(t.position, None)],
+        // Dimension — no tangent concept; def points as candidates.
+        Geom::Dimension(d) => d.grip_points().into_iter().map(|p| (p, None)).collect(),
     }
 }
 

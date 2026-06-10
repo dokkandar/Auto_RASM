@@ -11,21 +11,27 @@ use crate::dobject::DObject;
 use crate::layer::LayerTable;
 use crate::linetype::LinetypeTable;
 use crate::pen::PenTable;
+use crate::text::TextStyleTable;
+use crate::dim::DimStyleTable;
 
 #[derive(Clone)]
 pub struct Document {
-    pub dobjects:   Vec<DObject>,
-    pub layers:     LayerTable,
-    pub linetypes:  LinetypeTable,
-    pub pens:       PenTable,
+    pub dobjects:    Vec<DObject>,
+    pub layers:      LayerTable,
+    pub linetypes:   LinetypeTable,
+    pub pens:        PenTable,
     /// Shared 24-bit color table. Dobjects with `Color::TrueColorRef(idx)`
     /// look up their RGB here. Dedup'd on `intern`, so a million dobjects
     /// in the same color cost ~4 bytes once.
-    pub truecolors: TrueColorTable,
+    pub truecolors:  TrueColorTable,
+    /// Named text styles. Dobjects with `Geom::Text(t)` reference an
+    /// entry via `t.style`. Index 0 is reserved STANDARD.
+    pub text_styles: TextStyleTable,
+    /// Named dimension styles. Dobjects with `Geom::Dimension(d)`
+    /// reference an entry via `d.style`. Index 0 is reserved STANDARD.
+    pub dim_styles:  DimStyleTable,
     // Reserved for future slices — leave the field list extensible:
     // pub blocks:      BlockTable,
-    // pub text_styles: TextStyleTable,
-    // pub dim_styles:  DimStyleTable,
     // pub ucs_list:    UcsList,
     // pub named_views: NamedViewList,
     // pub doc_settings: DocSettings,
@@ -34,11 +40,13 @@ pub struct Document {
 impl Default for Document {
     fn default() -> Self {
         Self {
-            dobjects:   Vec::new(),
-            layers:     LayerTable::with_defaults(),
-            linetypes:  LinetypeTable::with_defaults(),
-            pens:       PenTable::default(),
-            truecolors: TrueColorTable::new(),
+            dobjects:    Vec::new(),
+            layers:      LayerTable::with_defaults(),
+            linetypes:   LinetypeTable::with_defaults(),
+            pens:        PenTable::default(),
+            truecolors:  TrueColorTable::new(),
+            text_styles: TextStyleTable::with_defaults(),
+            dim_styles:  DimStyleTable::with_defaults(),
         }
     }
 }

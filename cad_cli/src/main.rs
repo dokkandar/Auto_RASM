@@ -86,7 +86,9 @@ fn main() {
             | Ok(Command::Mirror) | Ok(Command::Hatch { .. }) | Ok(Command::DeleteSelected) | Ok(Command::Undo)
             | Ok(Command::Redo) | Ok(Command::MatchProps) | Ok(Command::Reverse)
             | Ok(Command::ChangeLayer) | Ok(Command::Offset(_)) | Ok(Command::Wall(_))
-            | Ok(Command::Linetype(_)) | Ok(Command::ChProp(_))
+            | Ok(Command::Linetype(_)) | Ok(Command::ChProp(_)) | Ok(Command::Text(_))
+            | Ok(Command::TextStyle(_)) | Ok(Command::DbgRecorder)
+            | Ok(Command::Dim) | Ok(Command::DimStyle(_))
             | Ok(Command::Lengthen(_)) | Ok(Command::Break) | Ok(Command::Align)
             | Ok(Command::Stretch) | Ok(Command::Trim) | Ok(Command::Extend)
             | Ok(Command::Fillet(_)) | Ok(Command::Chamfer(_)) | Ok(Command::Join)
@@ -157,5 +159,19 @@ fn describe(g: &Geom) -> String {
         Geom::Wall(w) => format!(
             "wall ({:.4},{:.4}) -> ({:.4},{:.4}) thk={:.4}",
             w.start.x, w.start.y, w.end.x, w.end.y, w.thickness),
+        Geom::Text(t) => format!(
+            "text \"{}\" @ ({:.4},{:.4}) h={:.4} ang={:.2}°",
+            t.text, t.position.x, t.position.y, t.height,
+            t.angle.to_degrees()),
+        Geom::Dimension(d) => {
+            use cad_kernel::DimKind;
+            let kind_name = match &d.kind {
+                DimKind::Linear { .. }   => "linear",
+                DimKind::Radius { .. }   => "radius",
+                DimKind::Diameter { .. } => "diameter",
+            };
+            format!("dim {} value={:.4} style={}",
+                kind_name, d.measured_value(), d.style)
+        }
     }
 }

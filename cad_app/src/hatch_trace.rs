@@ -220,7 +220,7 @@ fn tessellate_one(d: &DObject, src: usize, out: &mut Vec<TessSeg>) {
                 out.push(TessSeg { a: r.a, b: r.b, src });
             }
         }
-        Geom::Point(_) | Geom::Hatch(_) => {}
+        Geom::Point(_) | Geom::Hatch(_) | Geom::Text(_) | Geom::Dimension(_) => {}
     }
 }
 
@@ -602,7 +602,10 @@ pub struct TracedBoundary {
 /// the seed, or if every trace attempt failed.
 pub fn trace_boundary_at(doc: &Document, seed: Vec2) -> Option<TracedBoundary> {
     let raw = tessellate_doc(doc);
-    trace_boundary_from_raw(raw, seed)
+    let mut tb = trace_boundary_from_raw(raw, seed)?;
+    let scope: Vec<usize> = (0..doc.dobjects.len()).collect();
+    augment_islands_from_closed_dobjects(doc, &scope, seed, &mut tb);
+    Some(tb)
 }
 
 /// Viewport-scoped variant — tessellates ONLY dobjects whose indices
@@ -617,7 +620,9 @@ pub fn trace_boundary_at_in_view(
 ) -> Option<TracedBoundary> {
     let never = never_cancelled();
     let raw = tessellate_doc_in_view_cancellable(doc, scope, &never);
-    trace_boundary_from_raw(raw, seed)
+    let mut tb = trace_boundary_from_raw(raw, seed)?;
+    augment_islands_from_closed_dobjects(doc, scope, seed, &mut tb);
+    Some(tb)
 }
 
 /// Cancellable variant of `trace_boundary_at_in_view`. Used by the
@@ -633,7 +638,121 @@ pub fn trace_boundary_at_in_view_cancellable(
     if cancelled(cancel) { return None; }
     let segs = split_at_intersections_cancellable(&raw, cancel);
     if cancelled(cancel) { return None; }
-    trace_boundary_from_segs(segs, seed)
+    let mut tb = trace_boundary_from_segs(segs, seed)?;
+    // Ray-cast tracing only discovers loops that the +X ray actually
+    // crosses. Closed primitives that sit above/below the seed's
+    // horizontal ray (and therefore aren't hit) get silently missed
+    // as islands. Sweep the doc once more for closed dobjects fully
+    // contained in the traced outer and add them.
+    augment_islands_from_closed_dobjects(doc, scope, seed, &mut tb);
+    Some(tb)
+}
+
+/// Approximate a single closed kernel dobject as a polygon. Used for
+/// island detection — we need to know which closed primitives sit
+/// fully inside the traced outer so they can be cut out. Returns
+/// `None` for dobjects whose boundary isn't a single closed loop
+/// (lines, arcs, open polylines, etc.).
+fn closed_geom_to_polygon(d: &DObject) -> Option<Vec<Vec2>> {
+    use std::f64::consts::TAU;
+    match &d.geom {
+        Geom::Circle(c) => {
+            let n = 64;
+            let mut verts = Vec::with_capacity(n + 1);
+            for k in 0..=n {
+                let t = (k as f64) / (n as f64) * TAU;
+                verts.push(Vec2::new(
+                    c.center.x + c.radius * t.cos(),
+                    c.center.y + c.radius * t.sin()));
+            }
+            Some(verts)
+        }
+        Geom::Ellipse(e) => {
+            let n = 64;
+            let mut verts = Vec::with_capacity(n + 1);
+            for k in 0..=n {
+                let t = (k as f64) / (n as f64) * TAU;
+                verts.push(e.point_at(t));
+            }
+            Some(verts)
+        }
+        Geom::Polyline(p) if p.closed && p.vertices.len() >= 3 => {
+            let mut verts: Vec<Vec2> = Vec::new();
+            let n = p.vertices.len();
+            for k in 0..n {
+                let a = p.vertices[k].pos;
+                let b = p.vertices[(k + 1) % n].pos;
+                // Reuse the same bulge tessellation the segs path uses
+                // so the polygon matches the trace pipeline's idea of
+                // this boundary. push_bulged is private so duplicate
+                // the straight-edge case (most polylines) and accept
+                // bulged segments as straight chords here — good
+                // enough for island containment tests.
+                if p.vertices[k].bulge.abs() < 1e-9 {
+                    verts.push(a);
+                } else {
+                    // Approximate the arc with a few vertices.
+                    let bulge = p.vertices[k].bulge;
+                    let chord = b - a;
+                    let chord_len = chord.len();
+                    if chord_len < 1e-9 { verts.push(a); continue; }
+                    let sagitta = bulge * chord_len * 0.5;
+                    let radius = (chord_len * chord_len / 4.0 + sagitta * sagitta)
+                        / (2.0 * sagitta.abs());
+                    let _ = radius;  // not needed; sample by angle steps
+                    let steps = 12;
+                    for s in 0..steps {
+                        let t = (s as f64) / (steps as f64);
+                        verts.push(a + chord * t);
+                    }
+                }
+            }
+            // Close the loop
+            if let Some(first) = verts.first().copied() {
+                verts.push(first);
+            }
+            Some(verts)
+        }
+        _ => None,
+    }
+}
+
+/// After the main trace succeeds, scan `scope` for closed kernel
+/// dobjects that:
+///   * are fully inside the traced outer (every vertex inside),
+///   * do NOT contain the seed,
+///   * are not already represented in `tb.islands`.
+/// Each match becomes an additional island. Fixes the "+X ray missed
+/// this island" failure mode without changing the ray-based trace.
+fn augment_islands_from_closed_dobjects(
+    doc:   &Document,
+    scope: &[usize],
+    seed:  Vec2,
+    tb:    &mut TracedBoundary,
+) {
+    let (omin, omax) = polygon_bbox(&tb.outer);
+    for &idx in scope {
+        let Some(d) = doc.dobjects.get(idx) else { continue; };
+        let Some(poly) = closed_geom_to_polygon(d) else { continue; };
+        let (pmin, pmax) = polygon_bbox(&poly);
+        // Quick bbox reject before the expensive PIP loop.
+        if pmin.x < omin.x - JOIN_EPS || pmin.y < omin.y - JOIN_EPS
+            || pmax.x > omax.x + JOIN_EPS || pmax.y > omax.y + JOIN_EPS
+        { continue; }
+        // Seed must NOT be inside this poly — otherwise it would be a
+        // candidate for the outer, not an island.
+        if point_in_polygon(seed, &poly) { continue; }
+        // Don't duplicate islands already found via the ray trace.
+        if tb.islands.iter().any(|i| polygons_equivalent(i, &poly)) { continue; }
+        // Don't duplicate the outer.
+        if polygons_equivalent(&tb.outer, &poly) { continue; }
+        // Every vertex of the polygon must lie inside the outer.
+        // Even ONE vertex outside means the dobject crosses the outer
+        // boundary (probably split by chord lines) — let the ray-
+        // based trace handle that case rather than over-cutting.
+        if !poly.iter().all(|v| point_in_polygon(*v, &tb.outer)) { continue; }
+        tb.islands.push(poly);
+    }
 }
 
 /// Shared trace pipeline given the raw segment soup. Used by both the
@@ -644,6 +763,45 @@ fn trace_boundary_from_raw(raw: Vec<TessSeg>, seed: Vec2) -> Option<TracedBounda
     trace_boundary_from_segs(segs, seed)
 }
 
+/// Iteratively remove "dangle" segments — segments whose far endpoint
+/// is a graph node of degree 1. These are tree branches (open ends)
+/// that no closed walk can include; leaving them in causes
+/// `trace_loop` to walk INTO the dangle and fail when it can't
+/// continue past the free endpoint.
+///
+/// Repeat until stable: each removed segment may expose a new dangle
+/// at the OTHER endpoint, which we then also prune. After convergence,
+/// every surviving segment is on at least one cycle.
+///
+/// Operates by mutating `adj` and returning a `dead[seg]` mask. The
+/// segs / endpoints / cluster_pos arrays stay untouched — the trace
+/// walker reads adj exclusively for "what's next from this cluster",
+/// and ray_cast hits get filtered through `dead` so we never start a
+/// walk from a pruned segment either.
+fn prune_dangles(adj: &mut [Vec<AdjEntry>], n_segs: usize) -> Vec<bool> {
+    let mut dead = vec![false; n_segs];
+    loop {
+        let mut changed = false;
+        for c in 0..adj.len() {
+            // Filter previously-dead segs out of this cluster's adj.
+            let before = adj[c].len();
+            adj[c].retain(|(s, _, _)| !dead[*s]);
+            if adj[c].len() != before { changed = true; }
+            // If this leaves the cluster with exactly one outgoing
+            // edge, that edge is a dangle — kill it.
+            if adj[c].len() == 1 {
+                let (sidx, other, _) = adj[c][0];
+                dead[sidx] = true;
+                adj[c].clear();
+                adj[other].retain(|(s, _, _)| *s != sidx);
+                changed = true;
+            }
+        }
+        if !changed { break; }
+    }
+    dead
+}
+
 /// Shared trace pipeline given POST-SPLIT segments. Caller is
 /// responsible for any cancel checks during the upstream phases.
 fn trace_boundary_from_segs(segs: Vec<TessSeg>, seed: Vec2) -> Option<TracedBoundary> {
@@ -651,8 +809,19 @@ fn trace_boundary_from_segs(segs: Vec<TessSeg>, seed: Vec2) -> Option<TracedBoun
     // (no further split — segs are already split)
     let (endpoints, cluster_pos) = cluster_endpoints(&segs);
     let n_clusters = cluster_pos.len();
-    let adj = build_adjacency(&segs, &endpoints, n_clusters);
+    let mut adj = build_adjacency(&segs, &endpoints, n_clusters);
+    // Prune tree-branch dangles before tracing. Without this, lines
+    // crossing a closed boundary (e.g. a line through a circle) leave
+    // outside-the-circle stubs whose far endpoints are degree-1, and
+    // the CCW walker walks INTO them and fails. After pruning, every
+    // surviving edge is on at least one cycle and the walker closes.
+    let dead = prune_dangles(&mut adj, segs.len());
     let hits = ray_cast_horiz(seed, &segs);
+    // Hits on pruned (dangle) segments aren't valid starting points
+    // either — filter them out before iterating.
+    let hits: Vec<(f64, usize, Vec2)> = hits.into_iter()
+        .filter(|(_, sidx, _)| !dead[*sidx])
+        .collect();
     if hits.is_empty() { return None; }
 
     // Try to trace a loop from EACH hit. Each starting hit is a
@@ -857,6 +1026,72 @@ mod tests {
         assert!(area > 0.0 && area < single_circle_area * 0.5,
             "common-region area {} should be < half of one circle's area {}",
             area, single_circle_area);
+    }
+
+    /// REGRESSION: circle with a line crossing through it — the
+    /// line's two outside-the-circle stubs are dangles (their outer
+    /// endpoints are degree-1 graph nodes). Before the dangle-prune
+    /// pass, the CCW walker walked INTO one of those stubs and the
+    /// whole trace returned None. The chord splits the disk into two
+    /// half-discs; a seed in either half should trace a closed loop
+    /// strictly smaller than the full disc.
+    #[test]
+    fn circle_chord_with_outside_stubs_traces_half_disc() {
+        let doc = doc_from(vec![
+            Circle { center: Vec2::new(0.0, 0.0), radius: 10.0 }.into(),
+            // Horizontal chord — endpoints OUTSIDE the circle so the
+            // line has dangles on both sides.
+            Line { a: Vec2::new(-15.0, 0.0), b: Vec2::new(15.0, 0.0) }.into(),
+        ]);
+        // Seed in the lower half.
+        let tb = trace_boundary_at(&doc, Vec2::new(0.0, -5.0))
+            .expect("must trace lower half-disc despite outside-the-circle line stubs");
+        let area = polygon_signed_area(&tb.outer).abs();
+        let full_disc = std::f64::consts::PI * 100.0;
+        assert!(area > full_disc * 0.3 && area < full_disc * 0.7,
+            "half-disc area {} should be ~half of full disc {}", area, full_disc);
+    }
+
+    /// REGRESSION: circle with MULTIPLE crossing lines — every line
+    /// has both endpoints outside the circle, so all 8 line stubs are
+    /// dangles. Picking inside a sub-region bounded by an arc + line
+    /// chords must succeed.
+    #[test]
+    fn circle_with_many_crossing_lines() {
+        let doc = doc_from(vec![
+            Circle { center: Vec2::new(0.0, 0.0), radius: 10.0 }.into(),
+            Line { a: Vec2::new(-15.0, -3.0), b: Vec2::new(15.0,  3.0) }.into(),
+            Line { a: Vec2::new(-15.0,  3.0), b: Vec2::new(15.0, -3.0) }.into(),
+        ]);
+        // Seed in the small region just above the X crossing.
+        let tb = trace_boundary_at(&doc, Vec2::new(0.0, 5.0))
+            .expect("must trace a chord-bounded region of the disc");
+        let area = polygon_signed_area(&tb.outer).abs();
+        let full_disc = std::f64::consts::PI * 100.0;
+        assert!(area > 0.0 && area < full_disc,
+            "region area {} must be between 0 and full disc {}", area, full_disc);
+    }
+
+    /// REGRESSION: an island that the +X ray from the seed never
+    /// touches must still be detected. The ray-based trace only finds
+    /// loops the ray crosses, so a closed primitive lying entirely
+    /// above the seed's y is invisible to it. The post-trace doc
+    /// scan catches it.
+    #[test]
+    fn island_above_seed_is_detected_by_doc_scan() {
+        let doc = doc_from(vec![
+            // Outer container: big circle at origin r=20.
+            Circle { center: Vec2::new(0.0, 0.0), radius: 20.0 }.into(),
+            // Island fully above the seed (y range [8..12], r=2).
+            Circle { center: Vec2::new(0.0, 10.0), radius: 2.0 }.into(),
+        ]);
+        // Seed in the lower half — its +X ray (y=-5) never reaches
+        // the island at y∈[8,12].
+        let tb = trace_boundary_at(&doc, Vec2::new(0.0, -5.0))
+            .expect("must trace outer disc");
+        assert!(!tb.islands.is_empty(),
+            "island above the seed's ray must still appear in tb.islands; got {} islands",
+            tb.islands.len());
     }
 
     /// Splitting a single seg by itself is a no-op.

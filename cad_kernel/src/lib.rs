@@ -36,10 +36,14 @@ pub mod parser;
 pub mod construct;
 pub mod spatial;
 pub mod snap;
+pub mod text;
+pub mod dim;
 
 // Convenience re-exports
 pub use math::{approx_eq, approx_zero, norm_angle, Vec2, EPS};
 pub use geom::{Arc, Circle, Ellipse, EllipseArc, Geom, Hatch, HatchPattern, Line, Point, PolyVertex, Polyline, Spline, Wall};
+pub use text::{HAlign as TextHAlign, Text, TextStyle, TextStyleTable, VAlign as TextVAlign};
+pub use dim::{Dim, DimKind, DimStyle, DimStyleTable, LinearOrtho};
 pub mod patterns;
 pub use geom::{ChamferOut, FilletOut, GripRole, JoinOut, chamfer_lines, fillet_lines, join_geoms};
 pub use color::{aci_palette, resolve_color, Color, TrueColorTable};
