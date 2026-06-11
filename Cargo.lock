@@ -207,6 +207,7 @@ version = "0.1.0"
 dependencies = [
  "cad_io",
  "cad_kernel",
+ "cad_wall",
  "eframe",
  "egui",
  "egui_glow",
@@ -240,6 +241,13 @@ version = "0.1.0"
 
 [[package]]
 name = "cad_snap"
+version = "0.1.0"
+dependencies = [
+ "cad_kernel",
+]
+
+[[package]]
+name = "cad_wall"
 version = "0.1.0"
 dependencies = [
  "cad_kernel",

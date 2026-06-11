@@ -1643,12 +1643,43 @@ impl Geom {
                 Vec2::new(c.center.x - c.radius, c.center.y - c.radius),
                 Vec2::new(c.center.x + c.radius, c.center.y + c.radius),
             ),
-            Geom::Arc(a) => (
-                Vec2::new(a.center.x - a.radius, a.center.y - a.radius),
-                Vec2::new(a.center.x + a.radius, a.center.y + a.radius),
-            ),
+            // TIGHT arc bbox: the two endpoints, plus any cardinal extreme
+            // (+x/+y/-x/-y) the arc actually sweeps through. The old
+            // full-circle bbox broke window selection — an arc visually
+            // inside a window was rejected because its parent circle poked
+            // out of the box.
+            Geom::Arc(a) => {
+                let (e1, e2) = a.endpoints();
+                let mut min = Vec2::new(e1.x.min(e2.x), e1.y.min(e2.y));
+                let mut max = Vec2::new(e1.x.max(e2.x), e1.y.max(e2.y));
+                for k in 0..4 {
+                    let ang = k as f64 * std::f64::consts::FRAC_PI_2;
+                    let rel = (ang - a.start_angle).rem_euclid(std::f64::consts::TAU);
+                    if rel <= a.sweep_angle + 1e-12 {
+                        let p = Vec2::new(
+                            a.center.x + a.radius * ang.cos(),
+                            a.center.y + a.radius * ang.sin());
+                        min.x = min.x.min(p.x); min.y = min.y.min(p.y);
+                        max.x = max.x.max(p.x); max.y = max.y.max(p.y);
+                    }
+                }
+                (min, max)
+            }
             Geom::Ellipse(e)     => e.bbox(),
-            Geom::EllipseArc(ea) => ea.ellipse.bbox(),
+            // TIGHT elliptical-arc bbox by sampling — the full-ellipse bbox
+            // had the same window-selection bug as Arc.
+            Geom::EllipseArc(ea) => {
+                let n = 48;
+                let mut min = Vec2::new(f64::INFINITY, f64::INFINITY);
+                let mut max = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+                for i in 0..=n {
+                    let t = ea.start_param + ea.sweep_param * (i as f64 / n as f64);
+                    let p = ea.ellipse.point_at(t);
+                    min.x = min.x.min(p.x); min.y = min.y.min(p.y);
+                    max.x = max.x.max(p.x); max.y = max.y.max(p.y);
+                }
+                (min, max)
+            }
             Geom::Point(pt) => (pt.location, pt.location),
             Geom::Polyline(pl) => pl.bbox(),
             Geom::Hatch(h)  => h.bbox(),
@@ -3721,6 +3752,22 @@ mod fillet_chamfer_join_tests {
         // Loose bbox: expanded by thk/2 = 1.0 in both axes.
         assert!((min.y + 1.0).abs() < 1e-9);
         assert!((max.y - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn arc_bbox_is_tight_not_full_circle() {
+        // 45°→135° top-cap arc, r=5 at origin. Tight bbox must hug the cap,
+        // NOT return the full circle (that broke window selection).
+        let a = Arc {
+            center: Vec2::ZERO, radius: 5.0,
+            start_angle: std::f64::consts::FRAC_PI_4,
+            sweep_angle: std::f64::consts::FRAC_PI_2,
+        };
+        let (min, max) = Geom::Arc(a).bbox();
+        assert!((max.y - 5.0).abs() < 1e-6, "top cardinal swept → max.y=5, got {}", max.y);
+        assert!(min.y > 3.0, "bottom NOT swept → min.y ~3.54 (not -5), got {}", min.y);
+        assert!((max.x - 3.5355).abs() < 1e-3, "max.x from endpoint, got {}", max.x);
+        assert!((min.x + 3.5355).abs() < 1e-3, "min.x from endpoint, got {}", min.x);
     }
 
     #[test]

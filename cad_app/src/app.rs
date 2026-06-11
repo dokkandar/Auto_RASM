@@ -17231,7 +17231,7 @@ fn draw_dobject_thick(
                     .filter_map(|d| if let Geom::Wall(x) = &d.geom {
                         Some(x.clone()) } else { None })
                     .collect();
-                match crate::wall::solve_faces(w, &walls) {
+                match cad_wall::solve_faces(w, &walls) {
                     Some(f) => (
                         vec![app.w2s(f.left.0, rect),  app.w2s(f.left.1, rect)],
                         vec![app.w2s(f.right.0, rect), app.w2s(f.right.1, rect)],

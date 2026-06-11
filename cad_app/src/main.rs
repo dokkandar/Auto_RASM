@@ -4,7 +4,7 @@ mod dbg_recorder;
 mod gpu;
 mod hatch_trace;
 mod settings;
-mod wall;
+// wall feature logic now lives in the `cad_wall` crate (see ARCHITECTURE.md).
 
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
