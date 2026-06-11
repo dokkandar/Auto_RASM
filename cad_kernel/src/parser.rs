@@ -136,6 +136,9 @@ pub enum Command {
     /// style; `dimstyle <name>` opens it on the existing style
     /// (case-insensitive). Mirrors AutoCAD DDIM / DIMSTYLE.
     DimStyle(Option<String>),
+    /// Open the Wall Style Manager (Dry Wall / Structural / …). With a name,
+    /// pre-select / edit that wall style.
+    WallStyle(Option<String>),
     /// Lengthen every selected Line / Arc / EllipseArc by a signed delta.
     /// App captures a click on the end to extend.
     Lengthen(f64),
@@ -217,6 +220,7 @@ impl Command {
             Command::TextStyle(_)       => "TextStyle",
             Command::Dim                => "Dim",
             Command::DimStyle(_)        => "DimStyle",
+            Command::WallStyle(_)       => "WallStyle",
             Command::DbgRecorder        => "DbgRecorder",
             Command::Linetype(_)        => "Linetype",
             Command::ChProp(_)          => "ChProp",
@@ -379,6 +383,9 @@ pub fn parse(line: &str) -> Result<Command, String> {
             // `dimstyle`        → open dialog for a NEW dim style
             // `dimstyle <name>` → open dialog editing the named style
             Ok(Command::DimStyle(toks.get(1).map(|s| (*s).to_string())))
+        }
+        "wallstyle" | "wstyle" => {
+            Ok(Command::WallStyle(toks.get(1).map(|s| (*s).to_string())))
         }
         "text" | "tx" => {
             // `text`              → click position, then prompt for string

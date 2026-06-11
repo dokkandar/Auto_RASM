@@ -4,6 +4,7 @@ mod dbg_recorder;
 mod gpu;
 mod hatch_trace;
 mod settings;
+mod wall;
 
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {

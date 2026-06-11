@@ -405,6 +405,9 @@ pub fn read_rsm(bytes: &[u8]) -> Result<Document, String> {
         // Persisting the full ~70-DIMVAR table will land with the DXF
         // serializer pass.
         dim_styles: Default::default(),
+        // wall_styles: same — not round-tripped yet; reader synthesizes
+        // the STANDARD table. Walls read below default style=0/bulge=0.
+        wall_styles: Default::default(),
     })
 }
 
@@ -559,6 +562,8 @@ fn read_geom(r: &mut R) -> Result<Geom, String> {
         }
         9 => Geom::Wall(Wall {
             start: r.vec2()?, end: r.vec2()?, thickness: r.f64()?,
+            // style + bulge not yet in the RSM stream — default them.
+            style: 0, bulge: 0.0,
         }),
         10 => {
             let position = r.vec2()?;

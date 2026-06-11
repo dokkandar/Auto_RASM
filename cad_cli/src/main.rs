@@ -88,7 +88,7 @@ fn main() {
             | Ok(Command::ChangeLayer) | Ok(Command::Offset(_)) | Ok(Command::Wall(_))
             | Ok(Command::Linetype(_)) | Ok(Command::ChProp(_)) | Ok(Command::Text(_))
             | Ok(Command::TextStyle(_)) | Ok(Command::DbgRecorder)
-            | Ok(Command::Dim) | Ok(Command::DimStyle(_))
+            | Ok(Command::Dim) | Ok(Command::DimStyle(_)) | Ok(Command::WallStyle(_))
             | Ok(Command::Lengthen(_)) | Ok(Command::Break) | Ok(Command::Align)
             | Ok(Command::Stretch) | Ok(Command::Trim) | Ok(Command::Extend)
             | Ok(Command::Fillet(_)) | Ok(Command::Chamfer(_)) | Ok(Command::Join)

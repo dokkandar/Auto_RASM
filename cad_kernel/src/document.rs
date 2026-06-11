@@ -13,6 +13,7 @@ use crate::linetype::LinetypeTable;
 use crate::pen::PenTable;
 use crate::text::TextStyleTable;
 use crate::dim::DimStyleTable;
+use crate::wallstyle::WallStyleTable;
 
 #[derive(Clone)]
 pub struct Document {
@@ -30,6 +31,9 @@ pub struct Document {
     /// Named dimension styles. Dobjects with `Geom::Dimension(d)`
     /// reference an entry via `d.style`. Index 0 is reserved STANDARD.
     pub dim_styles:  DimStyleTable,
+    /// Named wall styles (Dry Wall / Structural / …). Walls reference an
+    /// entry via `w.style`. Index 0 is reserved STANDARD.
+    pub wall_styles: WallStyleTable,
     // Reserved for future slices — leave the field list extensible:
     // pub blocks:      BlockTable,
     // pub ucs_list:    UcsList,
@@ -47,6 +51,7 @@ impl Default for Document {
             truecolors:  TrueColorTable::new(),
             text_styles: TextStyleTable::with_defaults(),
             dim_styles:  DimStyleTable::with_defaults(),
+            wall_styles: WallStyleTable::with_defaults(),
         }
     }
 }

@@ -131,8 +131,8 @@ fn current_hint(tool: Tool, arc_method: ArcMethod, n: usize) -> &'static str {
         (Tool::None,   _) => "select a tool above, or type a command below",
         (Tool::Line,   0) => "line: click first endpoint",
         (Tool::Line,   _) => "line: click second endpoint    [Esc cancels]",
-        (Tool::Wall,   0) => "wall: click first centerline endpoint",
-        (Tool::Wall,   _) => "wall: click second centerline endpoint    [Esc cancels]",
+        (Tool::Wall,   0) => "wall: click first point of the run   (t = thickness)  [Esc exits]",
+        (Tool::Wall,   _) => "wall: click next point; corners auto-join.  t = thickness · Enter ends run  [Esc cancels]",
         (Tool::Text,   _) => "text: click anchor position    [Esc cancels]",
         (Tool::Dim,    _) => "dim: click defining point (D toggles radius/diameter, Esc cancels)",
         (Tool::Circle, 0) => "circle: click center",
@@ -521,6 +521,10 @@ pub struct CadApp {
     /// arms; the NEXT cmd-line input is consumed as the height value
     /// (NOT passed to the main parser). Mirrors `fillet_waiting_radius`.
     text_waiting_height: bool,
+    /// Wall tool `t`/`thickness` sub-option: a bare `t` arms this; the NEXT
+    /// cmd-line number is consumed as the wall thickness (persisted to
+    /// `WlThk`). Mirrors `text_waiting_height`.
+    wall_waiting_thickness: bool,
     /// Text Style dialog state — Add / Edit a TextStyle entry. None
     /// while the dialog is closed; Some when it's open and editing
     /// the given style id (or `None` inside to indicate "new style").
@@ -536,6 +540,14 @@ pub struct CadApp {
     /// The "current" dim style — new dims are created with this id.
     /// Mirrors AutoCAD's DIMSTYLE current. Defaults to STANDARD (0).
     current_dim_style:      u32,
+    /// The "current" wall style — new walls are created with this id, and
+    /// Set Current in the Wall Style Manager updates it (+ syncs WlThk).
+    current_wall_style:     u32,
+    /// Wall Style Manager (the `wallstyle` page) open flag + selected id;
+    /// `wall_style_dialog` is the New/Edit sub-form it launches.
+    wall_style_manager_open: bool,
+    wall_style_manager_sel:  u32,
+    wall_style_dialog:       Option<WallStyleDialog>,
     /// Text input popup — drives the discoverable Enter-Text dialog
     /// that opens at the click anchor when the user picks a text
     /// position. Without this the body capture happens silently in
@@ -987,6 +999,48 @@ impl DimStyleDialog {
     }
 }
 
+/// Which WallStyle color the shared ACI wheel is editing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WallColorSlot { Fill, Face }
+
+/// Add/Edit form for a `cad_kernel::WallStyle` — the wall "type" (Dry Wall,
+/// Structural, …). Parallel to `DimStyleDialog`.
+pub struct WallStyleDialog {
+    pub editing_id:  Option<u32>,
+    pub name:        String,
+    pub thickness:   f64,
+    /// Poché fill ACI; `None` = no fill (hollow wall).
+    pub fill_aci:    Option<u8>,
+    /// Face-line ACI; `None` = ByLayer (use the dobject color).
+    pub face_aci:    Option<u8>,
+    pub description: String,
+}
+
+impl WallStyleDialog {
+    pub fn new_blank() -> Self {
+        let s = cad_kernel::WallStyle::standard();
+        Self {
+            editing_id:  None,
+            name:        String::new(),
+            thickness:   s.thickness,
+            fill_aci:    None,
+            face_aci:    None,
+            description: String::new(),
+        }
+    }
+    pub fn from_existing(id: u32, s: &cad_kernel::WallStyle) -> Self {
+        let aci = |c: u32| if c == 0 { None } else { Some(c.min(255) as u8) };
+        Self {
+            editing_id:  Some(id),
+            name:        s.name.clone(),
+            thickness:   s.thickness,
+            fill_aci:    aci(s.fill_color),
+            face_aci:    aci(s.face_color),
+            description: s.description.clone(),
+        }
+    }
+}
+
 /// Grip drag — recorded when the user grabs a grip handle of a selected
 /// dobject (either by pressing+dragging OR clicking on it). v2: each grip
 /// has a role (`GripRole`) that decides what changes when the user moves
@@ -1177,6 +1231,8 @@ pub enum AciPickRequest {
     /// Picker is editing one of the Dim Style add/edit form's element
     /// colors (`dim_style_dialog`). The slot says which one.
     DimStyleForm(DimColorSlot),
+    /// Picker is editing a Wall Style form color (fill or face).
+    WallStyleForm(WallColorSlot),
 }
 
 impl Default for CadApp {
@@ -1291,11 +1347,16 @@ impl Default for CadApp {
             dim_draft:      DimDraftState::Off,
             pending_text:   None,
             text_waiting_height: false,
+            wall_waiting_thickness: false,
             text_style_dialog: None,
             dim_style_dialog:  None,
             dim_style_manager_open: false,
             dim_style_manager_sel:  0,
             current_dim_style:      0,
+            current_wall_style:     0,
+            wall_style_manager_open: false,
+            wall_style_manager_sel:  0,
+            wall_style_dialog:       None,
             text_input_dialog_open:     false,
             text_input_dialog_buf:      String::new(),
             text_input_dialog_anchor:   None,
@@ -2540,6 +2601,19 @@ impl CadApp {
                 self.dim_style_manager_open = true;
                 self.history.push(
                     "  Dimension Style Manager opened".into());
+            }
+            Ok(Command::WallStyle(name_opt)) => {
+                // Open the Wall Style Manager (Dry Wall / Structural / …).
+                if let Some(ref name) = name_opt {
+                    if let Some(id) = self.doc.wall_styles.find(name) {
+                        self.wall_style_manager_sel = id;
+                        self.current_wall_style     = id;
+                    }
+                } else {
+                    self.wall_style_manager_sel = self.current_wall_style;
+                }
+                self.wall_style_manager_open = true;
+                self.history.push("  Wall Style Manager opened".into());
             }
             Ok(Command::Wall(t_opt)) => {
                 // Persist thickness if user supplied one, then enter
@@ -5452,6 +5526,207 @@ impl CadApp {
     /// live preview (our OWN sample drawing) + Set Current / New… /
     /// Modify… / Override… / Compare…. New…/Modify… launch the
     /// `DimStyleDialog` add/edit sub-form (`render_dim_style_dialog`).
+    /// Wall Style Manager — the `wallstyle` page. Styles list + preview +
+    /// Set Current / New / Modify. New/Modify launch `WallStyleDialog`.
+    fn render_wall_style_manager(&mut self, ctx: &egui::Context) {
+        if !self.wall_style_manager_open { return; }
+        let mut open = true;
+        let mut do_close = false;
+        let mut do_new = false;
+        let mut do_modify = false;
+        let mut do_set_current = false;
+        let mut new_sel: Option<u32> = None;
+
+        let styles: Vec<(u32, String)> = self.doc.wall_styles.styles.iter()
+            .enumerate().map(|(i, s)| (i as u32, s.name.clone())).collect();
+        let max_id  = styles.len().saturating_sub(1) as u32;
+        let sel     = self.wall_style_manager_sel.min(max_id);
+        let current = self.current_wall_style.min(max_id);
+        let name_of = |id: u32| styles.get(id as usize)
+            .map(|(_, n)| n.clone()).unwrap_or_else(|| "STANDARD".into());
+        let cur_name  = name_of(current);
+        let sel_name  = name_of(sel);
+        let sel_style = self.doc.wall_styles.get(sel).cloned()
+            .unwrap_or_else(cad_kernel::WallStyle::standard);
+
+        egui::Window::new("Wall Style Manager")
+            .id(egui::Id::new("wall_style_manager"))
+            .open(&mut open).resizable(false).collapsible(false).movable(true)
+            .default_size(egui::vec2(640.0, 380.0))
+            .default_pos(egui::pos2(160.0, 80.0))
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new(
+                    format!("Current wall style:  {}", cur_name)).strong());
+                ui.add_space(6.0);
+                ui.horizontal_top(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label("Styles:");
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.set_width(150.0);
+                            egui::ScrollArea::vertical().max_height(240.0)
+                                .auto_shrink([false, false]).show(ui, |ui| {
+                                    ui.set_min_height(240.0);
+                                    for (id, nm) in &styles {
+                                        let txt = if *id == current {
+                                            format!("✔  {}", nm)
+                                        } else { format!("     {}", nm) };
+                                        let r = ui.selectable_label(*id == sel, txt);
+                                        if r.clicked() { new_sel = Some(*id); }
+                                        if r.double_clicked() {
+                                            new_sel = Some(*id); do_set_current = true; }
+                                    }
+                                });
+                        });
+                    });
+                    ui.vertical(|ui| {
+                        ui.label(format!("Preview of:  {}", sel_name));
+                        let (resp, painter) = ui.allocate_painter(
+                            egui::vec2(300.0, 240.0), egui::Sense::hover());
+                        painter.rect_filled(resp.rect, 4.0,
+                            egui::Color32::from_rgb(40, 42, 47));
+                        painter.rect_stroke(resp.rect, 4.0,
+                            egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 80, 95)));
+                        draw_wall_style_preview(&painter, resp.rect, &sel_style);
+                    });
+                    ui.vertical(|ui| {
+                        ui.add_space(18.0);
+                        let bw = 96.0;
+                        if ui.add_sized([bw, 24.0], egui::Button::new("Set Current")).clicked() { do_set_current = true; }
+                        ui.add_space(8.0);
+                        if ui.add_sized([bw, 24.0], egui::Button::new("New…")).clicked()    { do_new = true; }
+                        ui.add_space(8.0);
+                        if ui.add_sized([bw, 24.0], egui::Button::new("Modify…")).clicked() { do_modify = true; }
+                    });
+                });
+                ui.add_space(8.0);
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.set_width(560.0); ui.set_min_height(30.0);
+                    ui.label(format!(
+                        "{}  —  thickness {:.3} · fill {} · faces {}{}",
+                        sel_name, sel_style.thickness,
+                        if sel_style.fill_color == 0 { "none".to_string() }
+                            else { format!("ACI {}", sel_style.fill_color) },
+                        if sel_style.face_color == 0 { "ByLayer".to_string() }
+                            else { format!("ACI {}", sel_style.face_color) },
+                        if sel_style.description.is_empty() { String::new() }
+                            else { format!("  ·  {}", sel_style.description) }));
+                });
+                ui.add_space(6.0); ui.separator();
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Close").clicked() { do_close = true; }
+                    });
+                });
+            });
+
+        if let Some(id) = new_sel { self.wall_style_manager_sel = id; }
+        let target = new_sel.unwrap_or(sel);
+        if do_set_current {
+            self.current_wall_style = target;
+            if let Some(s) = self.doc.wall_styles.get(target) {
+                self.env.WlThk = s.thickness; let _ = self.env.save();
+            }
+            self.history.push(format!("  wall style: '{}' set current", name_of(target)));
+        }
+        if do_new    { self.wall_style_dialog = Some(WallStyleDialog::new_blank()); }
+        if do_modify { self.wall_style_dialog = Some(WallStyleDialog::from_existing(sel, &sel_style)); }
+        if !open || do_close { self.wall_style_manager_open = false; }
+    }
+
+    /// Add/Edit Wall Style sub-form (launched by the manager's New/Modify).
+    fn render_wall_style_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.wall_style_dialog.take() else { return; };
+        let mut open = true;
+        let mut do_ok = false;
+        let mut do_cancel = false;
+        let mut pick_slot: Option<WallColorSlot> = None;
+        egui::Window::new(if dialog.editing_id.is_some() {
+                "Edit Wall Style" } else { "New Wall Style" })
+            .id(egui::Id::new("wall_style_dialog"))
+            .open(&mut open).resizable(false).collapsible(false)
+            .default_size(egui::vec2(360.0, 240.0))
+            .default_pos(egui::pos2(240.0, 130.0))
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                egui::Grid::new("wall_style_form").num_columns(2)
+                    .spacing([8.0, 8.0]).show(ui, |ui| {
+                        ui.label("Name");
+                        ui.add(egui::TextEdit::singleline(&mut dialog.name)
+                            .desired_width(220.0).hint_text("Dry Wall, Structural…"));
+                        ui.end_row();
+                        ui.label("Thickness");
+                        ui.add(egui::DragValue::new(&mut dialog.thickness)
+                            .speed(0.01).range(0.0..=1000.0).min_decimals(3).max_decimals(3));
+                        ui.end_row();
+                        ui.label("Fill (poché)");
+                        ui.horizontal(|ui| {
+                            if dim_color_swatch(ui, &mut dialog.fill_aci) {
+                                pick_slot = Some(WallColorSlot::Fill); }
+                        });
+                        ui.end_row();
+                        ui.label("Face color");
+                        ui.horizontal(|ui| {
+                            if dim_color_swatch(ui, &mut dialog.face_aci) {
+                                pick_slot = Some(WallColorSlot::Face); }
+                        });
+                        ui.end_row();
+                        ui.label("Description");
+                        ui.add(egui::TextEdit::singleline(&mut dialog.description)
+                            .desired_width(220.0));
+                        ui.end_row();
+                    });
+                ui.add_space(10.0); ui.separator();
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Cancel").clicked() { do_cancel = true; }
+                        if ui.button("OK").clicked()     { do_ok = true; }
+                    });
+                });
+            });
+        if !open || do_cancel {
+            self.history.push("  wall style: cancelled".into());
+            return;
+        }
+        if do_ok {
+            let name = dialog.name.trim().to_string();
+            if name.is_empty() {
+                self.history.push("  ! wall style: name cannot be empty".into());
+                self.wall_style_dialog = Some(dialog); return;
+            }
+            if let Some(found) = self.doc.wall_styles.find(&name) {
+                if dialog.editing_id != Some(found) {
+                    self.history.push(format!("  ! wall style: '{}' already exists", name));
+                    self.wall_style_dialog = Some(dialog); return;
+                }
+            }
+            let new_style = cad_kernel::WallStyle {
+                name:        name.clone(),
+                thickness:   dialog.thickness,
+                fill_color:  dialog.fill_aci.map(|a| a as u32).unwrap_or(0),
+                face_color:  dialog.face_aci.map(|a| a as u32).unwrap_or(0),
+                description: dialog.description.clone(),
+            };
+            match dialog.editing_id {
+                Some(id) => {
+                    if let Some(s) = self.doc.wall_styles.styles.get_mut(id as usize) {
+                        *s = new_style;
+                        self.history.push(format!("  ⊛ wall style #{} '{}' updated", id, name));
+                    }
+                    self.gpu_dirty = true;
+                }
+                None => {
+                    let id = self.doc.wall_styles.add(new_style);
+                    self.history.push(format!("  + wall style #{} '{}' created", id, name));
+                }
+            }
+            return;
+        }
+        self.wall_style_dialog = Some(dialog);
+        if let Some(slot) = pick_slot {
+            self.aci_pick_request = Some(AciPickRequest::WallStyleForm(slot));
+        }
+    }
+
     fn render_dim_style_manager(&mut self, ctx: &egui::Context) {
         if !self.dim_style_manager_open { return; }
         let mut open           = true;
@@ -6994,6 +7269,10 @@ impl CadApp {
                 };
                 format!("ACI color — dimension {}", which)
             }
+            AciPickRequest::WallStyleForm(slot) => match slot {
+                WallColorSlot::Fill => "ACI color — wall fill".to_string(),
+                WallColorSlot::Face => "ACI color — wall faces".to_string(),
+            },
         };
 
         let mut open = true;
@@ -7119,6 +7398,14 @@ impl CadApp {
                             DimColorSlot::DimLine => d.color_aci      = Some(aci),
                             DimColorSlot::ExtLine => d.ext_color_aci  = Some(aci),
                             DimColorSlot::Text    => d.text_color_aci = Some(aci),
+                        }
+                    }
+                }
+                AciPickRequest::WallStyleForm(slot) => {
+                    if let Some(d) = self.wall_style_dialog.as_mut() {
+                        match slot {
+                            WallColorSlot::Fill => d.fill_aci = Some(aci),
+                            WallColorSlot::Face => d.face_aci = Some(aci),
                         }
                     }
                 }
@@ -8349,16 +8636,28 @@ impl CadApp {
             self.history.push("  ! fillet: same dobject clicked twice".into());
             return;
         }
-        // Both must be Lines for v1.
+        // Fillet operates on a CENTERLINE: a Line is its own centerline; a
+        // Wall contributes its centerline and keeps its thickness (the
+        // wall's identity). This is how two separate walls "reach and
+        // corner" — fillet extends/trims the centerlines to their
+        // intersection, then the wall faces re-derive (mitre) from the
+        // moved endpoints via `wall::solve_faces`.
         let Some(d1) = self.doc.dobjects.get(idx1) else { return; };
         let Some(d2) = self.doc.dobjects.get(idx2) else { return; };
-        let (l1, l2) = match (&d1.geom, &d2.geom) {
-            (Geom::Line(a), Geom::Line(b)) => (*a, *b),
-            _ => {
-                self.history.push(
-                    "  ! fillet: v1 supports LINE + LINE only (line/arc + arc/arc deferred)".into());
-                return;
+        // (Line, Some((thickness, wall_style_id)) if it's a Wall).
+        let wall_info = |g: &Geom| -> Option<(Line, Option<(f64, u32)>)> {
+            match g {
+                Geom::Line(a) => Some((*a, None)),
+                Geom::Wall(w) => Some((w.centerline(), Some((w.thickness, w.style)))),
+                _ => None,
             }
+        };
+        let (Some((l1, w1)), Some((l2, w2))) =
+            (wall_info(&d1.geom), wall_info(&d2.geom))
+        else {
+            self.history.push(
+                "  ! fillet: supports Line and Wall (its centerline) only".into());
+            return;
         };
         let style1 = d1.style;
         let style2 = d2.style;
@@ -8366,17 +8665,41 @@ impl CadApp {
         let trim = self.env.TrmMd;
         match cad_kernel::fillet_lines(&l1, pick1, &l2, pick2, r) {
             Ok(out) => {
-                // Trim mode → replace originals with kernel's shortened
-                // lines. No-trim mode → leave originals untouched, only
-                // append the arc. See AutoCAD TRIMMODE behavior.
+                // Trim mode → replace originals with the kernel's shortened
+                // centerlines, re-wrapped as Walls so they keep their
+                // identity (smart dobject), not become bare lines.
                 if trim {
-                    if let Some(d) = self.doc.dobjects.get_mut(idx1) { d.geom = out.g1_new; }
-                    if let Some(d) = self.doc.dobjects.get_mut(idx2) { d.geom = out.g2_new; }
+                    let rebuild = |g: Geom, w: Option<(f64, u32)>| -> Geom {
+                        if let (Some((t, st)), Geom::Line(l)) = (w, &g) {
+                            Geom::Wall(cad_kernel::Wall {
+                                start: l.a, end: l.b, thickness: t, style: st, bulge: 0.0,
+                            })
+                        } else { g }
+                    };
+                    let new1 = rebuild(out.g1_new, w1);
+                    let new2 = rebuild(out.g2_new, w2);
+                    if let Some(d) = self.doc.dobjects.get_mut(idx1) { d.geom = new1; }
+                    if let Some(d) = self.doc.dobjects.get_mut(idx2) { d.geom = new2; }
                 }
-                if let Some(arc) = out.arc {
-                    let mut d = DObject::new(arc);
-                    // Arc inherits style from the FIRST clicked line — same
-                    // convention AutoCAD uses for the fillet entity.
+                if let Some(arc_geom) = out.arc {
+                    // r>0 corner arc. If either side is a WALL, the rounded
+                    // corner becomes a CURVED WALL (scenario 1b): its
+                    // centerline is the arc (stored as bulge), faces derive
+                    // as concentric arcs. Otherwise it's a plain Arc.
+                    let wall_side = w1.or(w2);
+                    let g = if let (Some((thk, st)), Geom::Arc(arc)) =
+                        (wall_side, &arc_geom)
+                    {
+                        let (sp, ep) = arc.endpoints();
+                        let bulge = cad_kernel::bulge_from_arc(
+                            sp, ep, arc.center, arc.sweep_angle);
+                        Geom::Wall(cad_kernel::Wall {
+                            start: sp, end: ep, thickness: thk, style: st, bulge,
+                        })
+                    } else {
+                        arc_geom
+                    };
+                    let mut d = DObject::new(g);
                     d.style = style1;
                     let _ = style2;
                     self.doc.push(d);
@@ -9278,22 +9601,28 @@ impl CadApp {
                 self.add_dobject(g, "canvas");
             }
             (Tool::Wall, 2) => {
-                // SMART DOBJECT: one Geom::Wall, not two Lines. The
-                // kernel knows how to render it as two parallel side
-                // lines and apply all editing ops to the centerline.
+                // SMART DOBJECT: one Geom::Wall, not two Lines. The kernel
+                // renders it as two side lines; `wall::solve_faces` mitres
+                // the corner wherever endpoints coincide.
                 let start = self.pending[0];
                 let end   = self.pending[1];
-                self.pending.clear();
                 let thk = self.env.WlThk;
                 if (end - start).len() < EPS || thk <= 1e-9 {
-                    self.history.push(
-                        "  ! wall: zero-length centerline or non-positive thickness".into());
+                    // Degenerate click (no motion / bad thickness): drop the
+                    // duplicate point but keep the chain anchored.
+                    self.pending = vec![start];
                 } else {
                     self.add_dobject(
-                        Geom::Wall(cad_kernel::Wall { start, end, thickness: thk }),
+                        Geom::Wall(cad_kernel::Wall {
+                            start, end, thickness: thk,
+                            style: self.current_wall_style, bulge: 0.0,
+                        }),
                         "canvas");
-                    self.history.push(format!(
-                        "  + wall: thickness={}", thk));
+                    self.history.push(format!("  + wall: thickness={}", thk));
+                    // CHAINED drawing: retain the end as the start of the
+                    // next segment, so a run of walls shares endpoints and
+                    // auto-mitres. Enter/Esc ends the run.
+                    self.pending = vec![end];
                 }
             }
             (Tool::Text, 1) => {
@@ -11533,6 +11862,7 @@ impl eframe::App for CadApp {
             self.pending_bulges.clear();
             self.pline_mode = PlineMode::Line;
             self.pline_arc_sub = PlineArcSub::Normal;
+            self.wall_waiting_thickness = false;
             self.tool = Tool::None;
             self.picking_source = false;
             // Set the cooperative-cancellation flag for any long-
@@ -11753,6 +12083,12 @@ impl eframe::App for CadApp {
                 self.pending_bulges.clear();
                 let spline = cad_kernel::Spline::new_bspline(degree, ctrls);
                 self.add_dobject(Geom::Spline(spline), "canvas");
+            } else if self.tool == Tool::Wall && !self.pending.is_empty() {
+                // Chained wall run: each segment is committed live, so Enter
+                // just ends the run. Tool stays active for a fresh run.
+                self.pending.clear();
+                self.history.push("  wall: run ended".into());
+                self.clear_prompt();
             } else if matches!(self.offset_state, OffsetState::WaitingForObject(_)) {
                 // Offset's loop exit: Enter at "Select object" returns
                 // to Off. Matches AutoCAD's `Select object to offset
@@ -11821,6 +12157,37 @@ impl eframe::App for CadApp {
                     self.pline_mode = PlineMode::Line;
                 }
             }
+        }
+
+        // Wall `t`/`thickness` sub-option — set the wall thickness mid
+        // command (persists to WlThk). `t` alone arms a wait for the next
+        // number; `t <val>` (or `t5`) sets it directly; when armed, a bare
+        // number sets it. Eaten before the parser so `t` isn't a bad cmd.
+        if self.tool == Tool::Wall && enter_now && !cmd_is_empty {
+            let s = self.cmd.trim().to_ascii_lowercase();
+            let mut new_thk: Option<f64> = None;
+            let mut handled = false;
+            if s == "t" || s == "thickness" {
+                self.wall_waiting_thickness = true;
+                self.set_prompt(format!(
+                    "wall: type thickness then Enter  (current {})", self.env.WlThk));
+                handled = true;
+            } else if let Some(rest) = s.strip_prefix('t') {
+                if let Ok(v) = rest.trim().parse::<f64>() { new_thk = Some(v); handled = true; }
+            } else if self.wall_waiting_thickness {
+                if let Ok(v) = s.parse::<f64>() { new_thk = Some(v); handled = true; }
+            }
+            if let Some(v) = new_thk {
+                if v > 1e-9 {
+                    self.env.WlThk = v;
+                    let _ = self.env.save();
+                    self.history.push(format!("  wall: thickness = {}", v));
+                } else {
+                    self.history.push("  ! wall: thickness must be positive".into());
+                }
+                self.wall_waiting_thickness = false;
+            }
+            if handled { self.cmd.clear(); }
         }
 
         // ---- UI.2: MENUBAR (very top) -----------------------------------
@@ -12002,6 +12369,23 @@ impl eframe::App for CadApp {
                         .clicked()
                     {
                         self.run_command("dimstyle");
+                        ui.close_menu();
+                    }
+                });
+                ui.menu_button("Wall", |ui| {
+                    if ui.button("Wall  (chained run — t = thickness)")
+                        .on_hover_text("Click points for a connected run; corners auto-join. Enter ends the run")
+                        .clicked()
+                    {
+                        self.run_command("wall");
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Wall Style…")
+                        .on_hover_text("Wall types (Dry Wall / Structural / …): thickness, poché fill, face color")
+                        .clicked()
+                    {
+                        self.run_command("wallstyle");
                         ui.close_menu();
                     }
                 });
@@ -12232,7 +12616,12 @@ impl eframe::App for CadApp {
                         self.pending.len()), green),
                     Tool::Arc     => (format!("DRAWING ARC ({})",
                         self.arc_method.name()), green),
-                    Tool::Wall    => (format!("DRAWING WALL (thickness={})", self.env.WlThk), green),
+                    Tool::Wall    => (
+                        if self.pending.is_empty() {
+                            format!("DRAWING WALL run (thickness={}) — click start", self.env.WlThk)
+                        } else {
+                            format!("DRAWING WALL run (thickness={}) — click next; Enter ends", self.env.WlThk)
+                        }, green),
                     Tool::Text    => (format!("PLACING TEXT (height={})", self.env.TxHt), green),
                     Tool::Dim     => {
                         let phase = match &self.dim_draft {
@@ -12747,6 +13136,8 @@ impl eframe::App for CadApp {
         self.render_hatch_dialog(ctx);
         self.render_text_style_dialog(ctx);
         self.render_dim_style_manager(ctx);
+        self.render_wall_style_manager(ctx);
+        self.render_wall_style_dialog(ctx);
         self.render_dim_style_dialog(ctx);
         self.render_text_input_dialog(ctx);
         self.render_dbg_recorder_window(ctx);
@@ -15627,6 +16018,7 @@ impl eframe::App for CadApp {
                             // preview matches what apply will draw.
                             let ghost = cad_kernel::Wall {
                                 start: *a, end: cw, thickness: self.env.WlThk,
+                                style: self.current_wall_style, bulge: 0.0,
                             };
                             if let Some(l) = ghost.left_line() {
                                 painter.line_segment(
@@ -16804,27 +17196,78 @@ fn draw_dobject_thick(
             painter.add(egui::Shape::line(pts, stroke));
         }
         Geom::Wall(w) => {
-            // Solid sides + optional dashed centerline (gated by the
-            // WlCnL SYSVAR — true while we're developing the wall-
-            // aware fillet, off for production).
-            if let Some(l) = w.left_line() {
-                painter.line_segment(
-                    [app.w2s(l.a, rect), app.w2s(l.b, rect)], stroke);
+            // Resolve the WallStyle → face color override + poché fill.
+            let wstyle = app.doc.wall_styles.get(w.style);
+            let face_col = match wstyle {
+                Some(s) if s.face_color != 0 => {
+                    let (r, g, b) = aci_palette(s.face_color.min(255) as u8);
+                    egui::Color32::from_rgb(r, g, b)
+                }
+                _ => color,
+            };
+            let face_stroke = egui::Stroke::new(width, face_col);
+            let fill_aci = wstyle.map(|s| s.fill_color).unwrap_or(0);
+
+            // Build the two face polylines (screen space).
+            let (left_pts, right_pts): (Vec<egui::Pos2>, Vec<egui::Pos2>) =
+            if w.is_curved() {
+                // Curved corner wall — offset a tessellated centerline
+                // per-point along the local CCW normal (sign-robust).
+                let cl = w.centerline_polyline(28);
+                let n = cl.len();
+                let mut lp = Vec::with_capacity(n);
+                let mut rp = Vec::with_capacity(n);
+                for i in 0..n {
+                    let p = cl[i];
+                    let dir = if i + 1 < n { cl[i + 1] - p } else { p - cl[i - 1] };
+                    let nrm = dir.perp().normalized();
+                    lp.push(app.w2s(p + nrm * (w.thickness * 0.5), rect));
+                    rp.push(app.w2s(p - nrm * (w.thickness * 0.5), rect));
+                }
+                (lp, rp)
+            } else {
+                // Straight wall — mitred faces from the join solver.
+                let walls: Vec<cad_kernel::Wall> = app.doc.dobjects.iter()
+                    .filter_map(|d| if let Geom::Wall(x) = &d.geom {
+                        Some(x.clone()) } else { None })
+                    .collect();
+                match crate::wall::solve_faces(w, &walls) {
+                    Some(f) => (
+                        vec![app.w2s(f.left.0, rect),  app.w2s(f.left.1, rect)],
+                        vec![app.w2s(f.right.0, rect), app.w2s(f.right.1, rect)],
+                    ),
+                    None => match (w.left_line(), w.right_line()) {
+                        (Some(l), Some(r)) => (
+                            vec![app.w2s(l.a, rect), app.w2s(l.b, rect)],
+                            vec![app.w2s(r.a, rect), app.w2s(r.b, rect)],
+                        ),
+                        _ => (Vec::new(), Vec::new()),
+                    },
+                }
+            };
+
+            // Poché fill — footprint quad (left ++ reversed right). Convex
+            // for straight walls; skip curved (would need a concave path).
+            if fill_aci != 0 && !w.is_curved()
+                && left_pts.len() == 2 && right_pts.len() == 2
+            {
+                let (fr, fg, fb) = aci_palette(fill_aci.min(255) as u8);
+                let poly = vec![left_pts[0], left_pts[1], right_pts[1], right_pts[0]];
+                painter.add(egui::Shape::convex_polygon(
+                    poly, egui::Color32::from_rgba_unmultiplied(fr, fg, fb, 80),
+                    egui::Stroke::NONE));
             }
-            if let Some(r) = w.right_line() {
-                painter.line_segment(
-                    [app.w2s(r.a, rect), app.w2s(r.b, rect)], stroke);
-            }
+            // Faces.
+            if left_pts.len()  >= 2 { painter.add(egui::Shape::line(left_pts,  face_stroke)); }
+            if right_pts.len() >= 2 { painter.add(egui::Shape::line(right_pts, face_stroke)); }
+
             if app.env.WlCnL {
-                // Centerline rendered as a dashed line in the same
-                // colour but at half-alpha so it reads as a debug
-                // overlay rather than primary geometry.
                 let cl_col = egui::Color32::from_rgba_unmultiplied(
                     color.r(), color.g(), color.b(), 110);
                 let cl_stroke = egui::Stroke::new(width * 0.8, cl_col);
-                let a = app.w2s(w.start, rect);
-                let b = app.w2s(w.end,   rect);
-                for s in egui::Shape::dashed_line(&[a, b], cl_stroke, 6.0, 4.0) {
+                let clpts: Vec<egui::Pos2> = w.centerline_polyline(28).iter()
+                    .map(|p| app.w2s(*p, rect)).collect();
+                for s in egui::Shape::dashed_line(&clpts, cl_stroke, 6.0, 4.0) {
                     painter.add(s);
                 }
             }
@@ -17203,6 +17646,38 @@ fn dim_color_swatch(ui: &mut egui::Ui, val: &mut Option<u8>) -> bool {
 /// drawn from the given style's arrow size / text height / decimals /
 /// color. Deliberately NOT AutoCAD's L-bracket sample. Self-contained:
 /// maps a fixed sample-world box into `rect` (no global camera).
+/// Sample preview for the Wall Style Manager — a short wall segment showing
+/// the style's thickness, poché fill, and face color.
+fn draw_wall_style_preview(painter: &egui::Painter, rect: egui::Rect, style: &cad_kernel::WallStyle) {
+    let cx = rect.center().x;
+    let cy = rect.center().y;
+    let half_len = rect.width() * 0.32;
+    // Map thickness to px (STANDARD 0.2 → ~26px), clamped to fit.
+    let h = ((style.thickness as f32) * 130.0).clamp(8.0, rect.height() * 0.45);
+    let r = egui::Rect::from_center_size(egui::pos2(cx, cy), egui::vec2(half_len * 2.0, h));
+    if style.fill_color != 0 {
+        let (fr, fg, fb) = aci_palette(style.fill_color.min(255) as u8);
+        painter.rect_filled(r, 0.0, egui::Color32::from_rgba_unmultiplied(fr, fg, fb, 90));
+    }
+    let face_col = if style.face_color != 0 {
+        let (a, b, c) = aci_palette(style.face_color.min(255) as u8);
+        egui::Color32::from_rgb(a, b, c)
+    } else {
+        egui::Color32::from_rgb(236, 241, 248)
+    };
+    let s = egui::Stroke::new(1.6, face_col);
+    painter.line_segment([r.left_top(), r.right_top()], s);
+    painter.line_segment([r.left_bottom(), r.right_bottom()], s);
+    let cl = egui::Stroke::new(1.0, egui::Color32::from_rgb(120, 140, 160));
+    for seg in egui::Shape::dashed_line(
+        &[egui::pos2(r.left() - 12.0, cy), egui::pos2(r.right() + 12.0, cy)], cl, 6.0, 4.0) {
+        painter.add(seg);
+    }
+    painter.text(egui::pos2(cx, r.bottom() + 14.0), egui::Align2::CENTER_TOP,
+        format!("t = {:.3}", style.thickness),
+        egui::FontId::proportional(13.0), face_col);
+}
+
 fn draw_dim_style_preview(
     painter: &egui::Painter,
     rect:    egui::Rect,

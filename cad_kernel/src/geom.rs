@@ -21,9 +21,39 @@ pub struct Wall {
     pub start:     Vec2,
     pub end:       Vec2,
     pub thickness: f64,
+    /// WallStyle id (drywall / structural / …). 0 = STANDARD. Drives the
+    /// poché fill + (optionally) thickness; see `WallStyleTable`.
+    pub style:     u32,
+    /// Centerline bulge (polyline/DXF convention = tan(sweep/4)): 0 = a
+    /// straight segment; ≠ 0 = the centerline is a circular arc from
+    /// start→end. Used for rounded wall corners — a fillet (r>0) on two
+    /// straight walls spawns a curved corner wall.
+    pub bulge:     f64,
 }
 
 impl Wall {
+    /// True when the centerline is an arc (rounded corner wall).
+    pub fn is_curved(&self) -> bool { self.bulge.abs() > 1e-9 }
+
+    /// Tessellate the CENTERLINE into a polyline: 2 points for a straight
+    /// wall, `n`+1 points along the arc for a curved one. Faces are derived
+    /// by offsetting each point ±t/2 along the local normal (sign-robust).
+    pub fn centerline_polyline(&self, n: usize) -> Vec<Vec2> {
+        if !self.is_curved() {
+            return vec![self.start, self.end];
+        }
+        match bulge_arc(self.start, self.end, self.bulge) {
+            Some((center, r, a0, sweep)) => {
+                let steps = n.max(2);
+                (0..=steps).map(|i| {
+                    let t = a0 + sweep * (i as f64 / steps as f64);
+                    Vec2::new(center.x + r * t.cos(), center.y + r * t.sin())
+                }).collect()
+            }
+            None => vec![self.start, self.end],
+        }
+    }
+
     /// CCW unit normal of the centerline direction. `None` if the
     /// centerline is degenerate (start ≈ end).
     pub fn normal(&self) -> Option<Vec2> {
@@ -56,6 +86,31 @@ impl Wall {
     pub fn length(&self) -> f64 {
         (self.end - self.start).len()
     }
+}
+
+/// Circular arc through `a`→`b` with DXF `bulge` (= tan(sweep/4)). Returns
+/// `(center, radius, start_angle, signed_sweep)`; signed sweep is
+/// `4·atan(bulge)` so positive = CCW, negative = CW. `None` if degenerate.
+pub fn bulge_arc(a: Vec2, b: Vec2, bulge: f64) -> Option<(Vec2, f64, f64, f64)> {
+    let chord = b - a;
+    let l = chord.len();
+    if l < EPS || bulge.abs() < 1e-12 { return None; }
+    let r = l * (1.0 + bulge * bulge) / (4.0 * bulge.abs());
+    let mid = (a + b) * 0.5;
+    let perp = chord.perp() / l;
+    let d = r * (1.0 - bulge * bulge) / (1.0 + bulge * bulge);
+    let center = mid + perp * (d * bulge.signum());
+    let start_angle = (a - center).angle();
+    let sweep = 4.0 * bulge.atan();
+    Some((center, r, start_angle, sweep))
+}
+
+/// The DXF bulge for the arc start→end whose centre is `center`
+/// (= tan(sweep/4), signed: + when the centre is on the LEFT of start→end).
+pub fn bulge_from_arc(start: Vec2, end: Vec2, center: Vec2, sweep_abs: f64) -> f64 {
+    let perp = (end - start).perp();
+    let sign = if (center - start).dot(perp) >= 0.0 { 1.0 } else { -1.0 };
+    sign * (sweep_abs * 0.5 * 0.5).tan()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -472,6 +527,8 @@ impl Geom {
                 start:     rot(w.start),
                 end:       rot(w.end),
                 thickness: w.thickness,
+                style:     w.style,
+                bulge:     w.bulge,        // rotation preserves arc winding
             }),
             // Text — rotate the anchor + bump the text's own angle.
             Geom::Text(t) => {
@@ -537,6 +594,8 @@ impl Geom {
                 start:     sc(w.start),
                 end:       sc(w.end),
                 thickness: w.thickness * f_abs,
+                style:     w.style,
+                bulge:     w.bulge,        // tan(sweep/4) is scale-invariant
             }),
             // Text — scale anchor + height (angle invariant under
             // uniform scale).
@@ -622,6 +681,8 @@ impl Geom {
                 start:     mirror(w.start),
                 end:       mirror(w.end),
                 thickness: w.thickness,
+                style:     w.style,
+                bulge:     -w.bulge,       // reflection flips arc winding
             }),
             // Text — mirror the anchor; reflect the text angle by the
             // mirror axis. Text content remains readable (would appear
@@ -724,6 +785,8 @@ impl Geom {
                         start: new_line.a,
                         end:   new_line.b,
                         thickness: w.thickness,
+                        style: w.style,
+                        bulge: 0.0,        // lengthen yields a straight wall
                     }))
                 } else { Err("lengthen wall: unexpected non-Line result") }
             }
@@ -1029,6 +1092,7 @@ impl Geom {
                     if let Geom::Line(seg) = g {
                         Some(Geom::Wall(Wall {
                             start: seg.a, end: seg.b, thickness: w.thickness,
+                            style: w.style, bulge: 0.0,
                         }))
                     } else { None }
                 }).collect())
@@ -1130,6 +1194,7 @@ impl Geom {
                     Ok(Geom::Wall(Wall {
                         start: new_line.a, end: new_line.b,
                         thickness: w.thickness,
+                        style: w.style, bulge: 0.0,
                     }))
                 } else { Err("extend wall: unexpected non-Line result") }
             }
@@ -1238,8 +1303,8 @@ impl Geom {
                 let (g1, g2) = line.split_at(at)?;
                 match (g1, g2) {
                     (Geom::Line(l1), Geom::Line(l2)) => Ok((
-                        Geom::Wall(Wall { start: l1.a, end: l1.b, thickness: w.thickness }),
-                        Geom::Wall(Wall { start: l2.a, end: l2.b, thickness: w.thickness }),
+                        Geom::Wall(Wall { start: l1.a, end: l1.b, thickness: w.thickness, style: w.style, bulge: 0.0 }),
+                        Geom::Wall(Wall { start: l2.a, end: l2.b, thickness: w.thickness, style: w.style, bulge: 0.0 }),
                     )),
                     _ => Err("split wall: unexpected non-Line result"),
                 }
@@ -1334,6 +1399,7 @@ impl Geom {
                 if let Geom::Line(l) = g {
                     Ok(Geom::Wall(Wall {
                         start: l.a, end: l.b, thickness: w.thickness,
+                        style: w.style, bulge: 0.0,
                     }))
                 } else { Err("offset wall: unexpected non-Line result") }
             }
@@ -1414,6 +1480,7 @@ impl Geom {
             // CCW normal flips, but the geometry is identical.
             Geom::Wall(w) => Geom::Wall(Wall {
                 start: w.end, end: w.start, thickness: w.thickness,
+                style: w.style, bulge: -w.bulge,   // reversing flips winding
             }),
             // Text — reversal has no geometric meaning. Clone.
             Geom::Text(t) => Geom::Text(t.clone()),
@@ -1471,6 +1538,7 @@ impl Geom {
             }),
             Geom::Wall(w) => Geom::Wall(Wall {
                 start: w.start + off, end: w.end + off, thickness: w.thickness,
+                style: w.style, bulge: w.bulge,
             }),
             Geom::Text(t) => {
                 let mut nt = t.clone();
@@ -2560,9 +2628,11 @@ impl Geom {
             // on render so the wall moves coherently as one entity.
             (Geom::Wall(w), GripRole::LineEndA) => Geom::Wall(Wall {
                 start: new_pos, end: w.end, thickness: w.thickness,
+                style: w.style, bulge: w.bulge,
             }),
             (Geom::Wall(w), GripRole::LineEndB) => Geom::Wall(Wall {
                 start: w.start, end: new_pos, thickness: w.thickness,
+                style: w.style, bulge: w.bulge,
             }),
             (Geom::Wall(w), GripRole::LineMid) => {
                 // Move the whole wall — translate by (new_pos - current mid).
@@ -2571,6 +2641,7 @@ impl Geom {
                 Geom::Wall(Wall {
                     start: w.start + off, end: w.end + off,
                     thickness: w.thickness,
+                    style: w.style, bulge: w.bulge,
                 })
             }
             // ---- Dimension --------------------------------------------------
@@ -3604,7 +3675,7 @@ mod fillet_chamfer_join_tests {
     #[test]
     fn wall_translated_moves_centerline_keeps_thickness() {
         let w = Wall { start: Vec2::new(0.0, 0.0), end: Vec2::new(10.0, 0.0),
-                       thickness: 2.0 };
+                       thickness: 2.0, style: 0, bulge: 0.0 };
         let g = Geom::Wall(w).translated(Vec2::new(5.0, 3.0));
         if let Geom::Wall(w2) = g {
             assert_eq!(w2.start, Vec2::new(5.0, 3.0));
@@ -3615,7 +3686,7 @@ mod fillet_chamfer_join_tests {
 
     #[test]
     fn wall_scaled_scales_thickness() {
-        let w = Wall { start: Vec2::ZERO, end: Vec2::new(4.0, 0.0), thickness: 1.0 };
+        let w = Wall { start: Vec2::ZERO, end: Vec2::new(4.0, 0.0), thickness: 1.0, style: 0, bulge: 0.0 };
         let g = Geom::Wall(w).scaled(Vec2::ZERO, 2.5);
         if let Geom::Wall(w2) = g {
             assert!((w2.end.x - 10.0).abs() < 1e-12);
@@ -3625,7 +3696,7 @@ mod fillet_chamfer_join_tests {
 
     #[test]
     fn wall_rotated_90_swaps_axes() {
-        let w = Wall { start: Vec2::ZERO, end: Vec2::new(5.0, 0.0), thickness: 1.0 };
+        let w = Wall { start: Vec2::ZERO, end: Vec2::new(5.0, 0.0), thickness: 1.0, style: 0, bulge: 0.0 };
         let g = Geom::Wall(w).rotated(Vec2::ZERO, std::f64::consts::FRAC_PI_2);
         if let Geom::Wall(w2) = g {
             assert!((w2.end - Vec2::new(0.0, 5.0)).len() < 1e-9);
@@ -3638,17 +3709,30 @@ mod fillet_chamfer_join_tests {
         // Horizontal wall along the X-axis, thickness 2 → sides at y=±1.
         // Point at (5, 0.3) is distance 0.7 from the upper side and 1.3 from the lower.
         let w = Wall { start: Vec2::new(0.0, 0.0), end: Vec2::new(10.0, 0.0),
-                       thickness: 2.0 };
+                       thickness: 2.0, style: 0, bulge: 0.0 };
         let d = Geom::Wall(w).distance_to_point(Vec2::new(5.0, 0.3));
         assert!((d - 0.7).abs() < 1e-9);
     }
 
     #[test]
     fn wall_bbox_includes_thickness() {
-        let w = Wall { start: Vec2::ZERO, end: Vec2::new(10.0, 0.0), thickness: 2.0 };
+        let w = Wall { start: Vec2::ZERO, end: Vec2::new(10.0, 0.0), thickness: 2.0, style: 0, bulge: 0.0 };
         let (min, max) = Geom::Wall(w).bbox();
         // Loose bbox: expanded by thk/2 = 1.0 in both axes.
         assert!((min.y + 1.0).abs() < 1e-9);
         assert!((max.y - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bulge_roundtrip_reconstructs_arc() {
+        // CCW quarter arc, radius 5, centre origin: (5,0) → (0,5), sweep 90°.
+        let center = Vec2::new(0.0, 0.0);
+        let (start, end) = (Vec2::new(5.0, 0.0), Vec2::new(0.0, 5.0));
+        let sweep = std::f64::consts::FRAC_PI_2;
+        let b = bulge_from_arc(start, end, center, sweep);
+        let (c2, r2, _a0, sw) = bulge_arc(start, end, b).expect("arc");
+        assert!((c2 - center).len() < 1e-6, "centre {:?}", c2);
+        assert!((r2 - 5.0).abs() < 1e-6, "radius {}", r2);
+        assert!((sw - sweep).abs() < 1e-6, "sweep {}", sw);
     }
 }
