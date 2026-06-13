@@ -7089,6 +7089,30 @@ impl CadApp {
                 self.dbg.snapshots.len()));
             ui.add_space(6.0);
             ui.separator();
+            // ---- Smart-block authoring: capture base geometry ----------
+            ui.label("Smart dobject (parametric block) authoring:");
+            ui.horizontal(|ui| {
+                let n = if !self.selection.is_empty() { self.selection.len() }
+                        else if self.selected.is_some() { 1 } else { 0 };
+                let cap = egui::Button::new(
+                    egui::RichText::new("📐 Capture smart dobject")
+                        .strong().color(egui::Color32::WHITE))
+                    .fill(egui::Color32::from_rgb(60, 90, 140));
+                if ui.add(cap).on_hover_text(
+                    "Snapshot the FULL geometry of the selected dobject(s) into \
+                     the timeline — an exploded set OR a block (its definition \
+                     contents are dumped too). Pair with the recorded ✂REC \
+                     stretches to convert into a parametric smart block.")
+                    .clicked()
+                {
+                    self.capture_smart_geometry();
+                }
+                ui.label(format!("{} selected", n));
+            });
+            ui.small("Start ▶ · select the dobjects · 📐 Capture · do your \
+                      stretches (each logs ✂REC) · Stop ■ · 📋 Copy.");
+            ui.add_space(6.0);
+            ui.separator();
             ui.label("Annotate (📝 added with current ms):");
             ui.horizontal(|ui| {
                 let resp = ui.add(
@@ -9845,17 +9869,113 @@ impl CadApp {
         // Shift-exclude during the selection phase decided the set); each
         // one's vertices inside the box move by `v`, the rest stay.
         let sel: Vec<usize> = self.selection.clone();
+        // Smart-block authoring: while the Session Recorder runs, capture
+        // each stretch with FULL detail — box + vector + every CHANGED
+        // dobject's before→after coordinates — so the parametric rule
+        // (which dobjects move, by what vector, inside which box) can be
+        // extracted from the dump.
+        let recording = self.dbg.recording;
+        let mut affected: Vec<String> = Vec::new();
         for &i in &sel {
             if let Some(d) = self.doc.dobjects.get_mut(i) {
-                d.geom = stretch_one(&d.geom, win_min, win_max, v);
+                let before = d.geom.clone();
+                let after  = stretch_one(&before, win_min, win_max, v);
+                if recording {
+                    let b = describe_verbose(&before);
+                    let a = describe_verbose(&after);
+                    if b != a {
+                        affected.push(format!(
+                            "#{} h=0x{:X} {}\n              before: {}\n              after : {}",
+                            i, d.handle, dobject_kind_name(&before), b, a));
+                    }
+                }
+                d.geom = after;
             }
         }
+        if recording {
+            crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::StretchRecord {
+                box_min: (win_min.x, win_min.y),
+                box_max: (win_max.x, win_max.y),
+                base:    (base.x, base.y),
+                dest:    (dest.x, dest.y),
+                vector:  (v.x, v.y),
+                total_selected: sel.len(),
+                affected,
+            });
+        }
         self.history.push(format!(
-            "  ↔ stretch by ({:.2},{:.2})  {} dobject(s)", v.x, v.y, sel.len()));
+            "  ↔ stretch by ({:.2},{:.2})  {} dobject(s){}",
+            v.x, v.y, sel.len(),
+            if recording { "  [recorded]" } else { "" }));
         self.selection.clear();
         self.intersections.clear();
         self.index_dirty = true;
         self.gpu_dirty = true;
+    }
+
+    /// Recorder "📐 Capture smart dobject" — snapshot the FULL geometry of
+    /// the current selection into the timeline. Works on an EXPLODED set
+    /// (each dobject's coords) OR a BLOCK (its definition-space contents
+    /// are dumped too). With the `✂REC` stretch steps, this is everything
+    /// needed to convert the selection into a parametric smart block.
+    fn capture_smart_geometry(&mut self) {
+        let mut targets: Vec<usize> = if !self.selection.is_empty() {
+            self.selection.clone()
+        } else if let Some(i) = self.selected {
+            vec![i]
+        } else {
+            Vec::new()
+        };
+        targets.retain(|&i| i < self.doc.dobjects.len());
+        targets.sort_unstable();
+        targets.dedup();
+        if targets.is_empty() {
+            self.history.push(
+                "  ! capture: select the smart dobject(s) first — exploded set or a block".into());
+            return;
+        }
+        if !self.dbg.recording {
+            self.history.push(
+                "  ! capture: press ▶ Start in the Session Recorder first".into());
+            return;
+        }
+        let mut entries: Vec<String> = Vec::new();
+        for &i in &targets {
+            let Some(d) = self.doc.dobjects.get(i) else { continue };
+            match &d.geom {
+                Geom::BlockRef(br) => {
+                    let bname = self.doc.blocks.get(br.block)
+                        .map(|b| b.name.clone()).unwrap_or_else(|| "?".into());
+                    let mut s = format!(
+                        "#{} h=0x{:X} BlockRef '{}'  insert=({:.3},{:.3}) scale={:.4} rot={:.2}°",
+                        i, d.handle, bname,
+                        br.insert.x, br.insert.y, br.scale, br.rotation.to_degrees());
+                    if let Some(blk) = self.doc.blocks.get(br.block) {
+                        s.push_str(&format!(
+                            "\n              base=({:.3},{:.3})  {} content dobject(s) [DEFINITION space]:",
+                            blk.base.x, blk.base.y, blk.dobjects.len()));
+                        for (k, cd) in blk.dobjects.iter().enumerate() {
+                            s.push_str(&format!(
+                                "\n                [{}] h=0x{:X} {} | {}",
+                                k, cd.handle, dobject_kind_name(&cd.geom),
+                                describe_verbose(&cd.geom)));
+                        }
+                    }
+                    entries.push(s);
+                }
+                other => {
+                    entries.push(format!(
+                        "#{} h=0x{:X} {} | {}",
+                        i, d.handle, dobject_kind_name(other), describe_verbose(other)));
+                }
+            }
+        }
+        let label = format!("{} dobject(s) selected", targets.len());
+        let count = entries.len();
+        crate::dbg_event!(self,
+            crate::dbg_recorder::DbgEvent::GeometryCapture { label, entries });
+        self.history.push(format!(
+            "  📐 captured geometry of {} dobject(s) → recorder timeline", count));
     }
 
     // ---- Trim debug instrumentation ----

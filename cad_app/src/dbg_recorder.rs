@@ -168,6 +168,34 @@ pub enum DbgEvent {
         elapsed_us:  u64,
     },
 
+    /// On-demand snapshot of the user-selected smart-dobject CANDIDATE —
+    /// the full geometry (coordinates) of the chosen dobjects, whether an
+    /// exploded set OR a block (then the block's DEFINITION-space contents
+    /// are dumped too). This is the BASE geometry the parametric rule
+    /// (from `StretchRecord` steps) transforms; together they're enough to
+    /// convert the selection into a parametric smart block.
+    GeometryCapture {
+        label:   String,
+        entries: Vec<String>,   // one multi-line block per captured dobject
+    },
+
+    /// A STRETCH captured for smart-block authoring. The box, the vector,
+    /// and every dobject whose geometry CHANGED — with full before→after
+    /// coordinates. This is the raw data to extract a parametric rule:
+    /// which dobjects move, by what vector, inside which box. Recorded for
+    /// every `stretch`/DDE-stretch while the recorder is running.
+    StretchRecord {
+        box_min:        (f64, f64),
+        box_max:        (f64, f64),
+        base:           (f64, f64),
+        dest:           (f64, f64),
+        vector:         (f64, f64),
+        total_selected: usize,
+        /// One pre-formatted multi-line block per CHANGED dobject
+        /// (idx + handle + kind + verbose before/after coordinates).
+        affected:       Vec<String>,
+    },
+
     /// Dialog or palette state changed.
     WindowToggle { name: String, opened: bool },
     /// Menu button clicked from the menu bar.
@@ -434,6 +462,37 @@ fn format_event_oneline(e: &DbgEvent) -> String {
                 name, success, before_dobj_count, after_dobj_count, detail),
         DbgEvent::MemoryEvent { name, bytes, elapsed_us } =>
             format!("🧠 {} ~{} bytes in {} µs", name, bytes, elapsed_us),
+        DbgEvent::GeometryCapture { label, entries } => {
+            let mut s = format!(
+                "📐 GEOMETRY CAPTURE — {} ({} entr{})",
+                label, entries.len(),
+                if entries.len() == 1 { "y" } else { "ies" });
+            for e in entries {
+                s.push_str("\n         ");
+                s.push_str(e);
+            }
+            s
+        }
+        DbgEvent::StretchRecord {
+            box_min, box_max, base, dest, vector, total_selected, affected,
+        } => {
+            let mag = (vector.0 * vector.0 + vector.1 * vector.1).sqrt();
+            let mut s = format!(
+                "✂REC STRETCH  box=({:.3},{:.3})→({:.3},{:.3})  \
+                 vec=({:.3},{:.3}) |v|={:.3}  dir=({:.4},{:.4})  \
+                 base=({:.3},{:.3})→dest=({:.3},{:.3})  {}/{} changed",
+                box_min.0, box_min.1, box_max.0, box_max.1,
+                vector.0, vector.1, mag,
+                if mag > 1e-9 { vector.0 / mag } else { 0.0 },
+                if mag > 1e-9 { vector.1 / mag } else { 0.0 },
+                base.0, base.1, dest.0, dest.1,
+                affected.len(), total_selected);
+            for a in affected {
+                s.push_str("\n         ");
+                s.push_str(a);
+            }
+            s
+        }
         DbgEvent::WindowToggle { name, opened } =>
             format!("🪟 {} {}", name, if *opened {"OPENED"} else {"CLOSED"}),
         DbgEvent::MenuClick { path } =>
