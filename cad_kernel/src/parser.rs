@@ -443,7 +443,7 @@ pub fn parse(line: &str) -> Result<Command, String> {
             }
         }
         "btr" | "blocktask" | "taskrec" => Ok(Command::BlockTaskRecorder),
-        "finish" | "endrec" => Ok(Command::BlockTaskFinish),
+        "finish" | "endrec" | "done" => Ok(Command::BlockTaskFinish),
         "card" => {
             // `card` → toggle; `card on` / `card off` → set.
             match toks.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {

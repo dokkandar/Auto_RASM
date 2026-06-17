@@ -51,9 +51,9 @@ pub struct BlockRef {
 /// One MODIFIER VECTOR of a parametric block — a stretch window + a unit
 /// direction (taken from the source→target diff). A named `BlockParam`
 /// (variable) drives one or more of these. The displacement applied to a
-/// vector at a variable value `V` is `dir * (V - original)` — i.e. the
-/// value is in the SAME units as the geometry (1 unit of value = 1 unit of
-/// displacement along `dir`).
+/// vector at a variable value `V` is `dir * gain * (V - original)` — i.e.
+/// the value is in the SAME units as the geometry, scaled by `gain` (1
+/// unit of value = `gain` units of displacement along `dir`).
 #[derive(Clone, Copy, Debug)]
 pub struct ParamVector {
     /// Stretch window (definition/base-relative space) this vector moves.
@@ -61,6 +61,11 @@ pub struct ParamVector {
     pub win_max: Vec2,
     /// Unit direction of the displacement.
     pub dir:     Vec2,
+    /// How much this vector moves per unit of `(value - original)`.
+    /// 1.0 = moves the full amount (one-sided opening); 0.5 = half (a
+    /// symmetric/centered opening where each side takes half the change).
+    /// This is what makes several linked vectors CORRELATE to one value.
+    pub gain:    f64,
 }
 
 /// One named parametric VARIABLE of a (semi-smart) block — e.g. `width`.
@@ -110,6 +115,12 @@ pub struct Block {
     /// each instance carries values in `BlockRef.param_values`. NOT yet
     /// persisted to RSM (reader defaults it empty).
     pub params:   Vec<BlockParam>,
+    /// Indices (into `dobjects`) of the edges that bound an OPENING this block
+    /// cuts into host geometry on insert — e.g. a door/window's two jambs.
+    /// On insert the region enclosed by these (derived + transformed) edges is
+    /// trimmed out of overlapping host lines/polylines. Empty = cuts nothing.
+    /// NOT yet persisted to RSM (reader defaults it empty).
+    pub cut_edges: Vec<usize>,
 }
 
 /// Table of block definitions on the Document. Unlike the style tables

@@ -696,7 +696,7 @@ fn read_block_table(
         let base     = r.vec2()?;
         let smart    = if ver >= 3 { r.u8()? != 0 } else { false };
         let dobjects = read_dobjects(r, tc, ver)?;
-        blocks.push(cad_kernel::Block { name, base, dobjects, smart, params: Vec::new() });
+        blocks.push(cad_kernel::Block { name, base, dobjects, smart, params: Vec::new(), cut_edges: Vec::new() });
     }
     Ok(cad_kernel::BlockTable { blocks })
 }
@@ -922,6 +922,7 @@ mod tests {
         let id = doc.blocks.add(cad_kernel::Block {
             name: "CHAIR".into(), base: Vec2::new(2.0, 0.0),
             dobjects: contents, smart: false, params: Vec::new(),
+            cut_edges: Vec::new(),
         });
         let inner = vec![cad_kernel::DObject::new(Geom::BlockRef(
             cad_kernel::BlockRef {
@@ -931,7 +932,7 @@ mod tests {
             }))];
         doc.blocks.add(cad_kernel::Block {
             name: "DESK_SET".into(), base: Vec2::ZERO, dobjects: inner, smart: false,
-            params: Vec::new(),
+            params: Vec::new(), cut_edges: Vec::new(),
         });
         doc.push(DObject::new(Geom::BlockRef(cad_kernel::BlockRef {
             block: id, insert: Vec2::new(10.0, -3.0),
@@ -1012,7 +1013,7 @@ mod tests {
             name: "SMART1".into(), base: Vec2::ZERO,
             dobjects: vec![DObject::new(Geom::Line(Line {
                 a: Vec2::ZERO, b: Vec2::new(1.0, 0.0) }))],
-            smart: true, params: Vec::new(),
+            smart: true, params: Vec::new(), cut_edges: Vec::new(),
         });
 
         let back = round_trip(&doc);

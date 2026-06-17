@@ -214,8 +214,156 @@ fn stretch_one(g: &Geom, win_min: Vec2, win_max: Vec2, v: Vec2) -> Geom {
         }),
         Geom::Point(pt) if inside(pt.location) =>
             Geom::Point(Point { location: pt.location + v, style: pt.style, size: pt.size }),
+        // A block INSTANCE is stretched by moving it WHOLE when its
+        // insertion point is inside the window — AutoCAD's rule (block
+        // contents aren't individually stretchable from outside; explode
+        // or use the Block Task Recorder for that). Without this arm a
+        // selected block never moved on stretch (it fell through to the
+        // clone-unchanged catch-all → "0/N changed"). BlockRef is Copy.
+        Geom::BlockRef(br) if inside(br.insert) => {
+            let mut nb = *br;
+            nb.insert = br.insert + v;
+            Geom::BlockRef(nb)
+        }
         other => other.clone(),
     }
+}
+
+/// CARD (cardinal H/V) lock: snap a vector to its dominant axis so the
+/// recorded displacement direction is a clean ±X or ±Y. Used by the Block
+/// Editor when CARD is on. (Project convention: this is "CARD", never "ortho".)
+fn card_lock_vec(v: Vec2) -> Vec2 {
+    if v.x.abs() >= v.y.abs() { Vec2::new(v.x, 0.0) } else { Vec2::new(0.0, v.y) }
+}
+
+/// Collect the defining endpoints of a (cut-edge) geom — used to build the
+/// opening region a block cuts into host geometry.
+fn edge_endpoints(g: &Geom, out: &mut Vec<Vec2>) {
+    match g {
+        Geom::Line(l)     => { out.push(l.a); out.push(l.b); }
+        Geom::Polyline(p) => { for v in &p.vertices { out.push(v.pos); } }
+        Geom::Arc(a)      => { let (e1, e2) = a.endpoints(); out.push(e1); out.push(e2); }
+        other => {
+            let (mn, mx) = other.bbox();
+            out.push(mn); out.push(Vec2::new(mx.x, mn.y));
+            out.push(mx); out.push(Vec2::new(mn.x, mx.y));
+        }
+    }
+}
+
+/// Convex hull (Andrew's monotone chain) of a point set. Returns the hull in
+/// CCW order; fewer than 3 unique points returns them as-is.
+fn convex_hull(pts: &[Vec2]) -> Vec<Vec2> {
+    let mut p: Vec<Vec2> = pts.to_vec();
+    p.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap()
+        .then(a.y.partial_cmp(&b.y).unwrap()));
+    p.dedup_by(|a, b| (a.x - b.x).abs() < 1e-9 && (a.y - b.y).abs() < 1e-9);
+    if p.len() < 3 { return p; }
+    let cross = |o: Vec2, a: Vec2, b: Vec2|
+        (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+    let mut lower: Vec<Vec2> = Vec::new();
+    for &pt in &p {
+        while lower.len() >= 2
+            && cross(lower[lower.len()-2], lower[lower.len()-1], pt) <= 0.0 { lower.pop(); }
+        lower.push(pt);
+    }
+    let mut upper: Vec<Vec2> = Vec::new();
+    for &pt in p.iter().rev() {
+        while upper.len() >= 2
+            && cross(upper[upper.len()-2], upper[upper.len()-1], pt) <= 0.0 { upper.pop(); }
+        upper.push(pt);
+    }
+    lower.pop(); upper.pop();
+    lower.extend(upper);
+    lower
+}
+
+/// True if `p` is inside (or on the boundary of) the convex polygon `poly`.
+fn point_in_convex(p: Vec2, poly: &[Vec2]) -> bool {
+    let n = poly.len();
+    if n < 3 { return false; }
+    let mut sign = 0.0_f64;
+    for k in 0..n {
+        let a = poly[k]; let b = poly[(k + 1) % n];
+        let cross = (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+        if cross.abs() > 1e-9 {
+            if sign == 0.0 { sign = cross.signum(); }
+            else if cross.signum() != sign { return false; }
+        }
+    }
+    true
+}
+
+/// Intersection parameter `t` (on segment a→b) where it crosses segment p→q,
+/// or None if parallel / not crossing within both segments.
+fn seg_seg_param(a: Vec2, b: Vec2, p: Vec2, q: Vec2) -> Option<f64> {
+    let r = b - a; let s = q - p;
+    let rxs = r.x * s.y - r.y * s.x;
+    if rxs.abs() < 1e-12 { return None; }
+    let qp = p - a;
+    let t = (qp.x * s.y - qp.y * s.x) / rxs;
+    let u = (qp.x * r.y - qp.y * r.x) / rxs;
+    if t >= -1e-9 && t <= 1.0 + 1e-9 && u >= -1e-9 && u <= 1.0 + 1e-9 {
+        Some(t.clamp(0.0, 1.0))
+    } else { None }
+}
+
+/// Clip segment a→b against convex polygon `poly`, returning the parts that
+/// lie OUTSIDE the polygon (the inside part = the opening is removed).
+fn clip_line_outside(a: Vec2, b: Vec2, poly: &[Vec2]) -> Vec<(Vec2, Vec2)> {
+    let n = poly.len();
+    let mut ts: Vec<f64> = vec![0.0, 1.0];
+    for k in 0..n {
+        if let Some(t) = seg_seg_param(a, b, poly[k], poly[(k + 1) % n]) { ts.push(t); }
+    }
+    ts.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    ts.dedup_by(|x, y| (*x - *y).abs() < 1e-9);
+    let mut out = Vec::new();
+    for w in ts.windows(2) {
+        let (t0, t1) = (w[0], w[1]);
+        let mid = a + (b - a) * ((t0 + t1) * 0.5);
+        if !point_in_convex(mid, poly) {
+            out.push((a + (b - a) * t0, a + (b - a) * t1));
+        }
+    }
+    out
+}
+
+/// Shortest distance from point `p` to segment `a`→`b` (world units).
+fn point_seg_dist(p: Vec2, a: Vec2, b: Vec2) -> f64 {
+    let ab = b - a;
+    let len2 = ab.dot(ab);
+    if len2 < 1e-18 { return (p - a).len(); }
+    let t = ((p - a).dot(ab) / len2).clamp(0.0, 1.0);
+    (p - (a + ab * t)).len()
+}
+
+/// Distinct per-parameter colour for the Block Editor (cycles through a
+/// small high-contrast palette so each recorded parameter's window + arrow
+/// is visually separable).
+fn editor_param_color(k: usize) -> egui::Color32 {
+    const PAL: [(u8, u8, u8); 6] = [
+        (120, 220, 140), (255, 170, 90), (140, 180, 255),
+        (240, 130, 200), (235, 220, 110), (130, 220, 220),
+    ];
+    let (r, g, b) = PAL[k % PAL.len()];
+    egui::Color32::from_rgb(r, g, b)
+}
+
+/// Draw a simple displacement arrow (shaft + two barbs) for the Block
+/// Editor's recorded-parameter overlay.
+fn draw_editor_arrow(p: &egui::Painter, from: egui::Pos2, to: egui::Pos2, col: egui::Color32) {
+    let stroke = egui::Stroke::new(1.4, col);
+    p.line_segment([from, to], stroke);
+    let d = egui::vec2(to.x - from.x, to.y - from.y);
+    let len = (d.x * d.x + d.y * d.y).sqrt();
+    if len < 1e-3 { return; }
+    let u = egui::vec2(d.x / len, d.y / len);
+    let n = egui::vec2(-u.y, u.x);
+    let head = 9.0_f32.min(len * 0.4);
+    let base = egui::pos2(to.x - u.x * head, to.y - u.y * head);
+    p.line_segment([to, egui::pos2(base.x + n.x * head * 0.5, base.y + n.y * head * 0.5)], stroke);
+    p.line_segment([to, egui::pos2(base.x - n.x * head * 0.5, base.y - n.y * head * 0.5)], stroke);
 }
 
 fn current_hint(tool: Tool, arc_method: ArcMethod, n: usize) -> &'static str {
@@ -454,6 +602,9 @@ pub struct CadApp {
     insert_param_prompt:  Option<InsertParamPrompt>,
     /// Active Block Task Recorder session. See `BlockTaskRec`.
     block_task_rec:       Option<BlockTaskRec>,
+    /// True right after a btr stretch: the next cmd-line input names that
+    /// recorded function (Enter skips). Returns control to the recorder.
+    btr_awaiting_name:    bool,
     selected:      Option<usize>,
 
     tool:          Tool,
@@ -652,6 +803,10 @@ pub struct CadApp {
     /// in progress, so the per-change `snapshot_doc` fires once at the
     /// start of a drag/type (one undo step per gesture, not per frame).
     props_edit_gesture: bool,
+    /// Block Editor — `Some` while the isolated parametric-editing window is
+    /// open. While set, the main canvas pointer interaction is GATED OFF so
+    /// nothing bleeds into the main screen. See `BlockEditor`.
+    block_editor:   Option<BlockEditor>,
     /// Text drafting state. While `WaitingForString`, the next cmd-line
     /// input is captured as the text body (NOT parsed as a command).
     text_draft:     TextDraftState,
@@ -964,6 +1119,9 @@ pub enum BlockDefState {
 pub enum InsertState {
     Off,
     WaitingForPoint { block: u32 },
+    /// Insertion point chosen; waiting for the ROTATION angle — click a
+    /// direction point (angle = direction from `insert`), or Enter = 0.
+    WaitingForAngle { block: u32, insert: Vec2 },
 }
 
 /// Pick-two-blocks-on-screen flow for `blockdiff` / the dialog Compare
@@ -1043,8 +1201,10 @@ pub struct ParamRow {
     /// Editable fields.
     pub name:         String,
     /// The value the SOURCE block represents (displacement 0). Insert
-    /// displacement = (entered value − original) along `dir`.
+    /// displacement = gain·(entered value − original) along `dir`.
     pub original:     String,
+    /// Per-vector gain (see `cad_kernel::ParamVector::gain`). 1.0 = full.
+    pub gain:         f64,
 }
 
 /// "Set parameters on block" dialog — opens after picking source + target
@@ -1058,12 +1218,75 @@ pub struct ParamNameDialog {
     pub rows:        Vec<ParamRow>,
 }
 
+/// Self-contained **Block Editor** — an ISOLATED surface for turning a
+/// block into a parametric block. It draws the block's geometry in its own
+/// embedded canvas (own pan/zoom) and records STRETCH gestures as named
+/// parameters, reading input ONLY from the editor canvas's egui response —
+/// never the main canvas pipeline (selection / grips / stretch_state / DDE /
+/// command terminators). That isolation is the whole point: it ends the
+/// "mixing with the main screen" class of bugs. The window title is
+/// "Block Editor"; the main canvas interaction is gated off while it's open.
+pub struct BlockEditor {
+    /// Block definition being parametrized.
+    pub block_id:    u32,
+    pub name:        String,
+    /// Embedded-canvas view: the world point shown at the canvas centre, and
+    /// px-per-world zoom. Independent of the main view.
+    pub view_center: Vec2,
+    pub view_scale:  f64,
+    /// First-open fit-to-view done? (also reset by the "Fit view" button)
+    pub fitted:      bool,
+    /// Which half of the stretch gesture we're collecting.
+    pub phase:       EdPhase,
+    /// World point where the current primary drag began (rubber-band anchor).
+    pub drag_start:  Option<Vec2>,
+    /// Recorded parameter rows (BASE-RELATIVE windows — `save_block_params`
+    /// re-adds the block base). Saved onto the block on Save. Rows sharing
+    /// a `name` form ONE task (linked, correlated vectors).
+    pub rows:        Vec<ParamRow>,
+    /// Auto-name counter (P1, P2, …) for freshly recorded rows.
+    pub next_pid:    u32,
+    /// The ACTIVE TASK new stretches join — its name (e.g. `opening`) and the
+    /// measured `original` value freshly recorded vectors inherit. Empty name
+    /// → each new stretch gets an auto `P{n}` name (its own task).
+    pub active_name:     String,
+    pub active_original: String,
+    /// Default gain applied to freshly recorded vectors (1.0, or 0.5 for a
+    /// symmetric/centered task the user is building).
+    pub active_gain:     f64,
+    /// CARD (cardinal H/V) lock for THIS editor — constrains the displacement
+    /// and the measure to the nearest axis. Local to the window (isolation);
+    /// named CARD, never "ortho" (project convention).
+    pub card:        bool,
+    /// Indices (into the block's `dobjects`) marked as OPENING CUT EDGES — the
+    /// door/window jambs whose enclosed region trims host geometry on insert.
+    pub cut_edges:   Vec<usize>,
+    /// While true, a canvas click toggles the nearest edge's cut-edge mark
+    /// instead of doing a stretch gesture.
+    pub mark_cut:    bool,
+}
+
+/// Which half of a stretch demonstration the Block Editor is collecting.
+#[derive(Clone, Copy, PartialEq)]
+pub enum EdPhase {
+    /// Drag a crossing WINDOW over the vertices that should move.
+    Window,
+    /// Window chosen; drag the DISPLACEMENT (base → destination).
+    Displace { win_min: Vec2, win_max: Vec2 },
+    /// Measuring the active task's ORIGINAL distance — drag/click two points;
+    /// their distance becomes the baseline value.
+    Measure,
+}
+
 /// Insert-time value prompt for a parametric block: after the insertion
 /// point is clicked, the command line asks for each variable in turn
 /// ("set width [1000]:"); on the last, the instance is placed.
 pub struct InsertParamPrompt {
     pub block:    u32,
     pub insert:   Vec2,
+    /// Rotation (radians) chosen at the insert ANGLE step, applied to the
+    /// placed instance and its cut region.
+    pub rotation: f64,
     pub names:    Vec<String>,
     pub defaults: Vec<f64>,
     pub values:   Vec<f64>,   // collected so far (len = current index)
@@ -1084,6 +1307,10 @@ pub struct BlockTaskRec {
     pub world_offset: Vec2,
     /// Handles of the temp sandbox dobjects (deleted on Finish/cancel).
     pub temp_handles: Vec<u64>,
+    /// The block's own instances, REMOVED for the session so they don't
+    /// overlap the sandbox (and get grabbed by the stretch window). Re-added
+    /// on Finish/cancel.
+    pub removed_instances: Vec<DObject>,
     /// Recorded tasks (one per demonstrated stretch).
     pub recorded:     Vec<ParamRow>,
 }
@@ -1607,6 +1834,7 @@ impl Default for CadApp {
             param_name_dialog:   None,
             insert_param_prompt: None,
             block_task_rec:      None,
+            btr_awaiting_name:   false,
             selected:      None,
             tool:          Tool::None,
             arc_method:    ArcMethod::ThreePoints,
@@ -1692,6 +1920,7 @@ impl Default for CadApp {
             offset_state:   OffsetState::Off,
             dist_state:     DistState::Off,
             props_edit_gesture: false,
+            block_editor:   None,
             text_draft:     TextDraftState::Off,
             dim_draft:      DimDraftState::Off,
             pending_text:   None,
@@ -2069,6 +2298,56 @@ impl CadApp {
                     return;
                 }
             }
+        }
+
+        // ---- Block Task Recorder: name the just-recorded function -------
+        // After a btr stretch, the next typed line names that function.
+        // `finish`/`endrec`/`done` (or an empty Enter — handled in the key
+        // handler) ends the session and opens the dialog instead.
+        if self.btr_awaiting_name && self.block_task_rec.is_some() {
+            let low = trimmed.to_ascii_lowercase();
+            if low == "finish" || low == "endrec" || low == "done" {
+                self.btr_awaiting_name = false;
+                self.finish_block_task_recorder();
+                return;
+            }
+            if matches!(low.as_str(), "stretch" | "st" | "s") {
+                // Record another without naming this one (name it at finish).
+                self.btr_awaiting_name = false;
+                // fall through to the parser → starts a new stretch.
+            } else {
+                self.btr_awaiting_name = false;
+                if !trimmed.is_empty() {
+                    if let Some(rec) = self.block_task_rec.as_mut() {
+                        if let Some(last) = rec.recorded.last_mut() {
+                            last.name = trimmed.to_string();
+                        }
+                    }
+                    self.history.push(format!("  ◉ function named '{}'", trimmed));
+                } else {
+                    self.history.push("  ◉ function left unnamed (name it at finish)".into());
+                }
+                // Auto-re-enter stretch for the NEXT parameter — the user can
+                // crossing-window again, or type `finish` to stop.
+                self.start_btr_stretch();
+                return;
+            }
+        }
+
+        // ---- Insert ANGLE step: typed degrees (Enter=0 handled in key cascade) ----
+        if let InsertState::WaitingForAngle { block, insert } = self.insert_state {
+            let rot = match trimmed.parse::<f64>() {
+                Ok(deg) => deg.to_radians(),
+                Err(_) => {
+                    self.history.push(format!(
+                        "  ! insert: '{}' is not an angle — type degrees, click a \
+                         direction, or Enter=0", trimmed));
+                    return;
+                }
+            };
+            self.insert_state = InsertState::Off;
+            self.apply_insert(block, insert, rot);
+            return;
         }
 
         // ---- Insert-time parametric value prompt (must run FIRST) ----
@@ -3193,7 +3472,22 @@ impl CadApp {
                 Some((name_a, name_b)) => self.run_block_diff(&name_a, &name_b),
                 None => self.begin_block_diff_pick(),
             },
-            Ok(Command::BlockTaskRecorder) => self.begin_block_task_recorder(),
+            Ok(Command::BlockTaskRecorder) => {
+                // `btr` now opens the ISOLATED Block Editor on the selected
+                // block instance's definition (replaces the old explode-to-
+                // main-screen recorder — all editing stays in the dialog).
+                let bid = self.selection.iter().copied().chain(self.selected)
+                    .filter_map(|i| match self.doc.dobjects.get(i).map(|d| &d.geom) {
+                        Some(Geom::BlockRef(b)) => Some(b.block),
+                        _ => None,
+                    }).next();
+                match bid {
+                    Some(id) => self.open_block_editor(id),
+                    None => self.history.push(
+                        "  ! Block Editor: select a block instance first, \
+                         or use ‘Edit ▶’ in the Block dialog".into()),
+                }
+            }
             Ok(Command::BlockTaskFinish)   => self.finish_block_task_recorder(),
             Ok(Command::Wall(t_opt)) => {
                 // Persist thickness if user supplied one, then enter
@@ -9310,7 +9604,15 @@ impl CadApp {
         let mut any = false;
         for &i in &self.selection {
             if let Some(d) = self.doc.dobjects.get(i) {
-                let (a, b) = d.geom.bbox();
+                // BlockRef.bbox() is a degenerate placeholder (insert point)
+                // in the kernel — it can't resolve the definition. Resolve
+                // it here so a select-first stretch/move uses the block's
+                // REAL extents (otherwise the test box is a single point and
+                // nothing moves). See `resolved_blockref_bbox`.
+                let (a, b) = match &d.geom {
+                    Geom::BlockRef(br) => self.resolved_blockref_bbox(br),
+                    g => g.bbox(),
+                };
                 mn.x = mn.x.min(a.x); mn.y = mn.y.min(a.y);
                 mx.x = mx.x.max(b.x); mx.y = mx.y.max(b.y);
                 any = true;
@@ -9439,7 +9741,7 @@ impl CadApp {
             .open(&mut open)
             .resizable(false)
             .collapsible(false)
-            .default_pos(egui::pos2(300.0, 130.0))
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
                 ui.label(egui::RichText::new(format!(
                     "base '{}'  →  variant '{}'", dlg.source_name, dlg.target_name)).strong());
@@ -9490,6 +9792,554 @@ impl CadApp {
         self.param_name_dialog = Some(dlg);   // keep open
     }
 
+    /// Open the isolated Block Editor on a block DEFINITION. Starts with no
+    /// recorded parameters — the user demonstrates stretches inside the
+    /// editor's own canvas (Save replaces the block's params). All editing is
+    /// self-contained, so nothing touches the main canvas.
+    fn open_block_editor(&mut self, block_id: u32) {
+        let Some(blk) = self.doc.blocks.get(block_id) else {
+            self.history.push("  ! Block Editor: no such block".into());
+            return;
+        };
+        let name = blk.name.clone();
+        let base = blk.base;
+        // Seed the editor with the block's EXISTING parameters so re-opening
+        // ADDS to them. Save replaces the whole param set, so without this a
+        // second editing session would silently drop the prior tasks (e.g.
+        // adding 'frame' would forget 'opening'). Windows are stored base-
+        // relative in the editor (`save_block_params` re-adds the base).
+        let mut rows: Vec<ParamRow> = Vec::new();
+        for p in &blk.params {
+            for v in &p.vectors {
+                let diag = (v.win_max - v.win_min).len();
+                let mag = if diag > 1e-6 { diag * 0.5 } else { 100.0 };
+                rows.push(ParamRow {
+                    win_min: v.win_min - base, win_max: v.win_max - base,
+                    dir: v.dir, magnitude: mag,
+                    dx: v.dir.x * mag, dy: v.dir.y * mag,
+                    points: Vec::new(),
+                    name: p.name.clone(),
+                    original: format!("{}", p.original),
+                    gain: v.gain,
+                });
+            }
+        }
+        let next_pid = rows.len() as u32 + 1;
+        let seeded = rows.len();
+        let cut_edges = blk.cut_edges.clone();
+        self.block_editor = Some(BlockEditor {
+            block_id,
+            name: name.clone(),
+            view_center: Vec2::ZERO,
+            view_scale:  1.0,
+            fitted:      false,
+            phase:       EdPhase::Window,
+            drag_start:  None,
+            rows,
+            next_pid,
+            active_name:     String::new(),
+            active_original: "0".into(),
+            active_gain:     1.0,
+            card:        true,
+            cut_edges,
+            mark_cut:    false,
+        });
+        self.history.push(format!(
+            "  ◉ Block Editor: '{}' ({} existing vector(s)) — name a Task, Measure original, \
+             drag a window then the direction; Save when done",
+            name, seeded));
+    }
+
+    /// Render the isolated **Block Editor** window: an embedded canvas showing
+    /// the block (read-only) where the user demonstrates stretch gestures that
+    /// become named parameters. Reads input ONLY from the editor canvas's
+    /// response — the main canvas interaction is gated off while this is open
+    /// (see `block_editor.is_some()` checks in the CentralPanel).
+    fn render_block_editor(&mut self, ctx: &egui::Context) {
+        let Some(mut ed) = self.block_editor.take() else { return; };
+
+        // Block gone (deleted elsewhere)? Bail.
+        let Some(blk) = self.doc.blocks.get(ed.block_id) else {
+            self.history.push("  Block Editor closed — block no longer exists".into());
+            return;
+        };
+        let base = blk.base;
+        // Pre-extract the block's geometry as world (definition-space)
+        // polylines while &self is free, plus the bbox (seeded with base).
+        let geoms: Vec<Geom> = blk.dobjects.iter().map(|d| d.geom.clone()).collect();
+        // Definition-space dobjects for OBJECT SNAP inside the editor (END /
+        // MID / CEN / QUA / INT on the block's own geometry).
+        let snap_dobjects: Vec<DObject> = blk.dobjects.clone();
+        let snap_set = { let mut s = SnapSet::defaults(); s.int = true; s };
+        // Per-dobject polylines (index = dobject index) for hit-testing the
+        // cut-edge marker + drawing marked edges; plus a flat copy for the
+        // read-only geometry + affected-vertex tests.
+        let geom_polys: Vec<Vec<Vec<Vec2>>> =
+            geoms.iter().map(|g| self.preview_world_polylines(g)).collect();
+        let polylines: Vec<Vec<Vec2>> =
+            geom_polys.iter().flatten().cloned().collect();
+        let mut bmin = base;
+        let mut bmax = base;
+        for pl in &polylines {
+            for p in pl {
+                bmin.x = bmin.x.min(p.x); bmin.y = bmin.y.min(p.y);
+                bmax.x = bmax.x.max(p.x); bmax.y = bmax.y.max(p.y);
+            }
+        }
+
+        let mut open      = true;
+        let mut do_save   = false;
+        let mut do_cancel = false;
+
+        egui::Window::new(format!("Block Editor — {}", ed.name))
+            .id(egui::Id::new("block_editor"))
+            .open(&mut open)
+            .resizable(true)
+            .collapsible(false)
+            .default_size(egui::vec2(780.0, 660.0))
+            .default_pos(egui::pos2(120.0, 60.0))
+            .show(ctx, |ui| {
+                let hint = match ed.phase {
+                    EdPhase::Window =>
+                        "① Drag a CROSSING WINDOW over the vertices that should move.",
+                    EdPhase::Displace { .. } =>
+                        "② Now drag the DIRECTION it moves (amount is value-driven, not this drag).",
+                    EdPhase::Measure =>
+                        "⟷ Click TWO points to MEASURE this task's original distance.",
+                };
+                ui.label(egui::RichText::new(hint).strong().size(14.0));
+                ui.small("left-drag = gesture · right/middle-drag = pan · scroll = zoom · \
+                          Esc = cancel current step");
+
+                // ---- task toolbar --------------------------------------
+                // The active TASK new stretches join. Rows sharing a name are
+                // ONE correlated variable (e.g. all parts of a door opening).
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.label("Task:");
+                    ui.add(egui::TextEdit::singleline(&mut ed.active_name)
+                        .desired_width(140.0)
+                        .hint_text("e.g. opening / frame"));
+                    if ui.add(egui::Button::new("Measure original ⟷"))
+                        .on_hover_text("Click two points; their distance becomes \
+                                        this task's baseline value (e.g. 900).")
+                        .clicked()
+                    {
+                        ed.phase = EdPhase::Measure;
+                        ed.drag_start = None;
+                    }
+                    ui.label("orig:");
+                    ui.add(egui::TextEdit::singleline(&mut ed.active_original)
+                        .desired_width(56.0));
+                    ui.label("gain:");
+                    ui.add(egui::DragValue::new(&mut ed.active_gain)
+                        .speed(0.05).range(-10.0..=10.0))
+                        .on_hover_text("How much each new stretch moves per unit of \
+                                        value. 1.0 = full; 0.5 = half (centered).");
+                    ui.toggle_value(&mut ed.card, "CARD")
+                        .on_hover_text("Lock stretch/measure to the nearest H or V axis.");
+                    ui.toggle_value(&mut ed.mark_cut,
+                        format!("Mark cut edges ✂ ({})", ed.cut_edges.len()))
+                        .on_hover_text("Click the block edges that BOUND the opening \
+                                        (e.g. the two jambs). On insert, host geometry \
+                                        between them is trimmed away.");
+                });
+
+                // ---- embedded canvas -----------------------------------
+                let avail = ui.available_size();
+                let canvas_h = (avail.y - 200.0).max(240.0);
+                let (cresp, p) = ui.allocate_painter(
+                    egui::vec2(avail.x, canvas_h),
+                    egui::Sense::click_and_drag());
+                let rect = cresp.rect;
+                p.rect_filled(rect, 4.0, egui::Color32::from_rgb(16, 20, 26));
+                p.rect_stroke(rect, 4.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 80, 95)));
+
+                // First-open fit-to-view (and the "Fit view" button resets it).
+                if !ed.fitted {
+                    let size = bmax - bmin;
+                    let sx = (rect.width()  as f64 - 48.0) / size.x.max(1e-9);
+                    let sy = (rect.height() as f64 - 48.0) / size.y.max(1e-9);
+                    ed.view_scale  = sx.min(sy).clamp(1e-6, 1e6);
+                    ed.view_center = (bmin + bmax) * 0.5;
+                    ed.fitted = true;
+                }
+
+                // Pan (right/middle drag) — raw delta, no transform needed.
+                if cresp.dragged_by(egui::PointerButton::Middle)
+                    || cresp.dragged_by(egui::PointerButton::Secondary)
+                {
+                    let d = cresp.drag_delta();
+                    ed.view_center.x -= d.x as f64 / ed.view_scale;
+                    ed.view_center.y += d.y as f64 / ed.view_scale;
+                }
+                // Zoom about the cursor.
+                let ctr = rect.center();
+                let scroll = ui.input(|i| i.raw_scroll_delta.y);
+                if scroll != 0.0 {
+                    if let Some(c) = cresp.hover_pos() {
+                        let vc0 = ed.view_center; let vs0 = ed.view_scale;
+                        let before = Vec2::new(
+                            vc0.x + (c.x - ctr.x) as f64 / vs0,
+                            vc0.y - (c.y - ctr.y) as f64 / vs0);
+                        let f = (scroll as f64 * 0.0015).exp();
+                        ed.view_scale = (vs0 * f).clamp(1e-6, 1e6);
+                        let vs1 = ed.view_scale;
+                        let after = Vec2::new(
+                            vc0.x + (c.x - ctr.x) as f64 / vs1,
+                            vc0.y - (c.y - ctr.y) as f64 / vs1);
+                        ed.view_center.x += before.x - after.x;
+                        ed.view_center.y += before.y - after.y;
+                    }
+                }
+
+                // Final transform for this frame (after pan/zoom).
+                let vc = ed.view_center; let vs = ed.view_scale;
+                let w2s = |w: Vec2| egui::pos2(
+                    ctr.x + ((w.x - vc.x) * vs) as f32,
+                    ctr.y - ((w.y - vc.y) * vs) as f32);
+                let s2w = |s: egui::Pos2| Vec2::new(
+                    vc.x + (s.x - ctr.x) as f64 / vs,
+                    vc.y - (s.y - ctr.y) as f64 / vs);
+
+                // Object snap on the block's own geometry. Returns the snapped
+                // world point (or the raw one) + whether a snap was hit.
+                let tol_world = 12.0 / vs;
+                let snap = |raw: Vec2| -> (Vec2, bool) {
+                    match find_snap(raw, tol_world, snap_set, None, None,
+                                    &snap_dobjects, None) {
+                        Some(h) => (h.point, true),
+                        None    => (raw, false),
+                    }
+                };
+
+                let pc = p.with_clip_rect(rect);
+
+                // Block geometry (read-only).
+                let geo_col = egui::Color32::from_rgb(150, 200, 235);
+                for pl in &polylines {
+                    if pl.len() >= 2 {
+                        let pts: Vec<egui::Pos2> = pl.iter().map(|w| w2s(*w)).collect();
+                        pc.add(egui::Shape::line(pts, egui::Stroke::new(1.4, geo_col)));
+                    }
+                }
+                // Marked CUT EDGES (door/window jambs) — drawn thick orange.
+                let cut_col = egui::Color32::from_rgb(255, 140, 40);
+                for &ci in &ed.cut_edges {
+                    if let Some(polys) = geom_polys.get(ci) {
+                        for pl in polys {
+                            if pl.len() >= 2 {
+                                let pts: Vec<egui::Pos2> = pl.iter().map(|w| w2s(*w)).collect();
+                                pc.add(egui::Shape::line(pts,
+                                    egui::Stroke::new(3.0, cut_col)));
+                            }
+                        }
+                    }
+                }
+                // Base point marker.
+                let bs = w2s(base);
+                let bcol = egui::Color32::from_rgb(255, 180, 60);
+                pc.line_segment([egui::pos2(bs.x - 8.0, bs.y), egui::pos2(bs.x + 8.0, bs.y)],
+                    egui::Stroke::new(1.2, bcol));
+                pc.line_segment([egui::pos2(bs.x, bs.y - 8.0), egui::pos2(bs.x, bs.y + 8.0)],
+                    egui::Stroke::new(1.2, bcol));
+                pc.circle_stroke(bs, 4.0, egui::Stroke::new(1.2, bcol));
+
+                // Already-recorded parameters (window + displacement arrow).
+                for (k, r) in ed.rows.iter().enumerate() {
+                    let col = editor_param_color(k);
+                    let wmin = r.win_min + base;
+                    let wmax = r.win_max + base;
+                    let a = w2s(Vec2::new(wmin.x.min(wmax.x), wmin.y.min(wmax.y)));
+                    let b = w2s(Vec2::new(wmin.x.max(wmax.x), wmin.y.max(wmax.y)));
+                    pc.rect_stroke(egui::Rect::from_two_pos(a, b), 0.0,
+                        egui::Stroke::new(1.0, col));
+                    let c   = (wmin + wmax) * 0.5;
+                    let tip = c + r.dir * r.magnitude;
+                    draw_editor_arrow(&pc, w2s(c), w2s(tip), col);
+                }
+
+                // Snap marker at the hovered geometry point.
+                if let Some(hp) = cresp.hover_pos() {
+                    let (sp, hit) = snap(s2w(hp));
+                    if hit {
+                        let m = w2s(sp);
+                        pc.rect_stroke(
+                            egui::Rect::from_center_size(m, egui::vec2(11.0, 11.0)),
+                            0.0, egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 255, 120)));
+                    }
+                }
+
+                // ---- gesture handling (canvas-local input only) --------
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    ed.phase = EdPhase::Window;
+                    ed.drag_start = None;
+                    ed.mark_cut = false;
+                }
+                // MARK-CUT-EDGES mode: a click toggles the nearest edge's mark
+                // (no stretch gesture while marking).
+                if ed.mark_cut {
+                    if cresp.clicked() {
+                        if let Some(pp) = cresp.interact_pointer_pos() {
+                            let w = s2w(pp);
+                            let mut best: Option<(usize, f64)> = None;
+                            for (i, polys) in geom_polys.iter().enumerate() {
+                                let mut dmin = f64::INFINITY;
+                                for pl in polys {
+                                    for seg in pl.windows(2) {
+                                        dmin = dmin.min(point_seg_dist(w, seg[0], seg[1]));
+                                    }
+                                }
+                                if best.map_or(true, |(_, bd)| dmin < bd) {
+                                    best = Some((i, dmin));
+                                }
+                            }
+                            if let Some((i, d)) = best {
+                                if d <= (15.0 / vs) {
+                                    if let Some(pos) =
+                                        ed.cut_edges.iter().position(|&x| x == i) {
+                                        ed.cut_edges.remove(pos);
+                                    } else {
+                                        ed.cut_edges.push(i);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let gesturing = !ed.mark_cut;
+                if gesturing && cresp.drag_started_by(egui::PointerButton::Primary) {
+                    if let Some(pp) = cresp.interact_pointer_pos() {
+                        ed.drag_start = Some(snap(s2w(pp)).0);
+                    }
+                }
+                let cur = cresp.interact_pointer_pos().map(|pp| snap(s2w(pp)).0);
+                let prim_drag = gesturing && cresp.dragged_by(egui::PointerButton::Primary);
+                let prim_stop = gesturing && cresp.drag_stopped_by(egui::PointerButton::Primary);
+
+                match ed.phase {
+                    EdPhase::Window => {
+                        if prim_drag {
+                            if let (Some(st), Some(cu)) = (ed.drag_start, cur) {
+                                let a = w2s(st); let b = w2s(cu);
+                                pc.rect_stroke(egui::Rect::from_two_pos(a, b), 0.0,
+                                    egui::Stroke::new(1.2, egui::Color32::from_rgb(120, 220, 140)));
+                            }
+                        }
+                        if prim_stop {
+                            if let (Some(st), Some(cu)) = (ed.drag_start, cur) {
+                                let wmin = Vec2::new(st.x.min(cu.x), st.y.min(cu.y));
+                                let wmax = Vec2::new(st.x.max(cu.x), st.y.max(cu.y));
+                                if (wmax.x - wmin.x) > 1e-6 && (wmax.y - wmin.y) > 1e-6 {
+                                    ed.phase = EdPhase::Displace { win_min: wmin, win_max: wmax };
+                                }
+                            }
+                            ed.drag_start = None;
+                        }
+                    }
+                    EdPhase::Displace { win_min, win_max } => {
+                        let inside = |q: Vec2| q.x >= win_min.x && q.x <= win_max.x
+                                            && q.y >= win_min.y && q.y <= win_max.y;
+                        // Chosen window + affected vertices.
+                        let a = w2s(win_min); let b = w2s(win_max);
+                        pc.rect_stroke(egui::Rect::from_two_pos(a, b), 0.0,
+                            egui::Stroke::new(1.2, egui::Color32::from_rgb(120, 220, 140)));
+                        for pl in &polylines {
+                            for q in pl {
+                                if inside(*q) {
+                                    pc.circle_filled(w2s(*q), 3.0,
+                                        egui::Color32::from_rgb(255, 120, 120));
+                                }
+                            }
+                        }
+                        // Live displacement preview (CARD-locked if on).
+                        if prim_drag {
+                            if let (Some(st), Some(cu)) = (ed.drag_start, cur) {
+                                let mut v = cu - st;
+                                if ed.card { v = card_lock_vec(v); }
+                                pc.line_segment([w2s(st), w2s(st + v)],
+                                    egui::Stroke::new(1.2, egui::Color32::from_rgb(255, 220, 120)));
+                                for pl in &polylines {
+                                    let pts: Vec<egui::Pos2> = pl.iter().map(|q| {
+                                        let nq = if inside(*q) { *q + v } else { *q };
+                                        w2s(nq)
+                                    }).collect();
+                                    if pts.len() >= 2 {
+                                        pc.add(egui::Shape::line(pts,
+                                            egui::Stroke::new(1.0,
+                                                egui::Color32::from_rgb(255, 220, 120))));
+                                    }
+                                }
+                            }
+                        }
+                        if prim_stop {
+                            if let (Some(st), Some(cu)) = (ed.drag_start, cur) {
+                                let mut v = cu - st;
+                                if ed.card { v = card_lock_vec(v); }
+                                if v.len() > 1e-6 {
+                                    let dir = v / v.len();
+                                    let mut pts = Vec::new();
+                                    for pl in &polylines {
+                                        for q in pl {
+                                            if inside(*q) { pts.push(*q - base); }
+                                        }
+                                    }
+                                    // Join the ACTIVE task (shared name = linked,
+                                    // correlated vectors). Empty name → own P{n}.
+                                    let name = if ed.active_name.trim().is_empty() {
+                                        let pid = ed.next_pid; ed.next_pid += 1;
+                                        format!("P{}", pid)
+                                    } else {
+                                        ed.active_name.trim().to_string()
+                                    };
+                                    ed.rows.push(ParamRow {
+                                        win_min: win_min - base, win_max: win_max - base,
+                                        dir, magnitude: v.len(), dx: v.x, dy: v.y,
+                                        points: pts,
+                                        name,
+                                        original: ed.active_original.clone(),
+                                        gain: ed.active_gain,
+                                    });
+                                }
+                            }
+                            ed.phase = EdPhase::Window;
+                            ed.drag_start = None;
+                        }
+                    }
+                    EdPhase::Measure => {
+                        // Two CLICKS → distance becomes the active task's
+                        // original. First click sets A (held in drag_start),
+                        // second sets B. CARD locks the measured direction.
+                        if let Some(a0) = ed.drag_start {
+                            let asp = w2s(a0);
+                            let mcol = egui::Color32::from_rgb(120, 220, 255);
+                            pc.circle_filled(asp, 4.0, mcol);
+                            if let Some(cu) = cur {
+                                let b = if ed.card { a0 + card_lock_vec(cu - a0) } else { cu };
+                                pc.line_segment([asp, w2s(b)], egui::Stroke::new(1.2, mcol));
+                                pc.text(w2s(b) + egui::vec2(8.0, -8.0),
+                                    egui::Align2::LEFT_BOTTOM,
+                                    format!("{:.1}", (b - a0).len()),
+                                    egui::FontId::monospace(12.0), mcol);
+                            }
+                        }
+                        if gesturing && cresp.clicked() {
+                            if let Some(pp) = cresp.interact_pointer_pos() {
+                                let p = snap(s2w(pp)).0;
+                                match ed.drag_start {
+                                    None => ed.drag_start = Some(p),
+                                    Some(a0) => {
+                                        let b = if ed.card {
+                                            a0 + card_lock_vec(p - a0)
+                                        } else { p };
+                                        let dist = (b - a0).len();
+                                        ed.active_original = format!("{:.1}", dist);
+                                        // Propagate to existing rows of this task.
+                                        let nm = ed.active_name.trim().to_string();
+                                        if !nm.is_empty() {
+                                            let val = ed.active_original.clone();
+                                            for r in ed.rows.iter_mut()
+                                                .filter(|r| r.name == nm) {
+                                                r.original = val.clone();
+                                            }
+                                        }
+                                        ed.drag_start = None;
+                                        ed.phase = EdPhase::Window;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ---- parameters list -----------------------------------
+                // Rows sharing a NAME are one task (correlated vectors). The
+                // colour swatch is keyed by name so a task's vectors match.
+                ui.add_space(6.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let tasks = {
+                        let mut names: Vec<&str> =
+                            ed.rows.iter().map(|r| r.name.as_str()).collect();
+                        names.sort_unstable(); names.dedup(); names.len()
+                    };
+                    ui.label(egui::RichText::new(
+                        format!("Tasks: {} · vectors: {}", tasks, ed.rows.len())).strong());
+                    if ui.button("Fit view").clicked() { ed.fitted = false; }
+                });
+                let mut del: Option<usize> = None;
+                // Stable per-NAME colour index so a task's vectors share a hue.
+                let mut name_order: Vec<String> = Vec::new();
+                for r in &ed.rows {
+                    if !name_order.iter().any(|n| n == &r.name) {
+                        name_order.push(r.name.clone());
+                    }
+                }
+                egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
+                    for (k, r) in ed.rows.iter_mut().enumerate() {
+                        let ci = name_order.iter().position(|n| n == &r.name).unwrap_or(k);
+                        ui.horizontal(|ui| {
+                            ui.colored_label(editor_param_color(ci), "■");
+                            ui.add(egui::TextEdit::singleline(&mut r.name)
+                                .desired_width(110.0).hint_text("task e.g. opening"));
+                            ui.label(format!("Δ({:.1},{:.1})", r.dx, r.dy));
+                            ui.label("orig:");
+                            ui.add(egui::TextEdit::singleline(&mut r.original)
+                                .desired_width(52.0));
+                            ui.label("gain:");
+                            ui.add(egui::DragValue::new(&mut r.gain)
+                                .speed(0.05).range(-10.0..=10.0));
+                            if ui.small_button("✕").clicked() { del = Some(k); }
+                        });
+                    }
+                });
+                if let Some(k) = del { ed.rows.remove(k); }
+                if ed.rows.is_empty() {
+                    ui.small("No parameters yet — drag a window over the geometry, \
+                              then drag where it should move.");
+                }
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Cancel").clicked() { do_cancel = true; }
+                        if ui.add(egui::Button::new(
+                            egui::RichText::new("Save").strong())).clicked() {
+                            do_save = true;
+                        }
+                        ui.label(egui::RichText::new(
+                            "name each parameter, set its original value, then")
+                            .weak());
+                    });
+                });
+            });
+
+        // ---- post-frame -------------------------------------------------
+        if do_save {
+            // Persist the opening CUT EDGES (door/window jambs) onto the block
+            // first — these save even when there are no parametric vectors.
+            if let Some(blk) = self.doc.blocks.get_mut(ed.block_id) {
+                blk.cut_edges = ed.cut_edges.clone();
+            }
+            let n_cut = ed.cut_edges.len();
+            let rows = std::mem::take(&mut ed.rows);
+            self.save_block_params(ed.block_id, &rows);
+            if n_cut > 0 {
+                self.history.push(format!(
+                    "  ✔ block '{}' has {} cut edge(s) — host geometry is trimmed on insert",
+                    ed.name, n_cut));
+            }
+            return;   // editor closes
+        }
+        if do_cancel || !open {
+            self.history.push("  Block Editor closed (no changes saved)".into());
+            return;
+        }
+        self.block_editor = Some(ed);   // keep open
+    }
+
     /// Block dialog — bare `block` / Draw menu. Full define-a-block form:
     /// name, live PREVIEW of the selection, "Select objects" (round-trips
     /// to canvas), insertion point (typed X/Y or "Pick ⊕"), instance COLOR
@@ -9506,7 +10356,7 @@ impl CadApp {
         let mut clear_color = false;   // reset to inherit/ByLayer
         let mut insert_id: Option<u32> = None;
         let mut do_compare  = false;   // diff the two chosen blocks
-        let mut do_task_record = false; // start the Block Task Recorder
+        let mut edit_id: Option<u32> = None;  // open Block Editor for this block
 
         let existing: Vec<(u32, String, usize, bool)> = self.doc.blocks.blocks.iter()
             .enumerate()
@@ -9677,6 +10527,14 @@ impl CadApp {
                                         if ui.small_button("Insert").clicked() {
                                             insert_id = Some(*id);
                                         }
+                                        if ui.small_button("Edit ▶")
+                                            .on_hover_text("Open the Block Editor — \
+                                                turn this block parametric WITHOUT \
+                                                touching the main screen.")
+                                            .clicked()
+                                        {
+                                            edit_id = Some(*id);
+                                        }
                                     });
                                 });
                             }
@@ -9684,39 +10542,36 @@ impl CadApp {
                 }
 
                 // ---- Set parameters on block ----------------------------
-                if existing.len() >= 2 {
+                // Parametrizing now happens entirely inside the isolated Block
+                // Editor (the "Edit ▶" button per block above) — no exploding
+                // to the main canvas. COMPARE still needs two distinct block
+                // definitions, so it stays gated below.
+                if !existing.is_empty() {
                     ui.add_space(8.0);
                     ui.separator();
                     ui.label(egui::RichText::new("Set parameters on block").strong());
-                    ui.small("RECORD (recommended): select a block instance, close this \
-                              dialog, run `btr`, demonstrate each stretch, then `finish`. \
-                              Each stretch IS a parameter (reversible).");
-                    if ui.add(egui::Button::new(
-                        egui::RichText::new("Block Task Recorder (record stretches) ▶").strong()))
-                        .on_hover_text("Needs a block instance SELECTED. Closes this dialog, \
-                                        explodes it to a sandbox; stretch to demonstrate each \
-                                        parameter, then type `finish`.")
-                        .clicked()
-                    {
-                        do_task_record = true;
-                    }
-                    ui.add_space(2.0);
-                    ui.small("…or COMPARE two finished blocks (lossy for arcs/rotations):");
-                    if ui.add(egui::Button::new("Compare source & target on screen ▶"))
-                        .on_hover_text("Click the SOURCE block then the TARGET block; the \
-                                        diff is extracted (can include side-effect vectors).")
-                        .clicked()
-                    {
-                        do_compare = true;
+                    ui.small("Click ‘Edit ▶’ next to a block above to open the \
+                              Block Editor — demonstrate each stretch in its own canvas, \
+                              name it, then Save. All editing stays inside the dialog.");
+                    if existing.len() >= 2 {
+                        ui.add_space(2.0);
+                        ui.small("…or COMPARE two finished blocks (lossy for arcs/rotations):");
+                        if ui.add(egui::Button::new("Compare source & target on screen ▶"))
+                            .on_hover_text("Click the SOURCE block then the TARGET block; the \
+                                            diff is extracted (can include side-effect vectors).")
+                            .clicked()
+                        {
+                            do_compare = true;
+                        }
                     }
                 }
             });
 
         // ---- post-frame actions ------------------------------------------
-        if do_task_record {
-            // Close the dialog and start the Block Task Recorder on the
-            // currently-selected block instance.
-            self.begin_block_task_recorder();
+        if let Some(id) = edit_id {
+            // Close the dialog and open the isolated Block Editor on this
+            // block definition — all parametric editing happens in there.
+            self.open_block_editor(id);
             return;
         }
         if do_compare {
@@ -9816,7 +10671,7 @@ impl CadApp {
         let inst_style = contents.first().map(|d| d.style);
         let id = self.doc.blocks.add(cad_kernel::Block {
             name: name.to_string(), base, dobjects: contents, smart,
-            params: Vec::new(),
+            params: Vec::new(), cut_edges: Vec::new(),
         });
         for &i in sel.iter().rev() {
             self.doc.dobjects.remove(i);
@@ -9928,6 +10783,7 @@ impl CadApp {
                 points: c.points.clone(),
                 name: String::new(),
                 original: "0".into(),
+                gain: 1.0,
             }).collect();
         // Highlight on the base block.
         let oc: Vec<(Vec<Vec2>, Vec2)> = rows.iter()
@@ -9960,7 +10816,8 @@ impl CadApp {
         for r in rows.iter().filter(|r| !r.name.trim().is_empty()) {
             let name = r.name.trim().to_string();
             let vec = cad_kernel::ParamVector {
-                win_min: r.win_min + base, win_max: r.win_max + base, dir: r.dir };
+                win_min: r.win_min + base, win_max: r.win_max + base,
+                dir: r.dir, gain: r.gain };
             if let Some(p) = params.iter_mut().find(|p| p.name == name) {
                 p.vectors.push(vec);   // link into the existing variable
             } else if params.len() < cad_kernel::MAX_BLOCK_PARAMS {
@@ -10000,6 +10857,9 @@ impl CadApp {
 
     /// Start a Block Task Recorder on the selected block instance — explode
     /// it into a temp sandbox the user stretches to demonstrate parameters.
+    /// SUPERSEDED by the isolated Block Editor (`open_block_editor`); kept for
+    /// reference. The `btr` command and dialog now open the editor instead.
+    #[allow(dead_code)]
     fn begin_block_task_recorder(&mut self) {
         // Find a selected block instance (basket or single).
         let br = self.selection.iter().copied()
@@ -10023,34 +10883,72 @@ impl CadApp {
             .collect();
         // (blk borrow ends here — `temps` owns clones.)
         self.snapshot_doc();
+        // Remove the block's OWN instances for the session so they don't
+        // overlap the sandbox (and get caught by the stretch window).
+        let mut removed_instances: Vec<DObject> = Vec::new();
+        self.doc.dobjects.retain(|d| {
+            if matches!(&d.geom, Geom::BlockRef(b) if b.block == source_block) {
+                removed_instances.push(d.clone());
+                false
+            } else { true }
+        });
         let mut temp_handles = Vec::new();
         for t in temps { temp_handles.push(t.handle); self.doc.push(t); }
         self.selection.clear();
         self.selected = None;
         self.block_task_rec = Some(BlockTaskRec {
             source_block, source_name: source_name.clone(),
-            world_offset: br.insert, temp_handles, recorded: Vec::new() });
+            world_offset: br.insert, temp_handles, removed_instances,
+            recorded: Vec::new() });
         self.index_dirty = true;
         self.gpu_dirty   = true;
-        self.set_prompt(
-            "Block Task Recorder: STRETCH the geometry to demonstrate each parameter; \
-             type `finish` when done  [Esc=cancel]");
         self.history.push(format!(
-            "  ◉ Block Task Recorder: '{}' exploded to a sandbox — demonstrate stretches, then `finish`",
+            "  ◉ Block Task Recorder: '{}' exploded to a sandbox — crossing-window to STRETCH each parameter, then `finish`",
             source_name));
+        // Drop the user straight into a stretch selection session so the
+        // first crossing-window IS the stretch (no need to type `stretch`).
+        self.start_btr_stretch();
+    }
+
+    /// Enter a fresh STRETCH selection session for the active Block Task
+    /// Recorder so the user can crossing-window straight away instead of
+    /// having to type `stretch` first. Mirrors the empty-selection arm of
+    /// `Command::Stretch`, with a recorder-specific prompt; deliberately
+    /// leaves `block_task_rec` intact (begin_selection only touches the
+    /// selection/draw state, not the recorder).
+    fn start_btr_stretch(&mut self) {
+        self.tool = Tool::None;
+        self.pending.clear();
+        self.stretch_window_box = None;
+        self.begin_selection(SelectMode::ForSelect);  // clears selection
+        self.queued_op = QueuedOp::Stretch;           // set AFTER begin_selection
+        self.set_prompt(
+            "Block Task Recorder ▸ STRETCH: crossing-window the vertices, Enter, \
+             then click/​type base+dest  ·  `done` or empty Enter = finish  [Esc=cancel]");
     }
 
     /// Finish the Block Task Recorder: delete the sandbox and open the
     /// "Set parameters on block" dialog with the recorded tasks (or just
     /// clean up if none were recorded). Esc-cancel calls the cleanup half.
     fn finish_block_task_recorder(&mut self) {
+        self.btr_awaiting_name = false;
         let Some(rec) = self.block_task_rec.take() else {
             self.history.push("  ! finish: no Block Task Recorder active".into());
             return;
         };
+        // Delete the sandbox; restore the block's own instances.
         self.doc.dobjects.retain(|d| !rec.temp_handles.contains(&d.handle));
+        for d in &rec.removed_instances { self.doc.push(d.clone()); }
         self.selection.clear();
         self.selected = None;
+        // `finish` is usually typed while the auto-started stretch selection
+        // session is live — tear it down so no dangling select/stretch state
+        // survives into the dialog.
+        self.select_mode     = SelectMode::Off;
+        self.queued_op       = QueuedOp::None;
+        self.stretch_state   = StretchState::Off;
+        self.window_first    = None;
+        self.stretch_window_box = None;
         self.index_dirty = true;
         self.gpu_dirty   = true;
         self.clear_prompt();
@@ -10182,7 +11080,7 @@ impl CadApp {
     /// PARAMETRIC block instead starts the insert-time value prompt — the
     /// command line asks for each variable ("set width [1000]:") and the
     /// instance is placed once every value is entered.
-    fn apply_insert(&mut self, block: u32, insert: Vec2) {
+    fn apply_insert(&mut self, block: u32, insert: Vec2, rotation: f64) {
         let (names, defaults): (Vec<String>, Vec<f64>) =
             match self.doc.blocks.get(block) {
                 Some(blk) if !blk.params.is_empty() => (
@@ -10192,33 +11090,120 @@ impl CadApp {
                 _ => (Vec::new(), Vec::new()),
             };
         if names.is_empty() {
-            // Plain block — place now.
+            // Plain block — place now, then cut the host opening (if any).
             self.snapshot_doc();
-            self.add_dobject(Geom::BlockRef(cad_kernel::BlockRef {
-                block, insert, scale: 1.0, rotation: 0.0,
+            let br = cad_kernel::BlockRef {
+                block, insert, scale: 1.0, rotation,
                 param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
-            }), "insert");
+            };
+            self.add_dobject(Geom::BlockRef(br), "insert");
+            self.apply_block_cut(br);
             return;
         }
         // Parametric — prompt for each variable, starting with the first.
         self.set_prompt(format!(
             "insert: set {} [{}]  (Enter=default)  [Esc=cancel]", names[0], defaults[0]));
         self.insert_param_prompt = Some(InsertParamPrompt {
-            block, insert, names, defaults, values: Vec::new() });
+            block, insert, rotation, names, defaults, values: Vec::new() });
         self.refocus_cmd = true;
     }
 
-    /// Place the parametric instance once all variable values are collected.
+    /// Place the parametric instance once all variable values are collected,
+    /// then cut the host opening (if the block has cut edges).
     fn place_parametric_insert(&mut self, p: InsertParamPrompt) {
         self.snapshot_doc();
         let mut param_values = [0.0; cad_kernel::MAX_BLOCK_PARAMS];
         for (k, v) in p.values.iter().enumerate() {
             if k < cad_kernel::MAX_BLOCK_PARAMS { param_values[k] = *v; }
         }
-        self.add_dobject(Geom::BlockRef(cad_kernel::BlockRef {
-            block: p.block, insert: p.insert, scale: 1.0, rotation: 0.0, param_values,
-        }), "insert");
+        let br = cad_kernel::BlockRef {
+            block: p.block, insert: p.insert, scale: 1.0, rotation: p.rotation, param_values,
+        };
+        self.add_dobject(Geom::BlockRef(br), "insert");
+        self.apply_block_cut(br);
         self.clear_prompt();
+    }
+
+    /// Cut the host opening: if the inserted block carries CUT EDGES (jamb
+    /// lines), build the region they enclose (derived + transformed to world)
+    /// and trim out the portion of every host Line/Polyline that falls inside
+    /// it. The door/window leaves a clean gap in the wall. Runs as part of the
+    /// insert op (no extra undo snapshot — one undo reverts insert + cut).
+    fn apply_block_cut(&mut self, br: cad_kernel::BlockRef) {
+        let region: Vec<Vec2> = {
+            let Some(blk) = self.doc.blocks.get(br.block) else { return; };
+            if blk.cut_edges.is_empty() { return; }
+            let derived = self.block_derived_geoms(blk, &br.param_values);
+            let mut pts: Vec<Vec2> = Vec::new();
+            for &i in &blk.cut_edges {
+                if let Some(g) = derived.get(i) {
+                    let wg = br.transform_geom(g, blk.base);
+                    edge_endpoints(&wg, &mut pts);
+                }
+            }
+            convex_hull(&pts)
+        };
+        if region.len() < 3 { return; }
+        let mut changed = false;
+        let old = std::mem::take(&mut self.doc.dobjects);
+        let mut out: Vec<DObject> = Vec::with_capacity(old.len());
+        for d in old {
+            match &d.geom {
+                Geom::Line(l) => {
+                    let parts = clip_line_outside(l.a, l.b, &region);
+                    let whole = parts.len() == 1
+                        && (parts[0].0 - l.a).len() < 1e-6
+                        && (parts[0].1 - l.b).len() < 1e-6;
+                    if whole {
+                        out.push(d);
+                    } else {
+                        changed = true;
+                        for (a, b) in parts {
+                            if (a - b).len() > 1e-9 {
+                                out.push(DObject::with_style(
+                                    Geom::Line(Line { a, b }), d.style));
+                            }
+                        }
+                    }
+                }
+                Geom::Polyline(pl) => {
+                    let verts: Vec<Vec2> = pl.vertices.iter().map(|v| v.pos).collect();
+                    let mut segs: Vec<(Vec2, Vec2)> =
+                        verts.windows(2).map(|w| (w[0], w[1])).collect();
+                    if pl.closed && verts.len() >= 2 {
+                        segs.push((verts[verts.len() - 1], verts[0]));
+                    }
+                    let mut survivors: Vec<(Vec2, Vec2)> = Vec::new();
+                    let mut any_cut = false;
+                    for (a, b) in &segs {
+                        let parts = clip_line_outside(*a, *b, &region);
+                        let whole = parts.len() == 1
+                            && (parts[0].0 - *a).len() < 1e-6
+                            && (parts[0].1 - *b).len() < 1e-6;
+                        if !whole { any_cut = true; }
+                        survivors.extend(parts);
+                    }
+                    if !any_cut {
+                        out.push(d);
+                    } else {
+                        changed = true;
+                        for (a, b) in survivors {
+                            if (a - b).len() > 1e-9 {
+                                out.push(DObject::with_style(
+                                    Geom::Line(Line { a, b }), d.style));
+                            }
+                        }
+                    }
+                }
+                _ => out.push(d),   // blocks / walls / arcs untouched (v1)
+            }
+        }
+        self.doc.dobjects = out;
+        if changed {
+            self.index_dirty = true;
+            self.gpu_dirty   = true;
+            self.history.push("  ✔ opening cut into host geometry".into());
+        }
     }
 
     /// Explode: replace each selected BlockRef with transformed copies of
@@ -10587,7 +11572,9 @@ impl CadApp {
                 affected,
             });
         }
-        // Block Task Recorder: record this stretch as a parametric task.
+        // Block Task Recorder: record this stretch as a parametric task,
+        // then return control to the recorder by asking for its NAME (the
+        // amount stays dynamic — entered at insert).
         if let Some(off) = btr_off {
             let dir = if v.len() > 1e-9 { v / v.len() } else { v };
             let n_pts = btr_pts.len();
@@ -10596,11 +11583,21 @@ impl CadApp {
                     win_min: win_min - off, win_max: win_max - off,
                     dir, magnitude: v.len(), dx: v.x, dy: v.y,
                     points: btr_pts, name: String::new(), original: "0".into(),
+                    gain: 1.0,
                 });
             }
             self.history.push(format!(
-                "  ◉ task recorded: Δ=({:.1},{:.1})  {} point(s) — keep stretching or `finish`",
-                v.x, v.y, n_pts));
+                "  ◉ stretch recorded: dir=({:.2},{:.2})  {} point(s)", dir.x, dir.y, n_pts));
+            self.btr_awaiting_name = true;
+            self.set_prompt(
+                "Block Task Recorder: type a NAME for this function (e.g. width) — \
+                 it auto-continues to the next stretch  ·  `done` or empty Enter = finish  [Esc=cancel]");
+            // Don't fall through to the generic stretch summary/clear below.
+            self.selection.clear();
+            self.intersections.clear();
+            self.index_dirty = true;
+            self.gpu_dirty = true;
+            return;
         }
         self.history.push(format!(
             "  ↔ stretch by ({:.2},{:.2})  {} dobject(s){}",
@@ -10817,7 +11814,10 @@ impl CadApp {
                 // vectors move by the same (value - original) amount.
                 let amount = value - p.original;
                 for v in &p.vectors {
-                    let disp = v.dir * amount;
+                    // `gain` lets linked vectors share one value with
+                    // different magnitudes (e.g. 0.5 each for a centered
+                    // opening). See `ParamVector::gain`.
+                    let disp = v.dir * (v.gain * amount);
                     if disp.len() > 1e-12 {
                         g = stretch_one(&g, v.win_min, v.win_max, disp);
                     }
@@ -14458,9 +15458,12 @@ impl eframe::App for CadApp {
                 self.insert_param_prompt = None;
                 self.history.push("  insert cancelled".into());
             }
-            // Cancel a Block Task Recorder: delete the temp sandbox, discard.
+            // Cancel a Block Task Recorder: delete the sandbox, restore the
+            // block's own instances, discard recordings.
+            self.btr_awaiting_name = false;
             if let Some(rec) = self.block_task_rec.take() {
                 self.doc.dobjects.retain(|d| !rec.temp_handles.contains(&d.handle));
+                for d in &rec.removed_instances { self.doc.push(d.clone()); }
                 self.index_dirty = true;
                 self.gpu_dirty = true;
                 self.history.push("  Block Task Recorder cancelled (sandbox discarded)".into());
@@ -14623,6 +15626,31 @@ impl eframe::App for CadApp {
             self.history.push("  hatch pick-point session ended".into());
             if space_now { self.cmd.clear(); }
             return;
+        }
+        // Block Task Recorder — an empty Enter ENDS the session and opens the
+        // "Set parameters on block" dialog. Two cases, both meaning "I'm done":
+        //   (a) we're waiting to NAME the just-recorded stretch, or
+        //   (b) we're sitting in a stretch-select with an EMPTY basket
+        //       (nothing more to stretch).
+        // A NON-empty basket still finalises normally (→ base/dest), so the
+        // user can keep adding stretches. Sits above the generic select-mode
+        // "please make a selection" 2-stage cancel so it wins.
+        if trigger && cmd_is_empty && self.block_task_rec.is_some()
+            && (self.btr_awaiting_name || self.selection.is_empty())
+        {
+            self.btr_awaiting_name = false;
+            if space_now { self.cmd.clear(); }
+            self.finish_block_task_recorder();
+            return;
+        }
+        // Insert ANGLE step — empty Enter = 0° rotation, place + cut.
+        if trigger && cmd_is_empty {
+            if let InsertState::WaitingForAngle { block, insert } = self.insert_state {
+                self.insert_state = InsertState::Off;
+                if space_now { self.cmd.clear(); }
+                self.apply_insert(block, insert, 0.0);
+                return;
+            }
         }
         if trigger && cmd_is_empty {
             if self.select_mode != SelectMode::Off {
@@ -15979,6 +17007,7 @@ impl eframe::App for CadApp {
         self.render_wall_style_dialog(ctx);
         self.render_block_dialog(ctx);
         self.render_param_name_dialog(ctx);
+        self.render_block_editor(ctx);
         self.render_file_dialog(ctx);
         self.render_dim_style_dialog(ctx);
         self.render_text_input_dialog(ctx);
@@ -16385,6 +17414,11 @@ impl eframe::App for CadApp {
             // the canvas area (below toolbar, above status bar) not
             // the full window rect.
             self.canvas_screen_rect = Some(rect);
+            // ISOLATION: while the Block Editor is open, the main canvas must
+            // not react to ANY pointer gesture (pan/zoom/select/grip/draw) —
+            // all block editing happens inside that window. Every interaction
+            // gate below is AND-ed with `!canvas_locked`. See `BlockEditor`.
+            let canvas_locked = self.block_editor.is_some();
             // Stash the live cursor (raw world) so the command line's
             // direct-distance entry knows which way to throw a typed
             // distance (CARD-locked when CARD is on).
@@ -16427,15 +17461,16 @@ impl eframe::App for CadApp {
             }
 
             // pan with middle/right drag
-            if resp.dragged_by(egui::PointerButton::Middle)
-                || resp.dragged_by(egui::PointerButton::Secondary)
+            if !canvas_locked
+                && (resp.dragged_by(egui::PointerButton::Middle)
+                    || resp.dragged_by(egui::PointerButton::Secondary))
             {
                 let d = resp.drag_delta();
                 self.world_offset += egui::vec2(d.x / self.scale, -d.y / self.scale);
             }
 
             // wheel zoom around cursor
-            let scroll = ui.input(|i| i.raw_scroll_delta.y);
+            let scroll = if canvas_locked { 0.0 } else { ui.input(|i| i.raw_scroll_delta.y) };
             if scroll != 0.0 {
                 if let Some(cursor) = resp.hover_pos() {
                     let before = self.s2w(cursor, rect);
@@ -16595,14 +17630,15 @@ impl eframe::App for CadApp {
             // resp.clicked() fires only when egui classifies the press+release
             // as a click (small motion); drag_stopped() fires when a release
             // ends a drag — including a "click" that egui saw as a tiny drag.
-            let click_now    = resp.clicked();
-            let drag_stopped = resp.drag_stopped();
+            let click_now    = resp.clicked() && !canvas_locked;
+            let drag_stopped = resp.drag_stopped() && !canvas_locked;
             // SESSION RECORDER — every mouse press/release with the
             // FULL gesture context. Press position is stashed on self
             // and re-read at release time to derive the real drag
             // distance + emit a GestureClassification event with both
             // egui's classification AND the app's outcome.
-            {
+            // Skipped entirely while the Block Editor owns input.
+            if !canvas_locked {
                 let primary_press = ctx.input(|i|
                     i.pointer.button_pressed(egui::PointerButton::Primary));
                 let secondary_press = ctx.input(|i|
@@ -16854,7 +17890,8 @@ impl eframe::App for CadApp {
             // quadrant → radius; line midpoint → translate whole line).
             let mut grip_drag_consumed_click = false;
             if pointer_mode_idle && self.env.GrpEnb {
-                let drag_started = resp.drag_started_by(egui::PointerButton::Primary);
+                let drag_started = resp.drag_started_by(egui::PointerButton::Primary)
+                    && !canvas_locked;
                 // (a) Drag-grab: a primary-button drag begins near a grip.
                 // (b) Click-grab: a clicked() event lands near a grip AND
                 //     no grip is currently held.
@@ -17522,10 +18559,21 @@ impl eframe::App for CadApp {
                         }
                         self.refocus_cmd = true;
                     } else if let InsertState::WaitingForPoint { block } = self.insert_state {
-                        // insert — place one instance, end the session.
-                        self.apply_insert(block, click_world);
+                        // insert — point chosen; now ask for the rotation ANGLE
+                        // (click a direction, or Enter = 0).
+                        self.insert_state = InsertState::WaitingForAngle {
+                            block, insert: click_world };
+                        self.set_prompt(
+                            "insert: specify ROTATION — click a direction point  \
+                             (Enter = 0°)  [Esc=cancel]");
+                        self.refocus_cmd = true;
+                    } else if let InsertState::WaitingForAngle { block, insert } =
+                        self.insert_state
+                    {
+                        // Direction click → rotation, then place + cut.
+                        let rotation = (click_world - insert).angle();
                         self.insert_state = InsertState::Off;
-                        self.clear_prompt();
+                        self.apply_insert(block, insert, rotation);
                         self.refocus_cmd = true;
                     } else if self.matchprops_state != MatchPropsState::Off {
                         // matchprop is in source-pick mode — find the dobject
