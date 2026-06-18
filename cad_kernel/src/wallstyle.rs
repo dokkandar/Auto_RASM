@@ -16,6 +16,10 @@ pub struct WallStyle {
     pub fill_color:  u32,
     /// Face-line color (ACI). 0 = ByLayer/ByBlock (use the dobject color).
     pub face_color:  u32,
+    /// Draw a batt-INSULATION symbol (sine wave) in the cavity — the
+    /// architectural insulation-layer wall. Amplitude auto-fits the thickness.
+    /// NOT persisted to RSM yet (reader defaults it false, like the table).
+    pub insulation:  bool,
     /// Free-text note shown in the Wall Style Manager.
     pub description: String,
 }
@@ -28,6 +32,7 @@ impl WallStyle {
             thickness:   0.2,
             fill_color:  0,
             face_color:  0,
+            insulation:  false,
             description: String::new(),
         }
     }

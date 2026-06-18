@@ -52,7 +52,7 @@ pub use block::{Block, BlockParam, BlockRef, BlockTable, ParamVector, MAX_BLOCK_
 pub use blockdiff::{diff_blocks, BlockDiff, ParamCluster};
 pub use geom::{bulge_arc, bulge_from_arc};
 pub mod patterns;
-pub use geom::{ChamferOut, FilletOut, GripRole, JoinOut, chamfer_lines, fillet_lines, join_geoms};
+pub use geom::{ChamferOut, FilletOut, GripRole, JoinOut, chamfer_lines, fillet_lines, join_geoms, join_trim_survivors};
 pub use color::{aci_palette, resolve_color, Color, TrueColorTable};
 pub use lineweight::{resolve_lineweight, Lineweight, DEFAULT_LINEWEIGHT_MM};
 pub use linetype::{Linetype, LinetypeTable};

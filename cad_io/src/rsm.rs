@@ -727,6 +727,7 @@ fn read_wall_style_table(r: &mut R) -> Result<cad_kernel::WallStyleTable, String
             thickness:   r.f64()?,
             fill_color:  r.u32()?,
             face_color:  r.u32()?,
+            insulation:  false,   // not persisted yet
             description: r.str()?,
         });
     }
@@ -969,7 +970,8 @@ mod tests {
         // Wall style WITH a solid fill (the reported bug), + a wall on it.
         let ws_id = doc.wall_styles.add(cad_kernel::WallStyle {
             name: "STRUCTURAL".into(), thickness: 0.35,
-            fill_color: 8, face_color: 7, description: "load-bearing".into(),
+            fill_color: 8, face_color: 7, insulation: false,
+            description: "load-bearing".into(),
         });
         doc.push(DObject::new(Geom::Wall(cad_kernel::Wall {
             start: Vec2::new(0.0, 0.0), end: Vec2::new(5.0, 0.0),

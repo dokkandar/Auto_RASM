@@ -329,6 +329,70 @@ fn clip_line_outside(a: Vec2, b: Vec2, poly: &[Vec2]) -> Vec<(Vec2, Vec2)> {
     out
 }
 
+/// Ttr offset curves of an object at distance `r`: the loci of centres of a
+/// radius-`r` circle tangent to it. A line → two parallel lines (±r, extended
+/// long so the kernel `intersect` finds crossings beyond the segment); a
+/// circle/arc → two concentric circles (R+r and |R−r|).
+fn ttr_offsets(g: &Geom, r: f64) -> Vec<Geom> {
+    const EXT: f64 = 1.0e6;
+    match g {
+        Geom::Line(l) => {
+            let d = l.b - l.a;
+            let len = d.len();
+            if len < 1e-9 { return Vec::new(); }
+            let u = d / len;
+            let n = Vec2::new(-u.y, u.x);
+            let mid = (l.a + l.b) * 0.5;
+            let (a0, b0) = (mid - u * EXT, mid + u * EXT);
+            vec![
+                Geom::Line(Line { a: a0 + n * r, b: b0 + n * r }),
+                Geom::Line(Line { a: a0 - n * r, b: b0 - n * r }),
+            ]
+        }
+        Geom::Circle(c) => {
+            let mut v = vec![Geom::Circle(Circle { center: c.center, radius: c.radius + r })];
+            let inner = (c.radius - r).abs();
+            if inner > 1e-9 { v.push(Geom::Circle(Circle { center: c.center, radius: inner })); }
+            v
+        }
+        Geom::Arc(a) => {
+            let mut v = vec![Geom::Circle(Circle { center: a.center, radius: a.radius + r })];
+            let inner = (a.radius - r).abs();
+            if inner > 1e-9 { v.push(Geom::Circle(Circle { center: a.center, radius: inner })); }
+            v
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Foot of tangency on object `g` for a tangent-circle centre `c` — the point
+/// on `g` (its infinite line / full circle) nearest `c`.
+fn ttr_foot(g: &Geom, c: Vec2) -> Vec2 {
+    match g {
+        Geom::Line(l) => {
+            let d = l.b - l.a;
+            let len2 = d.dot(d);
+            if len2 < 1e-18 { return l.a; }
+            l.a + d * ((c - l.a).dot(d) / len2)
+        }
+        Geom::Circle(ci) => {
+            let v = c - ci.center; let len = v.len();
+            if len < 1e-12 { ci.center } else { ci.center + v * (ci.radius / len) }
+        }
+        Geom::Arc(a) => {
+            let v = c - a.center; let len = v.len();
+            if len < 1e-12 { a.center } else { a.center + v * (a.radius / len) }
+        }
+        _ => c,
+    }
+}
+
+/// Parse a typed coordinate `x,y` into a point. None unless both parse.
+fn parse_xy(s: &str) -> Option<Vec2> {
+    let (a, b) = s.split_once(',')?;
+    Some(Vec2::new(a.trim().parse::<f64>().ok()?, b.trim().parse::<f64>().ok()?))
+}
+
 /// Shortest distance from point `p` to segment `a`→`b` (world units).
 fn point_seg_dist(p: Vec2, a: Vec2, b: Vec2) -> f64 {
     let ab = b - a;
@@ -807,6 +871,17 @@ pub struct CadApp {
     /// open. While set, the main canvas pointer interaction is GATED OFF so
     /// nothing bleeds into the main screen. See `BlockEditor`.
     block_editor:   Option<BlockEditor>,
+    /// Active prompt-driven command flow (AutoCAD-style prompt sequence).
+    /// `Some` while a command like CIRCLE is collecting its inputs. See
+    /// `CmdFlow` + COMMAND_LINE.md.
+    cmd_flow:       Option<CmdFlow>,
+    /// Command-line TRANSCRIPT — every (prompt, reply) the flow exchanges with
+    /// the user. Kept on the command structure for review / replay / future AI.
+    transcript:     Vec<PromptReply>,
+    /// Drafting-command live preview ON by default; `preview off` disables it.
+    /// Part of the drafting-command architecture (every flow previews unless
+    /// this is off). See `flow_preview`.
+    draft_preview:  bool,
     /// Text drafting state. While `WaitingForString`, the next cmd-line
     /// input is captured as the text body (NOT parsed as a command).
     text_draft:     TextDraftState,
@@ -1035,6 +1110,11 @@ pub enum QueuedOp {
     /// layer/color/linetype reassignment. Pair stored as Strings so
     /// the kernel layer-id / linetype-id lookups happen at apply time.
     ChProp(String, String),
+    /// MatchProp — applied on Enter. After the SOURCE is clicked, the target
+    /// phase runs as a normal selection session (so crossing/window/W/C/B/all
+    /// all work); on Enter every selected dobject takes the source's
+    /// properties. Carries the source dobject index.
+    MatchPropPaint(usize),
 }
 
 /// State machine for the interactive copy tool — same shape as MoveState.
@@ -1097,11 +1177,15 @@ pub enum MirrorState {
     AwaitingKeep(Vec2, Vec2),
 }
 
-/// State machine for matchprop — one click selects a source dobject;
-/// its `style` is then assigned to every dobject in the basket.
+/// State machine for matchprop (AutoCAD MATCHPROP): click ONE source dobject;
+/// the target phase then runs as a normal SELECTION SESSION (click / window /
+/// crossing / W/C/B/all) with `QueuedOp::MatchPropPaint` queued, so on Enter
+/// every selected dobject takes the source's general properties (layer / color
+/// / linetype) plus the matching geom-embedded style (wall / dim / text).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum MatchPropsState {
     Off,
+    /// Click the source dobject.
     WaitingForSource,
 }
 
@@ -1290,6 +1374,51 @@ pub struct InsertParamPrompt {
     pub names:    Vec<String>,
     pub defaults: Vec<f64>,
     pub values:   Vec<f64>,   // collected so far (len = current index)
+}
+
+/// One recorded prompt↔reply pair — the command line's transcript. The whole
+/// command structure keeps this so the exchange can be reviewed, replayed, or
+/// later fed to an AI/external resolver (see COMMAND_LINE.md). Reply is the
+/// canonical answer (a coordinate, number, or keyword), not the raw keystrokes.
+#[derive(Clone, Debug)]
+pub struct PromptReply {
+    /// Command this exchange belongs to (e.g. "circle").
+    pub cmd:    &'static str,
+    pub prompt: String,
+    pub reply:  String,
+}
+
+/// A live, prompt-driven command flow (AutoCAD-style): the command line shows
+/// the current step's exact prompt; the user answers with a point / number /
+/// keyword; each answer is recorded in `CadApp.transcript` and advances the
+/// step. Slice 1 implements CIRCLE; the model generalises later.
+pub struct CmdFlow {
+    /// Command being run (e.g. "circle") — for the transcript + display.
+    pub name:   &'static str,
+    /// Current step of the CIRCLE state machine.
+    pub circle: CircleStep,
+}
+
+/// CIRCLE prompt-flow steps. Each carries the geometry captured so far. The
+/// prompt text + valid keywords per step live in `flow_prompt`.
+#[derive(Clone, Copy, Debug)]
+pub enum CircleStep {
+    /// "Specify center point for circle or [3P/2P/Ttr (tan tan radius)]:"
+    Center,
+    /// "Specify radius of circle or [Diameter]:"  (center captured)
+    Radius(Vec2),
+    /// "Specify diameter of circle:"
+    Diameter(Vec2),
+    /// 3-point: first / second / third point on the circle.
+    P3a, P3b(Vec2), P3c(Vec2, Vec2),
+    /// 2-point: first / second endpoint of the diameter.
+    P2a, P2b(Vec2),
+    /// Ttr (tangent-tangent-radius): pick first object, second object, then
+    /// type the radius. Each pick stores (dobject index, click point) — the
+    /// click point disambiguates which tangent solution to use.
+    TtrObj1,
+    TtrObj2(usize, Vec2),
+    TtrRadius(usize, Vec2, usize, Vec2),
 }
 
 /// Block Task Recorder session — the block is exploded into a TEMP sandbox
@@ -1568,6 +1697,8 @@ pub struct WallStyleDialog {
     pub fill_aci:    Option<u8>,
     /// Face-line ACI; `None` = ByLayer (use the dobject color).
     pub face_aci:    Option<u8>,
+    /// Draw the batt-insulation sine wave in the cavity.
+    pub insulation:  bool,
     pub description: String,
 }
 
@@ -1580,6 +1711,7 @@ impl WallStyleDialog {
             thickness:   s.thickness,
             fill_aci:    None,
             face_aci:    None,
+            insulation:  false,
             description: String::new(),
         }
     }
@@ -1591,6 +1723,7 @@ impl WallStyleDialog {
             thickness:   s.thickness,
             fill_aci:    aci(s.fill_color),
             face_aci:    aci(s.face_color),
+            insulation:  s.insulation,
             description: s.description.clone(),
         }
     }
@@ -1921,6 +2054,9 @@ impl Default for CadApp {
             dist_state:     DistState::Off,
             props_edit_gesture: false,
             block_editor:   None,
+            cmd_flow:       None,
+            transcript:     Vec::new(),
+            draft_preview:  true,
             text_draft:     TextDraftState::Off,
             dim_draft:      DimDraftState::Off,
             pending_text:   None,
@@ -2063,7 +2199,14 @@ impl CadApp {
 
     #[track_caller]
     fn run_command(&mut self, raw: &str) {
-        self.history.push(format!("> {}", raw));
+        // Echo the line into the history. A TOP-LEVEL command (typed at the
+        // idle "command:" prompt) reads "command: circle"; a reply to an
+        // active prompt reads "> 50". Both then stack upward in the history.
+        if self.current_prompt.is_empty() {
+            self.history.push(format!("command: {}", raw));
+        } else {
+            self.history.push(format!("> {}", raw));
+        }
         let trimmed = raw.trim();
         // Any non-empty input cancels the 2-stage-Enter notice.
         self.empty_enter_count_in_select = 0;
@@ -2079,6 +2222,49 @@ impl CadApp {
             },
             source:        crate::dbg_recorder::CmdSource::Typed,
         });
+
+        // ---- Prompt-driven command flow (Slice 1: CIRCLE) ----------------
+        // When a flow is live the command line IS its prompt — route typed
+        // input there. Otherwise `circle`/`ci` STARTS the flow. Each prompt +
+        // reply lands in `self.transcript`. See COMMAND_LINE.md.
+        if self.cmd_flow.is_some() {
+            self.flow_input_text(trimmed);
+            return;
+        }
+        if matches!(trimmed.to_ascii_lowercase().as_str(), "circle" | "ci")
+            && self.select_mode == SelectMode::Off
+        {
+            self.circle_flow_start();
+            return;
+        }
+        // `preview [on|off]` — toggle drafting-command live preview.
+        {
+            let lc = trimmed.to_ascii_lowercase();
+            if lc == "preview" || lc == "preview on" || lc == "preview off" {
+                self.draft_preview = match lc.as_str() {
+                    "preview on"  => true,
+                    "preview off" => false,
+                    _             => !self.draft_preview,
+                };
+                self.history.push(format!(
+                    "  drafting preview: {}", if self.draft_preview { "ON" } else { "off" }));
+                return;
+            }
+        }
+        // `transcript` — dump the recorded prompt↔reply log (the command
+        // structure's memory; later fed to an AI/external resolver).
+        if matches!(trimmed.to_ascii_lowercase().as_str(), "transcript" | "trans") {
+            if self.transcript.is_empty() {
+                self.history.push("  transcript: (empty)".into());
+            } else {
+                self.history.push(format!("  transcript — {} exchange(s):", self.transcript.len()));
+                for (i, pr) in self.transcript.iter().enumerate() {
+                    self.history.push(format!(
+                        "    {:>2}. [{}] {}  →  {}", i + 1, pr.cmd, pr.prompt, pr.reply));
+                }
+            }
+            return;
+        }
 
         // ---- Text-tool sub-command intercepts (must run FIRST) ----
         // The `text` tool consumes the cmd line until the user clicks
@@ -3220,14 +3406,17 @@ impl CadApp {
             Ok(Command::Undo) => self.do_undo(),
             Ok(Command::Redo) => self.do_redo(),
             Ok(Command::MatchProps) => {
-                if self.selection.is_empty() {
-                    self.history.push(
-                        "  ! matchprop: select target dobjects first, then run matchprop, then click source".into());
-                } else {
-                    self.matchprops_state = MatchPropsState::WaitingForSource;
+                // AutoCAD flow: pick SOURCE (1), then paint TARGETS (many).
+                // The current selection is PRESERVED as the "bank" — after the
+                // source is picked, `B` applies to it in one shot.
+                self.matchprops_state = MatchPropsState::WaitingForSource;
+                self.set_prompt("matchprop: click the SOURCE object  [Esc=cancel]");
+                let n = self.selection.len();
+                if n > 0 {
                     self.history.push(format!(
-                        "  matchprop — {} dobject(s) in basket. Click SOURCE dobject (Esc cancels)",
-                        self.selection.len()));
+                        "  matchprop — click the SOURCE object  ({} in bank; apply with B after the source)", n));
+                } else {
+                    self.history.push("  matchprop — click the SOURCE object".into());
                 }
             }
             Ok(Command::Reverse)     => self.apply_reverse(),
@@ -3978,6 +4167,20 @@ impl CadApp {
             }
             QueuedOp::ChProp(prop, val) => {
                 self.apply_chprop(&prop, &val);
+            }
+            QueuedOp::MatchPropPaint(src) => {
+                let targets: Vec<usize> =
+                    self.selection.iter().copied().filter(|&t| t != src).collect();
+                if targets.is_empty() {
+                    self.history.push("  matchprop: no targets selected".into());
+                } else {
+                    self.snapshot_doc();
+                    let mut n = 0;
+                    for t in &targets { if self.apply_matchprop_one(src, *t) { n += 1; } }
+                    self.history.push(format!(
+                        "  ✓ matchprop: source #{} → {} dobject(s)", src, n));
+                }
+                self.clear_prompt();
             }
         }
         // self.selection persists so follow-up commands (move, list, …) can use it.
@@ -6661,6 +6864,11 @@ impl CadApp {
                                 pick_slot = Some(WallColorSlot::Face); }
                         });
                         ui.end_row();
+                        ui.label("Insulation");
+                        ui.checkbox(&mut dialog.insulation, "batt symbol in cavity")
+                            .on_hover_text("Draw the architectural insulation \
+                                            (sine-wave batt) symbol along the wall cavity.");
+                        ui.end_row();
                         ui.label("Description");
                         ui.add(egui::TextEdit::singleline(&mut dialog.description)
                             .desired_width(220.0));
@@ -6695,6 +6903,7 @@ impl CadApp {
                 thickness:   dialog.thickness,
                 fill_color:  dialog.fill_aci.map(|a| a as u32).unwrap_or(0),
                 face_color:  dialog.face_aci.map(|a| a as u32).unwrap_or(0),
+                insulation:  dialog.insulation,
                 description: dialog.description.clone(),
             };
             match dialog.editing_id {
@@ -9547,29 +9756,26 @@ impl CadApp {
 
     // ---- Slice K: matchprop / reverse / chlayer apply methods ----
 
-    fn apply_matchprops(&mut self, source_idx: usize) {
-        let Some(source) = self.doc.dobjects.get(source_idx) else {
-            self.history.push("  ! matchprop: invalid source".into());
-            return;
+    /// Paint one target with the source's properties: general style (layer /
+    /// color / linetype via `d.style`) always, plus the geom-embedded style
+    /// (wall / dim / text) when both are the same kind. Returns true on apply.
+    fn apply_matchprop_one(&mut self, src_idx: usize, target_idx: usize) -> bool {
+        if src_idx == target_idx { return false; }   // self-match = no-op
+        let (src_style, src_geom) = match self.doc.dobjects.get(src_idx) {
+            Some(s) => (s.style, s.geom.clone()),
+            None => return false,
         };
-        let src_style = source.style;
-        if self.selection.is_empty() {
-            self.history.push("  ! matchprop: empty basket".into());
-            return;
+        let Some(t) = self.doc.dobjects.get_mut(target_idx) else { return false; };
+        t.style = src_style;
+        // Geom-embedded style — only when source and target are the same kind.
+        match (&src_geom, &mut t.geom) {
+            (Geom::Wall(s), Geom::Wall(d))           => d.style = s.style,
+            (Geom::Dimension(s), Geom::Dimension(d)) => d.style = s.style,
+            (Geom::Text(s), Geom::Text(d))           => d.style = s.style,
+            _ => {}
         }
-        self.snapshot_doc();
-        let n = self.selection.len();
-        for &i in &self.selection {
-            if i == source_idx { continue; }   // self-match is a no-op
-            if let Some(d) = self.doc.dobjects.get_mut(i) {
-                d.style = src_style;
-            }
-        }
-        self.history.push(format!(
-            "  ✓ matchprop: style from #{} applied to {} dobject(s)",
-            source_idx, n.saturating_sub(if self.selection.contains(&source_idx) {1} else {0})
-        ));
         self.gpu_dirty = true;
+        true
     }
 
     // ---- Blocks: create / insert / explode ----
@@ -11080,6 +11286,310 @@ impl CadApp {
     /// PARAMETRIC block instead starts the insert-time value prompt — the
     /// command line asks for each variable ("set width [1000]:") and the
     /// instance is placed once every value is entered.
+    // ---- Prompt-driven command flow (CIRCLE; Slice 1) -------------------
+    // The command line becomes a sequence of prompts; each (prompt, reply) is
+    // recorded in `self.transcript`. See COMMAND_LINE.md.
+
+    /// Start the CIRCLE flow at the center step.
+    fn circle_flow_start(&mut self) {
+        // Ribbon/menu/typed all land here — record it so an empty Enter
+        // repeats the command (icon commands ARE app commands).
+        self.last_command = Some("circle".into());
+        self.cmd_flow = Some(CmdFlow { name: "circle", circle: CircleStep::Center });
+        self.history.push("  command: circle".into());
+        self.flow_show_prompt();
+    }
+
+    /// Per-step GHOST geometry for the active flow + the optional anchor for a
+    /// hint line to the cursor. Drafting commands preview by default — this is
+    /// where each step declares what to show. See COMMAND_LINE.md.
+    fn flow_preview(&self, cursor: Vec2) -> (Vec<Geom>, Option<Vec2>) {
+        let Some(f) = &self.cmd_flow else { return (Vec::new(), None); };
+        match f.circle {
+            CircleStep::Center      => (Vec::new(), None),
+            CircleStep::Radius(c)   =>
+                (vec![Geom::Circle(Circle { center: c, radius: (cursor - c).len() })], Some(c)),
+            CircleStep::Diameter(c) =>
+                (vec![Geom::Circle(Circle { center: c, radius: (cursor - c).len() * 0.5 })], Some(c)),
+            CircleStep::P3a         => (Vec::new(), None),
+            CircleStep::P3b(p1)     => (Vec::new(), Some(p1)),
+            CircleStep::P3c(p1, p2) => match arc_three_points(p1, p2, cursor) {
+                Some(a) => (vec![Geom::Circle(Circle { center: a.center, radius: a.radius })], None),
+                None    => (Vec::new(), None),
+            },
+            CircleStep::P2a         => (Vec::new(), None),
+            CircleStep::P2b(p1)     => {
+                let c = (p1 + cursor) * 0.5;
+                (vec![Geom::Circle(Circle { center: c, radius: (cursor - p1).len() * 0.5 })], Some(p1))
+            }
+            // Ttr — highlight the hovered/picked objects, and at the radius
+            // step show the live tangent circle for a cursor-derived radius.
+            CircleStep::TtrObj1 => {
+                let tol = 10.0 / self.scale as f64;
+                let mut g = Vec::new();
+                if let Some(i) = self.nearest_entity_under(cursor, tol) {
+                    if let Some(d) = self.doc.dobjects.get(i) { g.push(d.geom.clone()); }
+                }
+                (g, None)
+            }
+            CircleStep::TtrObj2(o1, _) => {
+                let tol = 10.0 / self.scale as f64;
+                let mut g = Vec::new();
+                if let Some(d) = self.doc.dobjects.get(o1) { g.push(d.geom.clone()); }
+                if let Some(i) = self.nearest_entity_under(cursor, tol) {
+                    if i != o1 {
+                        if let Some(d) = self.doc.dobjects.get(i) { g.push(d.geom.clone()); }
+                    }
+                }
+                (g, None)
+            }
+            CircleStep::TtrRadius(o1, pk1, o2, pk2) => {
+                let mut g = Vec::new();
+                if let Some(d) = self.doc.dobjects.get(o1) { g.push(d.geom.clone()); }
+                if let Some(d) = self.doc.dobjects.get(o2) { g.push(d.geom.clone()); }
+                // Cursor-derived radius = nearest distance from cursor to obj1.
+                let r = self.doc.dobjects.get(o1)
+                    .map(|d| (cursor - ttr_foot(&d.geom, cursor)).len())
+                    .unwrap_or(0.0);
+                if r > 1e-6 {
+                    if let Some(center) = self.solve_ttr(o1, pk1, o2, pk2, r) {
+                        g.push(Geom::Circle(Circle { center, radius: r }));
+                    }
+                }
+                (g, None)
+            }
+        }
+    }
+
+    /// Exact prompt text for the current flow step (empty if no flow).
+    fn flow_prompt(&self) -> String {
+        let Some(f) = &self.cmd_flow else { return String::new(); };
+        match f.circle {
+            CircleStep::Center      => "Specify center point for circle or [3P/2P/Ttr (tan tan radius)]:".into(),
+            CircleStep::Radius(_)   => "Specify radius of circle or [Diameter]:".into(),
+            CircleStep::Diameter(_) => "Specify diameter of circle:".into(),
+            CircleStep::P3a         => "Specify first point on circle:".into(),
+            CircleStep::P3b(_)      => "Specify second point on circle:".into(),
+            CircleStep::P3c(_, _)   => "Specify third point on circle:".into(),
+            CircleStep::P2a         => "Specify first endpoint of circle's diameter:".into(),
+            CircleStep::P2b(_)      => "Specify second endpoint of circle's diameter:".into(),
+            CircleStep::TtrObj1     => "Specify point on object for first tangent of circle:".into(),
+            CircleStep::TtrObj2(..) => "Specify point on object for second tangent of circle:".into(),
+            CircleStep::TtrRadius(..) => "Specify radius of circle:".into(),
+        }
+    }
+
+    /// Echo the current step's prompt into the command line + status line.
+    fn flow_show_prompt(&mut self) {
+        let p = self.flow_prompt();
+        self.history.push(format!("  {}", p));
+        self.set_prompt(p);
+        self.refocus_cmd = true;
+    }
+
+    /// All current CIRCLE steps accept a point/coordinate.
+    fn flow_wants_point(&self) -> bool { self.cmd_flow.is_some() }
+
+    /// Record (current prompt, reply) into the transcript + log. Call BEFORE
+    /// advancing the step.
+    fn flow_record(&mut self, reply: impl Into<String>) {
+        let cmd = self.cmd_flow.as_ref().map(|f| f.name).unwrap_or("");
+        let prompt = self.flow_prompt();
+        let reply = reply.into();
+        self.history.push(format!("    {}  →  {}", prompt, reply));
+        self.transcript.push(PromptReply { cmd, prompt, reply });
+    }
+
+    /// Record the reply that caused the transition, then advance to `next`.
+    fn flow_to(&mut self, reply: impl Into<String>, next: CircleStep) {
+        self.flow_record(reply);
+        self.cmd_flow = Some(CmdFlow { name: "circle", circle: next });
+        self.flow_show_prompt();
+    }
+
+    /// Record the reply, draw the circle, end the flow.
+    fn flow_finish_circle(&mut self, reply: impl Into<String>, center: Vec2, radius: f64) {
+        self.flow_record(reply);
+        self.cmd_flow = None;
+        self.clear_prompt();
+        if radius <= 1e-9 {
+            self.history.push("  ! circle: zero radius — cancelled".into());
+            return;
+        }
+        self.snapshot_doc();
+        self.add_dobject(Geom::Circle(Circle { center, radius }), "circle");
+        self.history.push(format!(
+            "  ✔ circle — center ({:.3},{:.3})  r={:.3}", center.x, center.y, radius));
+    }
+
+    /// Cancel the active flow (Esc).
+    fn flow_cancel(&mut self) {
+        if self.cmd_flow.take().is_some() {
+            self.clear_prompt();
+            self.history.push("  circle: cancelled".into());
+        }
+    }
+
+    /// A POINT answer — a canvas click (already snapped) or a typed `x,y`.
+    fn flow_input_point(&mut self, p: Vec2) {
+        let step = match self.cmd_flow.as_ref() { Some(f) => f.circle, None => return };
+        let r = format!("{:.3},{:.3}", p.x, p.y);
+        match step {
+            CircleStep::Center      => self.flow_to(r, CircleStep::Radius(p)),
+            CircleStep::Radius(c)   => self.flow_finish_circle(r, c, (p - c).len()),
+            CircleStep::Diameter(c) => self.flow_finish_circle(r, c, (p - c).len() * 0.5),
+            CircleStep::P3a         => self.flow_to(r, CircleStep::P3b(p)),
+            CircleStep::P3b(p1)     => self.flow_to(r, CircleStep::P3c(p1, p)),
+            CircleStep::P3c(p1, p2) => match arc_three_points(p1, p2, p) {
+                Some(a) => self.flow_finish_circle(r, a.center, a.radius),
+                None => {
+                    self.flow_record(r);
+                    self.history.push(
+                        "  ! circle: three points are collinear — pick again".into());
+                    self.cmd_flow = Some(CmdFlow { name: "circle", circle: CircleStep::P3a });
+                    self.flow_show_prompt();
+                }
+            },
+            CircleStep::P2a         => self.flow_to(r, CircleStep::P2b(p)),
+            CircleStep::P2b(p1)     => {
+                let c = (p1 + p) * 0.5;
+                self.flow_finish_circle(r, c, (p - p1).len() * 0.5);
+            }
+            // Ttr: a click PICKS an object (not a point). Hit-test the nearest
+            // dobject; the click point is kept to disambiguate the solution.
+            CircleStep::TtrObj1 => {
+                let tol = 10.0 / self.scale as f64;
+                match self.nearest_entity_under(p, tol) {
+                    Some(i) => self.flow_to(format!("object #{}", i), CircleStep::TtrObj2(i, p)),
+                    None => self.history.push("  ! no object there — click on a line/circle/arc".into()),
+                }
+            }
+            CircleStep::TtrObj2(o1, pk1) => {
+                let tol = 10.0 / self.scale as f64;
+                match self.nearest_entity_under(p, tol) {
+                    Some(i) if i != o1 =>
+                        self.flow_to(format!("object #{}", i), CircleStep::TtrRadius(o1, pk1, i, p)),
+                    Some(_) => self.history.push("  ! pick a DIFFERENT object for the second tangent".into()),
+                    None => self.history.push("  ! no object there — click on a line/circle/arc".into()),
+                }
+            }
+            // Click at the radius step = pick the radius on screen (nearest
+            // distance from the click to object 1). Typing a number also works.
+            CircleStep::TtrRadius(o1, pk1, o2, pk2) => {
+                let r = match self.doc.dobjects.get(o1) {
+                    Some(d1) => (p - ttr_foot(&d1.geom, p)).len(),
+                    None => 0.0,
+                };
+                if r > 1e-9 {
+                    if let Some(center) = self.solve_ttr(o1, pk1, o2, pk2, r) {
+                        self.flow_finish_circle(format!("{:.3}", r), center, r);
+                        return;
+                    }
+                }
+                self.history.push(
+                    "  ! couldn't fit a tangent circle there — move out, or type a radius".into());
+            }
+        }
+    }
+
+    /// A TYPED answer (keyword / number / coordinate) at the current step.
+    fn flow_input_text(&mut self, raw: &str) {
+        let step = match self.cmd_flow.as_ref() { Some(f) => f.circle, None => return };
+        let low = raw.trim().to_ascii_lowercase();
+        if low.is_empty() { return; }
+        // Inline object-snap override (END/MID/CEN/PER/TAN/NEA/INT/QUA) — arms a
+        // one-shot snap for the NEXT click, exactly as during any other point
+        // pick. See feedback_rust_cad_inline_snap_override_supersedes.
+        if let Some(kind) = cad_kernel::SnapKind::parse(&low) {
+            if kind.requires_from() && self.card_anchor().is_none() {
+                self.history.push(format!(
+                    "  ! {} needs an anchor — pick the center first", kind.name()));
+            } else {
+                self.snap_override = Some(kind);
+                self.history.push(format!(
+                    "  ↳ {} armed — hover the target and click", kind.name()));
+            }
+            return;
+        }
+        // A typed coordinate `x,y` is a POINT answer in every step.
+        if let Some(p) = parse_xy(raw) { self.flow_input_point(p); return; }
+        match step {
+            CircleStep::Center => match low.as_str() {
+                "3p" => self.flow_to("3P", CircleStep::P3a),
+                "2p" => self.flow_to("2P", CircleStep::P2a),
+                "t" | "ttr" => self.flow_to("Ttr", CircleStep::TtrObj1),
+                _ if low.parse::<f64>().is_ok() => self.history.push(
+                    "  ! a single number here is a COORDINATE, not a radius — type x,y or click  [3P/2P/Ttr]".into()),
+                _ => self.history.push(
+                    "  ! Invalid option keyword — valid: 3P / 2P / Ttr, or pick a point".into()),
+            },
+            CircleStep::Radius(c) => {
+                if low == "d" || low == "diameter" {
+                    self.flow_to("D", CircleStep::Diameter(c));
+                } else if let Ok(rad) = low.parse::<f64>() {
+                    self.flow_finish_circle(format!("{}", rad), c, rad);
+                } else {
+                    self.history.push("  ! need a radius number, D, or a point".into());
+                }
+            }
+            CircleStep::Diameter(c) => {
+                if let Ok(d) = low.parse::<f64>() {
+                    self.flow_finish_circle(format!("{}", d), c, d * 0.5);
+                } else {
+                    self.history.push("  ! need a diameter number".into());
+                }
+            }
+            CircleStep::TtrRadius(o1, pk1, o2, pk2) => {
+                if let Ok(rad) = low.parse::<f64>() {
+                    if rad <= 1e-9 {
+                        self.history.push("  ! radius must be > 0".into());
+                        return;
+                    }
+                    match self.solve_ttr(o1, pk1, o2, pk2, rad) {
+                        Some(center) => self.flow_finish_circle(format!("{}", rad), center, rad),
+                        None => {
+                            self.flow_record(format!("{}", rad));
+                            self.cmd_flow = None;
+                            self.clear_prompt();
+                            self.history.push(
+                                "  ! circle: no tangent circle of that radius touches both objects".into());
+                        }
+                    }
+                } else {
+                    self.history.push("  ! need a radius number".into());
+                }
+            }
+            _ => self.history.push("  click an object (or type x,y)".into()),
+        }
+    }
+
+    /// Solve Ttr (tangent-tangent-radius): find the centre of a circle of
+    /// radius `r` tangent to dobjects `o1` and `o2`. Candidate centres are the
+    /// intersections of each object's ±r offset curves (reusing the kernel's
+    /// `intersect`); the one whose tangent feet land nearest the two pick
+    /// points (`pk1`,`pk2`) wins — matching AutoCAD's pick-driven choice.
+    fn solve_ttr(&self, o1: usize, pk1: Vec2, o2: usize, pk2: Vec2, r: f64) -> Option<Vec2> {
+        let ga = self.doc.dobjects.get(o1)?.geom.clone();
+        let gb = self.doc.dobjects.get(o2)?.geom.clone();
+        let offs_a = ttr_offsets(&ga, r);
+        let offs_b = ttr_offsets(&gb, r);
+        let mut best: Option<(f64, Vec2)> = None;
+        for oa in &offs_a {
+            for ob in &offs_b {
+                for c in cad_kernel::intersect(oa, ob) {
+                    let fa = ttr_foot(&ga, c);
+                    let fb = ttr_foot(&gb, c);
+                    // Verify true tangency (filters invalid offset branches).
+                    if ((fa - c).len() - r).abs() > 1e-6 { continue; }
+                    if ((fb - c).len() - r).abs() > 1e-6 { continue; }
+                    let score = (fa - pk1).len() + (fb - pk2).len();
+                    if best.map_or(true, |(bs, _)| score < bs) { best = Some((score, c)); }
+                }
+            }
+        }
+        best.map(|(_, c)| c)
+    }
+
     fn apply_insert(&mut self, block: u32, insert: Vec2, rotation: f64) {
         let (names, defaults): (Vec<String>, Vec<f64>) =
             match self.doc.blocks.get(block) {
@@ -11879,6 +12389,11 @@ impl CadApp {
         let target_style = target.style;
         match target.geom.trim_at(&cutter_geoms, pick, edge_mode) {
             Ok(pieces) => {
+                // Verify + JOIN the break parts: a closed circle/ellipse is
+                // over-split at every cut point; re-merge the consecutive
+                // survivors that still TOUCH so we keep the natural run(s)
+                // (gaps from removed arcs are preserved). See join_trim_survivors.
+                let pieces = cad_kernel::join_trim_survivors(pieces);
                 let n_pieces = pieces.len();
                 self.doc.dobjects.remove(target_idx);
                 for g in pieces {
@@ -12898,6 +13413,16 @@ impl CadApp {
     /// therefore no effect this frame (e.g. waiting for the first
     /// endpoint of a line, or no active command at all).
     fn card_anchor(&self) -> Option<Vec2> {
+        // Prompt-flow (CIRCLE): the center/last-point is the anchor for CARD +
+        // PER/TAN at the radius / next-point steps.
+        if let Some(f) = &self.cmd_flow {
+            match f.circle {
+                CircleStep::Radius(c) | CircleStep::Diameter(c) => return Some(c),
+                CircleStep::P3b(p1) | CircleStep::P2b(p1)       => return Some(p1),
+                CircleStep::P3c(_, p2)                          => return Some(p2),
+                _ => {}
+            }
+        }
         if let MoveState::WaitingForDest(base) = self.move_state { return Some(base); }
         if let CopyState::WaitingForDest(base) = self.copy_state { return Some(base); }
         if let MirrorState::WaitingForB(a)    = self.mirror_state { return Some(a); }
@@ -14855,6 +15380,26 @@ fn draw_cmd_glyph(
     }
 }
 
+/// Command word a draw tool maps to (for the last-command buffer, so an empty
+/// Enter repeats a ribbon/icon command). `None` for the pointer.
+fn tool_command_word(t: Tool) -> Option<&'static str> {
+    Some(match t {
+        Tool::Line       => "line",
+        Tool::Circle     => "circle",
+        Tool::Arc        => "arc",
+        Tool::Ellipse    => "ellipse",
+        Tool::EllipseArc => "ellipsearc",
+        Tool::Point      => "point",
+        Tool::Polyline   => "polyline",
+        Tool::Spline     => "spline",
+        Tool::Wall       => "wall",
+        Tool::Text       => "text",
+        Tool::Dim        => "dim",
+        Tool::Rectangle  => "rec",
+        Tool::None       => return None,
+    })
+}
+
 fn tool_button(ui: &mut egui::Ui, current: &mut Tool, this: Tool, label: &str) -> bool {
     let selected = *current == this;
     let (resp, painter) =
@@ -15433,6 +15978,7 @@ impl eframe::App for CadApp {
                 self.insert_state = InsertState::Off;
                 self.history.push("  insert cancelled".into());
             }
+            self.flow_cancel();   // cancel an active prompt-driven flow (CIRCLE)
             self.tool = Tool::None;
             self.picking_source = false;
             // Set the cooperative-cancellation flag for any long-
@@ -16335,7 +16881,13 @@ impl eframe::App for CadApp {
                 ui.add_space(4.0);
                 tool_button(ui, &mut self.tool, Tool::Line,     "line");
                 tool_button(ui, &mut self.tool, Tool::Rectangle, "rect");
-                tool_button(ui, &mut self.tool, Tool::Circle,   "circle");
+                // Circle ribbon button → the prompt-driven flow (same as
+                // typing `circle`), NOT the old click-click tool. tool_button
+                // toggles self.tool first; we reset it and start the flow.
+                if tool_button(ui, &mut self.tool, Tool::Circle, "circle") {
+                    self.tool = Tool::None;
+                    self.circle_flow_start();
+                }
                 // Hatch is a one-shot command (not a persistent draw
                 // tool); custom-painted icon — clicking opens the
                 // Choose Hatch Attributes dialog same as the `hatch`
@@ -16377,6 +16929,11 @@ impl eframe::App for CadApp {
                         self.run_command("dim");
                     } else if prev == Tool::Dim {
                         self.dim_draft = DimDraftState::Off;
+                    }
+                    // Ribbon/icon command → record it as the last command so an
+                    // empty Enter repeats it (icon commands ARE app commands).
+                    if let Some(word) = tool_command_word(self.tool) {
+                        self.last_command = Some(word.to_string());
                     }
                 }
                 ui.add_space(20.0);
@@ -17299,10 +17856,9 @@ impl eframe::App for CadApp {
             .collapsible(true);
         let win = self.apply_dock_pos("Command", ctx, win);
         let resp = win.show(ctx, |ui| {
-                // Reserve space at the bottom for: prompt line (if any) +
+                // Reserve space at the bottom for: prompt line (always shown) +
                 // the input row.
-                let prompt_h = if self.current_prompt.is_empty() { 0.0 } else { 18.0 };
-                let bottom_reserve = 32.0 + prompt_h;
+                let bottom_reserve = 32.0 + 18.0;
                 egui::ScrollArea::vertical()
                     .id_salt("hist_scroll")
                     .stick_to_bottom(true)
@@ -17312,10 +17868,16 @@ impl eframe::App for CadApp {
                             ui.monospace(h);
                         }
                     });
-                // Item 1 — the only pretext shown above the input is the
-                // CURRENT prompt for the active command. Replaces the
-                // growing pile of historical prompts in the history pane.
-                if !self.current_prompt.is_empty() {
+                // The line directly above the input is the CURRENT prompt for
+                // the active command — or the idle "command:" ready prompt when
+                // nothing is active (e.g. right after Esc). It always shows, so
+                // the user always knows what the line expects.
+                if self.current_prompt.is_empty() {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(150, 200, 235),
+                        "command:",
+                    );
+                } else {
                     ui.colored_label(
                         egui::Color32::from_rgb(255, 220, 120),
                         &self.current_prompt,
@@ -17517,6 +18079,10 @@ impl eframe::App for CadApp {
                 // definition's base point. All were silently snap-dead.
                 || self.dist_state       != DistState::Off
                 || self.insert_state     != InsertState::Off
+                || self.cmd_flow.is_some()
+                // A grip drag commits a precise coordinate too — it needs
+                // running osnap so the dragged grip lands ON an END/MID/CEN/…
+                || self.grip_drag.is_some()
                 || self.block_def_state  != BlockDefState::Off;
             // Phantom dobject for the in-progress polyline so snap kinds
             // (END / MID / CEN / …) work against vertices the user has
@@ -17827,6 +18393,7 @@ impl eframe::App for CadApp {
                 || self.block_dialog_pick_base
                 || self.block_def_state != BlockDefState::Off
                 || self.insert_state    != InsertState::Off
+                || self.cmd_flow.is_some()
                 || self.blockdiff_pick  != BlockDiffPick::Off
                 || self.picking_source
                 || self.intersect_pending_click;
@@ -17941,7 +18508,12 @@ impl eframe::App for CadApp {
                     let click_release = click_now && !grip_drag_consumed_click;
                     if drag_release || click_release {
                         if let Some(pos) = resp.interact_pointer_pos() {
-                            let drop_world = self.s2w(pos, rect);
+                            // Honor running osnap (and CARD/grid) so the grip
+                            // lands ON the highlighted END/MID/CEN/… instead of
+                            // the raw cursor. Matches the live preview below.
+                            let drop_world = self
+                                .cursor_world_constrained(Some(pos), rect, snap_hit.map(|h| h.point))
+                                .unwrap_or_else(|| self.s2w(pos, rect));
                             let delta = drop_world - gd.grip_origin;
                             // Suppress accidental no-op drags (tiny mouse
                             // jitter). Click-grab pairs may legitimately
@@ -18105,6 +18677,15 @@ impl eframe::App for CadApp {
                                 active_tool:  format!("{:?}", self.tool),
                                 active_state,
                             });
+                    }
+
+                    // Prompt-driven flow (CIRCLE) — a point answer. Consumes
+                    // the click before any other handler. The clicked world
+                    // point is already snap-applied (`click_world`).
+                    if self.cmd_flow.is_some() && self.flow_wants_point() {
+                        self.flow_input_point(click_world);
+                        self.refocus_cmd = true;
+                        return;
                     }
 
                     // Hatch pick-point — consumes the click before any
@@ -18575,16 +19156,31 @@ impl eframe::App for CadApp {
                         self.insert_state = InsertState::Off;
                         self.apply_insert(block, insert, rotation);
                         self.refocus_cmd = true;
-                    } else if self.matchprops_state != MatchPropsState::Off {
-                        // matchprop is in source-pick mode — find the dobject
-                        // under the cursor and use its style.
+                    } else if self.matchprops_state == MatchPropsState::WaitingForSource {
+                        // Pick the SOURCE, then hand off to a normal selection
+                        // session for the targets (so window / crossing / W / C
+                        // / B / all all work). Applied on Enter via
+                        // QueuedOp::MatchPropPaint.
                         let tol_world = 10.0 / self.scale as f64;
-                        if let Some(src) = self.nearest_entity_under(world, tol_world) {
-                            self.apply_matchprops(src);
-                            self.matchprops_state = MatchPropsState::Off;
-                        } else {
-                            self.history.push(
-                                "  matchprop — no dobject under cursor (Esc to cancel)".into());
+                        match self.nearest_entity_under(world, tol_world) {
+                            Some(src) => {
+                                // Preserve any pre-existing bank so `B` (before)
+                                // recovers it after begin_selection clears it.
+                                if !self.selection.is_empty() {
+                                    self.selection_prev = self.selection.clone();
+                                }
+                                self.matchprops_state = MatchPropsState::Off;
+                                self.begin_selection(SelectMode::ForSelect);
+                                self.queued_op = QueuedOp::MatchPropPaint(src);
+                                self.set_prompt(
+                                    "matchprop: select TARGETS — click, drag window/crossing, \
+                                     or W/C/B/all; Enter applies  [Esc=cancel]");
+                                self.history.push(format!(
+                                    "  matchprop — source #{}; select targets \
+                                     (window/crossing/B/all), Enter to apply", src));
+                            }
+                            None => self.history.push(
+                                "  matchprop — no object under cursor (click the SOURCE, Esc cancels)".into()),
                         }
                         self.refocus_cmd = true;
                     } else if self.fillet_state != FilletState::Off {
@@ -19613,7 +20209,8 @@ impl eframe::App for CadApp {
                 // Render preview translation if dragging.
                 let drag_delta: Option<Vec2> = self.grip_drag.and_then(|gd| {
                     let cur = resp.hover_pos()?;
-                    let w   = self.s2w(cur, rect);
+                    let w = self.cursor_world_constrained(Some(cur), rect, snap_hit.map(|h| h.point))
+                        .unwrap_or_else(|| self.s2w(cur, rect));
                     Some(w - gd.grip_origin)
                 });
                 let gsz = self.env.GrpSz as f32;
@@ -19636,7 +20233,9 @@ impl eframe::App for CadApp {
                     let preview_geom = if let Some(gd) = self.grip_drag {
                         if gd.dobject_idx == *idx {
                             if let Some(cur) = resp.hover_pos() {
-                                let w = self.s2w(cur, rect);
+                                let w = self.cursor_world_constrained(
+                                    Some(cur), rect, snap_hit.map(|h| h.point))
+                                    .unwrap_or_else(|| self.s2w(cur, rect));
                                 Some(d.geom.with_grip_moved(gd.role, w))
                             } else { None }
                         } else { None }
@@ -20089,6 +20688,30 @@ impl eframe::App for CadApp {
             let preview_col = egui::Color32::from_rgb(255, 220, 100);
             for p in &self.pending {
                 painter.circle_filled(self.w2s(*p, rect), 4.0, preview_col);
+            }
+            // ---- Prompt-flow (CIRCLE) live ghost preview ------------------
+            // Drafting commands preview by default. The flow's current step
+            // declares its ghost geometry (`flow_preview`); render it at the
+            // constrained/snapped cursor. (Flow runs with tool == None, so it
+            // sits OUTSIDE the tool-preview block below.) See COMMAND_LINE.md.
+            if self.cmd_flow.is_some() && self.draft_preview {
+                if let Some(raw_cursor) = resp.hover_pos() {
+                    let cw = self.cursor_world_constrained(
+                        Some(raw_cursor), rect, snap_hit.map(|h| h.point))
+                        .unwrap_or_else(|| self.s2w(raw_cursor, rect));
+                    let cursor = self.w2s(cw, rect);
+                    let gcol = egui::Color32::from_rgba_unmultiplied(
+                        120, 220, 255, pulse_alpha);
+                    let (ghosts, anchor) = self.flow_preview(cw);
+                    for g in &ghosts {
+                        if let Geom::Circle(c) = g { if c.radius <= 1e-9 { continue; } }
+                        draw_dobject(&painter, rect, self, g, gcol);
+                    }
+                    if let Some(a) = anchor {
+                        painter.line_segment([self.w2s(a, rect), cursor],
+                            egui::Stroke::new(0.5, gcol.gamma_multiply(0.5)));
+                    }
+                }
             }
             if self.tool != Tool::None {
                 if let Some(raw_cursor) = resp.hover_pos() {
@@ -21409,6 +22032,38 @@ fn paint_dobject_with_style(
 /// (`Wall::face_polylines`, radial normals — no chord-tilt gap at fillet
 /// joints) with a zoom-adaptive sample count (same pattern as the Arc
 /// renderer, so close zoom shows no faceting).
+/// Batt-INSULATION symbol for a wall: a sine wave running along the centerline,
+/// oscillating across the cavity (amplitude auto-fit to the thickness). Returns
+/// world-space points (caller maps to screen). Works for straight + curved
+/// walls (sampled along the centerline, offset by the local normal).
+fn wall_insulation_wave(w: &cad_kernel::Wall) -> Vec<Vec2> {
+    let amp = (w.thickness * 0.5 * 0.72).max(1e-9);
+    let wavelen = w.thickness.max(1e-6);          // ~one loop per wall width
+    let step = (wavelen / 14.0).max(1e-6);         // ~14 samples per wave
+    // Dense centerline samples (straight: build them; curved: sample the arc).
+    let cl: Vec<Vec2> = {
+        let d = w.end - w.start;
+        let len = d.len();
+        if len < 1e-9 { return Vec::new(); }
+        let n = ((len / step).ceil() as usize).max(2);
+        if w.is_curved() { w.centerline_polyline(n) }
+        else { (0..=n).map(|i| w.start + d * (i as f64 / n as f64)).collect() }
+    };
+    if cl.len() < 2 { return Vec::new(); }
+    // Walk arc length; offset each sample by amp·sin(2π·s/λ) along local normal.
+    let mut out = Vec::with_capacity(cl.len());
+    let mut acc = 0.0_f64;
+    for i in 0..cl.len() {
+        let dir = if i + 1 < cl.len() { cl[i + 1] - cl[i] } else { cl[i] - cl[i - 1] };
+        let u = if dir.len() > 1e-12 { dir.normalized() } else { Vec2::new(1.0, 0.0) };
+        let nperp = u.perp();
+        let off = amp * (std::f64::consts::TAU * acc / wavelen).sin();
+        out.push(cl[i] + nperp * off);
+        if i + 1 < cl.len() { acc += (cl[i + 1] - cl[i]).len(); }
+    }
+    out
+}
+
 fn wall_face_screen_pts(
     app:  &CadApp,
     rect: egui::Rect,
@@ -21594,6 +22249,16 @@ fn draw_dobject_thick(
             let n_face = left_pts.len();
             if left_pts.len()  >= 2 { painter.add(egui::Shape::line(left_pts,  face_stroke)); }
             if right_pts.len() >= 2 { painter.add(egui::Shape::line(right_pts, face_stroke)); }
+
+            // Batt-INSULATION symbol (sine wave) in the cavity.
+            if wstyle.map(|s| s.insulation).unwrap_or(false) {
+                let wave = wall_insulation_wave(w);
+                if wave.len() >= 2 {
+                    let pts: Vec<egui::Pos2> = wave.iter().map(|p| app.w2s(*p, rect)).collect();
+                    painter.add(egui::Shape::line(pts,
+                        egui::Stroke::new(width.max(1.0), face_col)));
+                }
+            }
 
             if app.env.WlCnL {
                 let cl_col = egui::Color32::from_rgba_unmultiplied(

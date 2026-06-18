@@ -3382,6 +3382,114 @@ pub fn join_geoms(geoms: &[(usize, Geom)]) -> JoinOut {
     JoinOut { merged, consumed_indices: consumed }
 }
 
+/// Re-join the TOUCHING fragments a trim leaves on a CLOSED curve. The trim
+/// over-splits a circle / ellipse at EVERY cut point; after the clicked arc is
+/// removed, the remaining consecutive arcs share their cut points and should
+/// merge back into the natural run(s). Only fragments that actually TOUCH are
+/// merged — the removed gap is preserved (so removing a middle arc still leaves
+/// two parts). Lines and everything else pass through untouched (no collinear-
+/// across-a-gap merge, which would undo the trim). Used right after a trim pick.
+pub fn join_trim_survivors(pieces: Vec<Geom>) -> Vec<Geom> {
+    let mut out: Vec<Geom> = Vec::new();
+    let mut arcs:  Vec<Arc> = Vec::new();
+    let mut earcs: Vec<EllipseArc> = Vec::new();
+    for g in pieces {
+        match g {
+            Geom::Arc(a)        => arcs.push(a),
+            Geom::EllipseArc(e) => earcs.push(e),
+            other               => out.push(other),
+        }
+    }
+    // Arcs grouped by (center, radius).
+    while let Some(first) = arcs.first().copied() {
+        let same = |a: &Arc| (a.center - first.center).len() < JOIN_EPS
+            && (a.radius - first.radius).abs() < JOIN_EPS;
+        let group: Vec<Arc> = arcs.iter().copied().filter(|a| same(a)).collect();
+        arcs.retain(|a| !same(a));
+        let ivs: Vec<(f64, f64)> = group.iter().map(|a| (a.start_angle, a.sweep_angle)).collect();
+        let (merged, full) = circular_union(&ivs);
+        if full {
+            out.push(Geom::Circle(Circle { center: first.center, radius: first.radius }));
+        } else {
+            for (s, sw) in merged {
+                out.push(Geom::Arc(Arc {
+                    center: first.center, radius: first.radius,
+                    start_angle: s, sweep_angle: sw }));
+            }
+        }
+    }
+    // Ellipse arcs grouped by underlying ellipse.
+    while let Some(first) = earcs.first().copied() {
+        let same = |e: &EllipseArc| same_ellipse(&e.ellipse, &first.ellipse);
+        let group: Vec<EllipseArc> = earcs.iter().copied().filter(|e| same(e)).collect();
+        earcs.retain(|e| !same(e));
+        let ivs: Vec<(f64, f64)> = group.iter().map(|e| (e.start_param, e.sweep_param)).collect();
+        let (merged, full) = circular_union(&ivs);
+        if full {
+            out.push(Geom::Ellipse(first.ellipse));
+        } else {
+            for (s, sw) in merged {
+                out.push(Geom::EllipseArc(EllipseArc {
+                    ellipse: first.ellipse, start_param: s, sweep_param: sw }));
+            }
+        }
+    }
+    out
+}
+
+fn same_ellipse(a: &Ellipse, b: &Ellipse) -> bool {
+    (a.center - b.center).len() < JOIN_EPS
+        && (a.major - b.major).len() < JOIN_EPS
+        && (a.ratio - b.ratio).abs() < JOIN_EPS
+}
+
+/// Union of param intervals `(start, sweep)` on a CLOSED curve (period TAU).
+/// Merges overlapping/touching intervals, preserves gaps. Returns the merged
+/// `(start, sweep)` list and a `full` flag (total coverage ≈ TAU → whole curve).
+/// Works regardless of wrap by rotating the origin into a gap first.
+fn circular_union(intervals: &[(f64, f64)]) -> (Vec<(f64, f64)>, bool) {
+    let tau = std::f64::consts::TAU;
+    let eps = 1e-6;
+    if intervals.is_empty() { return (Vec::new(), false); }
+    let total: f64 = intervals.iter().map(|(_, l)| *l).sum();
+    if total >= tau - eps { return (Vec::new(), true); }
+    // Normalise starts into [0, TAU); find a point inside a GAP to use as origin
+    // so nothing wraps in the rotated domain.
+    let mut a: Vec<(f64, f64)> = intervals.iter()
+        .map(|&(s, l)| (s.rem_euclid(tau), l)).collect();
+    a.sort_by(|p, q| p.0.partial_cmp(&q.0).unwrap());
+    let n = a.len();
+    let mut origin = 0.0_f64;
+    let mut found = false;
+    for i in 0..n {
+        let end_i = a[i].0 + a[i].1;
+        let next_start = if i + 1 < n { a[i + 1].0 } else { a[0].0 + tau };
+        if next_start - end_i > eps {
+            origin = (end_i + (next_start - end_i) * 0.5).rem_euclid(tau);
+            found = true;
+            break;
+        }
+    }
+    if !found { return (Vec::new(), true); }
+    let mut rel: Vec<(f64, f64)> = a.iter()
+        .map(|&(s, l)| ((s - origin).rem_euclid(tau), l)).collect();
+    rel.sort_by(|p, q| p.0.partial_cmp(&q.0).unwrap());
+    let mut merged: Vec<(f64, f64)> = Vec::new();
+    for (s, l) in rel {
+        if let Some(last) = merged.last_mut() {
+            let last_end = last.0 + last.1;
+            if s <= last_end + eps {
+                last.1 = (last_end.max(s + l)) - last.0;
+                continue;
+            }
+        }
+        merged.push((s, l));
+    }
+    let abs: Vec<(f64, f64)> = merged.into_iter()
+        .map(|(rs, l)| ((origin + rs).rem_euclid(tau), l)).collect();
+    (abs, false)
+}
+
 const JOIN_EPS: f64 = 1e-6;
 
 fn find_collinear_line_group(items: &[(usize, Geom)]) -> Vec<usize> {

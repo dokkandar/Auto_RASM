@@ -404,3 +404,27 @@ Isolated **Block Editor** (`BlockEditor` / `render_block_editor` in app.rs) — 
 - **OWED:** stretch_one live-preview (swing arc), Wall-dobject hosts, re-cut on param change, angle ghost-preview, RSM persistence of params + cut_edges.
 
 `~/workspace/RUST_CAD/target/release/rust_cad`
+
+---
+
+## 8. Command-line subsystem + command edits (2026-06-18)
+
+**Command-line refactor (planned, spec at `COMMAND_LINE.md` — read it before working the CLI):** make the command line a first-class, AI-pluggable subsystem. Deterministic-first (parse() instant; AI only on miss/NL-trigger), ONE `Command` intent IR (every modal answer → a Command variant), pure core in cad_kernel (`InputContext`/`Resolution`/`resolve`), orchestration module `cad_app/src/command_line.rs`, app stays executor behind `CmdHost{apply, scene_snapshot}`, async AI via Background Ops Pattern. Slices: 1=IR+seam+golden tests, 2=purify intercepts→Command, 3=lift to module, 4=AI resolver. NOT YET STARTED beyond the prompt-flow below.
+
+**Prompt-flow (first concrete piece, in app.rs — the pattern to generalize):**
+- `CmdFlow`/`CircleStep` drive CIRCLE as a prompt sequence (center/radius/diameter, 2P, 3P, **Ttr** tan-tan-radius via `solve_ttr`/`ttr_offsets`/`ttr_foot`). `flow_prompt`/`flow_input_text`/`flow_input_point`. Routing at top of `run_command`. All entry points (ribbon button, Draw menu, typed) → `circle_flow_start`.
+- **Transcript:** `transcript: Vec<PromptReply{cmd,prompt,reply}>`; `transcript` command dumps it (the AI-feed record).
+- **Preview architecture:** `flow_preview(cursor)` = per-step ghost; `draft_preview` flag + `preview on|off` command. Drafting commands preview by default.
+- **Ribbon = last command:** `tool_command_word` + tool-change block + `circle_flow_start` set `last_command` → empty Enter repeats ribbon/icon commands.
+- **Command-line UX:** prompt line always shown above input — `command:` (blue) when idle/after Esc, else the active prompt (amber). Top-level command echoes `command: circle`; replies echo `> 50`. History stacks upward.
+- **OWED:** generalize the flow model to other commands; retire old `Tool::*` click paths per-command; build the COMMAND_LINE.md slices.
+
+## 9. Other fixes this session (2026-06-18)
+
+- **matchprop** rewritten to AutoCAD flow: click SOURCE (1) → target phase is a real SELECTION SESSION (`QueuedOp::MatchPropPaint`, supports click/window/crossing/W/C/B/all) → Enter paints. Copies general style + wall/dim/text style when kinds match. `apply_matchprop_one`.
+- **trim join-after-cut:** `cad_kernel::join_trim_survivors` (+ `circular_union`) re-merges TOUCHING arc/ellipse-arc fragments a closed-curve trim over-splits (gaps preserved; lines untouched). Called in `apply_trim_pick`. Edge-mode extensions still cut (EdgMod).
+- **block stretch** fix: `selection_bbox` resolves BlockRef; `stretch_one` has a BlockRef arm.
+- **grip snap on release:** grip drag now honors osnap — `snap_phase_active` includes `grip_drag`; preview + commit use `cursor_world_constrained`.
+- **Insulation wall type:** `WallStyle.insulation` → wall renders a batt sine wave in the cavity (`wall_insulation_wave`); checkbox in the Wall Style dialog. Linetypes are dash-only, so insulation lives on the wall style. OWED: optional standalone "wave" linetype; RSM persistence.
+
+`~/workspace/RUST_CAD/target/release/rust_cad`
