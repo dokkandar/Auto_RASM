@@ -1,4 +1,4 @@
-# Auto-RASM(real-time Automated Simulation Module)
+# Auto-RASM(Real-time Automated Simulation Module)
 
 **A pure-Rust 2D CAD workbench.** (internal name: `RUST_CAD`, binary: `rust_cad`)
 
