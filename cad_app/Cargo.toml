@@ -11,6 +11,11 @@ path = "src/main.rs"
 cad_kernel = { path = "../cad_kernel" }
 cad_io     = { path = "../cad_io" }
 cad_wall   = { path = "../cad_wall" }
+cad_raster = { path = "../cad_raster" }
+image      = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tiff"] }
+# Native OS file chooser via the XDG desktop portal (no GTK/Qt linked).
+rfd        = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
+async-std  = "1"
 eframe     = { version = "0.30", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 egui       = "0.30"
 egui_glow  = "0.30"

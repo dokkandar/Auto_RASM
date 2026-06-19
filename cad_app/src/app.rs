@@ -387,6 +387,160 @@ fn ttr_foot(g: &Geom, c: Vec2) -> Vec2 {
     }
 }
 
+/// Tessellate a geom into world-space preview polylines (approximate; for the
+/// file browser thumbnail). Resolves `BlockRef` via `blocks`; non-curve geoms
+/// fall back to their bbox rectangle.
+fn preview_polys(g: &Geom, blocks: &cad_kernel::BlockTable, out: &mut Vec<Vec<Vec2>>) {
+    use std::f64::consts::TAU;
+    let n = 40usize;
+    match g {
+        Geom::Line(l) => out.push(vec![l.a, l.b]),
+        Geom::Polyline(p) => {
+            let mut v: Vec<Vec2> = p.vertices.iter().map(|x| x.pos).collect();
+            if p.closed { if let Some(&f) = v.first() { v.push(f); } }
+            out.push(v);
+        }
+        Geom::Circle(c) => out.push((0..=n).map(|i| {
+            let t = i as f64 / n as f64 * TAU;
+            Vec2::new(c.center.x + c.radius * t.cos(), c.center.y + c.radius * t.sin())
+        }).collect()),
+        Geom::Arc(a) => out.push((0..=n).map(|i| {
+            let t = a.start_angle + (i as f64 / n as f64) * a.sweep_angle;
+            Vec2::new(a.center.x + a.radius * t.cos(), a.center.y + a.radius * t.sin())
+        }).collect()),
+        Geom::Ellipse(e) => out.push((0..=n).map(|i| e.point_at(i as f64 / n as f64 * TAU)).collect()),
+        Geom::EllipseArc(ea) => out.push((0..=n).map(|i| {
+            ea.ellipse.point_at(ea.start_param + (i as f64 / n as f64) * ea.sweep_param)
+        }).collect()),
+        Geom::Spline(s) => out.push(s.tessellate(48)),
+        Geom::Wall(w) => out.push(vec![w.start, w.end]),
+        Geom::BlockRef(br) => {
+            if let Some(b) = blocks.get(br.block) {
+                for cd in &b.dobjects {
+                    let wg = br.transform_geom(&cd.geom, b.base);
+                    preview_polys(&wg, blocks, out);
+                }
+            }
+        }
+        other => {
+            let (mn, mx) = other.bbox();
+            out.push(vec![
+                Vec2::new(mn.x, mn.y), Vec2::new(mx.x, mn.y),
+                Vec2::new(mx.x, mx.y), Vec2::new(mn.x, mx.y), Vec2::new(mn.x, mn.y),
+            ]);
+        }
+    }
+}
+
+/// Build the file-browser preview for a path: raster → texture thumbnail,
+/// drawing (.dxf/.rsm) → wireframe polylines, else Unsupported.
+fn build_file_preview(ctx: &egui::Context, path: &std::path::Path) -> PreviewState {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "bmp" | "tif" | "tiff" => match image::open(path) {
+            Ok(img) => {
+                let (w, h) = (img.width(), img.height());
+                let thumb = img.thumbnail(360, 360).to_rgba8();
+                let size = [thumb.width() as usize, thumb.height() as usize];
+                let ci = egui::ColorImage::from_rgba_unmultiplied(size, thumb.as_raw());
+                let tex = ctx.load_texture("file_preview", ci, egui::TextureOptions::LINEAR);
+                PreviewState::Image { tex, w, h }
+            }
+            Err(e) => PreviewState::Error(format!("{}", e)),
+        },
+        "dxf" | "rsm" => {
+            let doc = if ext == "dxf" {
+                std::fs::read_to_string(path).ok()
+                    .and_then(|t| cad_io::dxf::read_dxf(&t).ok())
+            } else {
+                std::fs::read(path).ok().and_then(|b| cad_io::rsm::read_rsm(&b).ok())
+            };
+            match doc {
+                Some(d) => {
+                    let mut polys = Vec::new();
+                    for ob in &d.dobjects { preview_polys(&ob.geom, &d.blocks, &mut polys); }
+                    PreviewState::Drawing { polys, count: d.dobjects.len() }
+                }
+                None => PreviewState::Error("could not read drawing".into()),
+            }
+        }
+        _ => PreviewState::Unsupported,
+    }
+}
+
+/// One row in the file browser's list — name + the metadata GIMP shows in its
+/// Size / Type / Modified columns. Gathered once per directory listing.
+struct EntryInfo {
+    name: String,
+    is_dir: bool,
+    len: u64,
+    modified: String,
+}
+
+/// Human-readable byte size (GIMP shows "1.0 MB", "810.9 kB" …).
+fn human_size(b: u64) -> String {
+    const U: [&str; 5] = ["B", "kB", "MB", "GB", "TB"];
+    if b < 1024 { return format!("{} B", b); }
+    let mut f = b as f64;
+    let mut i = 0usize;
+    while f >= 1024.0 && i < U.len() - 1 { f /= 1024.0; i += 1; }
+    format!("{:.1} {}", f, U[i])
+}
+
+/// Short content-type label for the Type column.
+fn file_kind_label(name: &str, is_dir: bool) -> &'static str {
+    if is_dir { return "Folder"; }
+    let ext = std::path::Path::new(name).extension()
+        .and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "bmp" | "tif" | "tiff" => "Image",
+        "dxf" => "DXF drawing",
+        "rsm" => "RSM drawing",
+        "" => "File",
+        _ => "File",
+    }
+}
+
+/// Format a file's mtime as `YYYY-MM-DD HH:MM` (UTC). Pure std — converts the
+/// UNIX timestamp to a civil date via Howard Hinnant's algorithm (no chrono).
+fn fmt_mtime(t: std::time::SystemTime) -> String {
+    let secs = match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(_) => return String::new(),
+    };
+    let days = secs.div_euclid(86_400);
+    let tod  = secs.rem_euclid(86_400);
+    let (hh, mm) = (tod / 3600, (tod % 3600) / 60);
+    // civil_from_days: days since 1970-01-01 → (year, month, day)
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;                       // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0,399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0,365]
+    let mp = (5 * doy + 2) / 153;                       // [0,11]
+    let d = doy - (153 * mp + 2) / 5 + 1;              // [1,31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };     // [1,12]
+    let year = y + if m <= 2 { 1 } else { 0 };
+    format!("{:04}-{:02}-{:02} {:02}:{:02}", year, m, d, hh, mm)
+}
+
+/// The "Places" sidebar shortcuts — Home + standard XDG user dirs that exist,
+/// then filesystem root. (GIMP's left rail.)
+fn user_places() -> Vec<(String, std::path::PathBuf)> {
+    let mut v: Vec<(String, std::path::PathBuf)> = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        let h = std::path::PathBuf::from(home);
+        v.push(("⌂ Home".into(), h.clone()));
+        for sub in ["Desktop", "Documents", "Downloads", "Pictures", "Music", "Videos"] {
+            let p = h.join(sub);
+            if p.is_dir() { v.push((format!("📁 {}", sub), p)); }
+        }
+    }
+    v.push(("🖥 Filesystem".into(), std::path::PathBuf::from("/")));
+    v
+}
+
 /// Parse a typed coordinate `x,y` into a point. None unless both parse.
 fn parse_xy(s: &str) -> Option<Vec2> {
     let (a, b) = s.split_once(',')?;
@@ -859,6 +1013,15 @@ pub struct CadApp {
     file_dialog: Option<FileDialog>,
     /// Directory the file browser last sat in, so reopening lands there.
     file_dialog_dir: Option<std::path::PathBuf>,
+    /// In-flight NATIVE file chooser: the action + a channel the worker thread
+    /// sends the chosen path through (None = cancelled). Polled each frame so
+    /// the UI never blocks while the portal dialog is open.
+    pending_file: Option<(FileAction, std::sync::mpsc::Receiver<Option<std::path::PathBuf>>)>,
+    /// Imported raster (File ▸ Import ▸ Image) awaiting the raster→vector
+    /// editor. Holds the Photoshop-style layer stack. See `cad_raster`.
+    raster_doc: Option<cad_raster::RasterDoc>,
+    /// The open raster→vector editor (examine + adjust). `Some` after import.
+    raster_editor: Option<RasterEditor>,
 
     // ---- Slice L: medium editing actions ----
     offset_state:   OffsetState,
@@ -1444,9 +1607,13 @@ pub struct BlockTaskRec {
     pub recorded:     Vec<ParamRow>,
 }
 
-/// Open vs Save As for the in-app file browser.
+/// Open vs Save As vs Import-image for the in-app file browser.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum FileDialogMode { Open, Save }
+pub enum FileDialogMode { Open, Save, ImportImage }
+
+/// What a NATIVE file-chooser result should do once the user picks a path.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FileAction { Open, ImportImage, SaveDxf, SaveRsm }
 
 /// Pure-Rust file browser (no native-dialog dependency — `std::fs` only).
 /// Lists directories + .dxf/.rsm files, lets the user navigate, type/pick
@@ -1459,13 +1626,199 @@ pub struct FileDialog {
     /// Save format extension, ".dxf" or ".rsm". Ignored in Open mode.
     pub ext:      String,
     pub error:    Option<String>,
+    /// Cached preview of the currently-selected file + which file it's for
+    /// (rebuilt only when the selection changes).
+    pub preview:      PreviewState,
+    pub preview_path: Option<std::path::PathBuf>,
 }
 
 impl FileDialog {
     fn new(mode: FileDialogMode, dir: std::path::PathBuf, ext: &str) -> Self {
         FileDialog { mode, dir, filename: String::new(),
-                     ext: ext.to_string(), error: None }
+                     ext: ext.to_string(), error: None,
+                     preview: PreviewState::None, preview_path: None }
     }
+}
+
+/// First raster→vector EDITOR (Slice 4 v1): every imported image opens here so
+/// the user can EXAMINE + ADJUST (grayscale / brightness-contrast / invert /
+/// threshold) and re-analyze. The analyzer verdict is ADVISORY — the app never
+/// refuses an image. Trace→DObjects engines arrive in later slices.
+/// Output geometry a buffer layer converts its marked line-work into.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BufferGeom { Lines, Arcs, Nurbs }
+impl BufferGeom {
+    pub fn label(self) -> &'static str {
+        match self { BufferGeom::Lines => "Straight lines",
+                     BufferGeom::Arcs => "Arcs", BufferGeom::Nurbs => "NURBS" }
+    }
+}
+
+/// A BUFFER LAYER — one conversion job AND a destructive raster carve. Marking
+/// an area with the brush *moves ownership* of those pixels (at their original
+/// positions) from the source into this layer's `mask` — exclusively, so a
+/// pixel belongs to exactly one layer. The source image thus splits apart layer
+/// by layer (Photoshop-style). On Convert the owned pixels are traced as `geom`
+/// and emitted as DObjects of `dobject_aci` on CAD layer `cad_layer`.
+pub struct BufferLayer {
+    pub id:          u64,
+    pub name:        String,
+    pub geom:        BufferGeom,
+    pub cad_layer:   String,
+    pub dobject_aci: u8,
+    /// Identity colour — also the tint shown over this layer's carved pixels.
+    pub marker:      egui::Color32,
+    /// 255 = this pixel was carved (moved) into THIS layer. Same size as the
+    /// editor preview base; positions follow the original image exactly.
+    pub mask:        image::GrayImage,
+    /// Show this layer's carved pixels in the composite. Hide it → the hole it
+    /// left in the source shows through, so you can watch the image peel apart.
+    pub visible:     bool,
+    /// Tint carved pixels with `marker` (see which layer owns them); off = show
+    /// the original pixels in place.
+    pub tint:        bool,
+}
+
+impl BufferLayer {
+    pub fn new(id: u64, name: String, w: u32, h: u32, marker: egui::Color32) -> Self {
+        Self { id, name, geom: BufferGeom::Lines, cad_layer: "0".into(),
+               dobject_aci: 7, marker, mask: image::GrayImage::new(w, h),
+               visible: true, tint: true }
+    }
+    /// Number of pixels carved into this layer.
+    pub fn marked(&self) -> usize {
+        self.mask.pixels().filter(|p| p.0[0] > 0).count()
+    }
+}
+
+pub struct RasterEditor {
+    /// Filename (for the title).
+    pub name:        String,
+    /// Downscaled preview base (fast adjust loop); full-res lives in raster_doc.
+    pub base:        image::DynamicImage,
+    pub grayscale:   bool,
+    pub brightness:  i32,
+    pub contrast:    f32,
+    pub invert:      bool,
+    pub threshold_on: bool,
+    pub threshold:   u8,
+    /// Re-derive the working source + report next frame (adjustment changed).
+    pub dirty:       bool,
+    /// Re-composite the display next frame (a carve / visibility / tint change).
+    pub composite_dirty: bool,
+    pub tex:         Option<egui::TextureHandle>,
+    pub report:      Option<cad_raster::Report>,
+    /// Buffer (conversion) layers + which one the brush paints into.
+    pub buffers:     Vec<BufferLayer>,
+    pub active_buf:  Option<usize>,
+    pub next_buf_id: u64,
+    /// Brush radius in screen pixels.
+    pub brush:       f32,
+}
+
+impl RasterEditor {
+    pub fn new(name: String, base: image::DynamicImage) -> Self {
+        Self { name, base, grayscale: false, brightness: 0, contrast: 1.0,
+               invert: false, threshold_on: false, threshold: 128,
+               dirty: true, composite_dirty: false, tex: None, report: None,
+               buffers: Vec::new(), active_buf: None, next_buf_id: 1, brush: 14.0 }
+    }
+    /// Add a buffer layer (sized to the preview base) with a fresh marker colour.
+    pub fn add_buffer(&mut self) {
+        use image::GenericImageView;
+        let (w, h) = self.base.dimensions();
+        let id = self.next_buf_id; self.next_buf_id += 1;
+        let marker = editor_param_color((id as usize).wrapping_sub(1));
+        self.buffers.push(BufferLayer::new(id, format!("buffer {}", id), w, h, marker));
+        self.active_buf = Some(self.buffers.len() - 1);
+    }
+    /// CARVE: move a filled disc (radius `r` px, centre image pixel cx,cy) into
+    /// buffer layer `ai`. Ownership is EXCLUSIVE — every pixel touched is set in
+    /// `ai`'s mask and cleared from every other layer, so the source splits into
+    /// disjoint layers. Positions are preserved (the layer mask is base-sized).
+    pub fn carve(&mut self, ai: usize, cx: i32, cy: i32, r: i32) {
+        use image::GenericImageView;
+        let (w, h) = self.base.dimensions();
+        let (w, h) = (w as i32, h as i32);
+        let r2 = r * r;
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if dx * dx + dy * dy > r2 { continue; }
+                let (x, y) = (cx + dx, cy + dy);
+                if x < 0 || y < 0 || x >= w || y >= h { continue; }
+                let (ux, uy) = (x as u32, y as u32);
+                for (i, b) in self.buffers.iter_mut().enumerate() {
+                    if i == ai {
+                        b.mask.put_pixel(ux, uy, image::Luma([255]));
+                    } else if b.mask.get_pixel(ux, uy).0[0] > 0 {
+                        b.mask.put_pixel(ux, uy, image::Luma([0]));
+                    }
+                }
+            }
+        }
+        self.composite_dirty = true;
+    }
+    /// Build the display composite from the adjusted source `work`: source pixels
+    /// stay in place; each carved pixel is tinted by its layer's marker (if
+    /// `tint`), shown as-is (if visible & not tinted), or punched transparent
+    /// (if the layer is hidden — revealing the peel). Transparent holes show the
+    /// dark canvas behind, so hiding a layer reads as "those pixels left here".
+    pub fn composite_image(&self, work: &image::DynamicImage) -> image::RgbaImage {
+        let mut out = work.to_rgba8();
+        let (w, h) = (out.width(), out.height());
+        for b in &self.buffers {
+            if b.mask.width() != w || b.mask.height() != h { continue; }
+            let (mr, mg, mb) = (b.marker.r() as u32, b.marker.g() as u32, b.marker.b() as u32);
+            for y in 0..h {
+                for x in 0..w {
+                    if b.mask.get_pixel(x, y).0[0] == 0 { continue; }
+                    if !b.visible {
+                        out.put_pixel(x, y, image::Rgba([0, 0, 0, 0]));   // hole
+                    } else if b.tint {
+                        let o = out.get_pixel(x, y).0;
+                        // 55% marker over the original pixel
+                        let mix = |c: u32, m: u32| ((c * 45 + m * 55) / 100) as u8;
+                        out.put_pixel(x, y, image::Rgba([
+                            mix(o[0] as u32, mr), mix(o[1] as u32, mg),
+                            mix(o[2] as u32, mb), 255]));
+                    }
+                    // visible & not tinted → leave the original pixel in place
+                }
+            }
+        }
+        out
+    }
+    /// Apply the current adjustments to the preview base.
+    pub fn working(&self) -> image::DynamicImage {
+        use cad_raster::AdjustKind;
+        let mut img = self.base.clone();
+        if self.grayscale { img = AdjustKind::Grayscale.apply(&img); }
+        if self.brightness != 0 || (self.contrast - 1.0).abs() > 1e-3 {
+            img = AdjustKind::BrightnessContrast {
+                brightness: self.brightness, contrast: self.contrast }.apply(&img);
+        }
+        if self.invert { img = AdjustKind::Invert.apply(&img); }
+        if self.threshold_on { img = AdjustKind::Threshold(self.threshold).apply(&img); }
+        img
+    }
+    pub fn reset(&mut self) {
+        self.grayscale = false; self.brightness = 0; self.contrast = 1.0;
+        self.invert = false; self.threshold_on = false; self.threshold = 128;
+        self.dirty = true;
+    }
+}
+
+/// File-browser preview of the selected file.
+pub enum PreviewState {
+    None,
+    Unsupported,
+    Error(String),
+    /// Raster thumbnail (loaded into a GPU texture) + the FULL image's pixel
+    /// dimensions (for the metadata line, GIMP-style).
+    Image { tex: egui::TextureHandle, w: u32, h: u32 },
+    /// Drawing wireframe — world-space polylines, fitted into the preview box,
+    /// plus the object count for the metadata line.
+    Drawing { polys: Vec<Vec<Vec2>>, count: usize },
 }
 
 /// State machines for the Slice-L click-driven actions.
@@ -2048,6 +2401,9 @@ impl Default for CadApp {
             stretch_window_box: None,
             file_dialog: None,
             file_dialog_dir: None,
+            pending_file: None,
+            raster_doc: None,
+            raster_editor: None,
             insert_state:    InsertState::Off,
             block_dialog:    None,
             offset_state:   OffsetState::Off,
@@ -9483,10 +9839,300 @@ impl CadApp {
         self.file_dialog = Some(FileDialog::new(mode, dir, ext));
     }
 
+    /// File ▸ Import ▸ Image — load a raster into a `RasterDoc` and run the
+    /// convertibility analyzer. The interactive raster→vector editor is a
+    /// later slice; for now the doc is held in memory and the report logged.
+    fn do_import_image(&mut self, path: &str) {
+        match cad_raster::RasterDoc::load(path) {
+            Ok(doc) => {
+                let name = std::path::Path::new(path).file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.to_string());
+                self.history.push(format!(
+                    "  ✔ imported '{}'  {}×{} — opening raster editor", name,
+                    doc.width(), doc.height()));
+                // Downscaled preview base for a fast adjust loop; the analyzer
+                // verdict is ADVISORY — the editor opens regardless of class.
+                let preview_base = doc.base.thumbnail(900, 900);
+                self.raster_editor = Some(RasterEditor::new(name, preview_base));
+                self.raster_doc = Some(doc);
+            }
+            Err(e) => self.history.push(format!("  ! import image '{}': {}", path, e)),
+        }
+    }
+
+    // (file preview helpers are free fns below: `build_file_preview` + `preview_polys`)
+
+    /// Open the NATIVE OS file chooser (XDG portal) on a worker thread for the
+    /// given action, so the UI stays responsive. The result is delivered via a
+    /// channel polled in `poll_pending_file`.
+    ///
+    /// Currently UNUSED — the File menu routes to the in-app `render_file_dialog`
+    /// instead, because the portal gives us no control over the preview pane
+    /// (which the user wants front-and-centre). Kept as a ready fallback.
+    #[allow(dead_code)]
+    fn native_pick(&mut self, action: FileAction, save_name: Option<&str>) {
+        if self.pending_file.is_some() { return; }   // one at a time
+        let dir = self.file_dialog_dir.clone().or_else(|| std::env::current_dir().ok());
+        let save_name = save_name.map(|s| s.to_string());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let is_save = matches!(action, FileAction::SaveDxf | FileAction::SaveRsm);
+        let filter: (&'static str, &'static [&'static str]) = match action {
+            FileAction::Open        => ("Drawings", &["dxf", "rsm"]),
+            FileAction::ImportImage => ("Images", &["png", "jpg", "jpeg", "bmp", "tif", "tiff"]),
+            FileAction::SaveDxf     => ("DXF", &["dxf"]),
+            FileAction::SaveRsm     => ("Native RSM", &["rsm"]),
+        };
+        std::thread::spawn(move || {
+            let mut d = rfd::AsyncFileDialog::new().add_filter(filter.0, filter.1);
+            if let Some(dir) = dir { d = d.set_directory(dir); }
+            let handle = if is_save {
+                if let Some(n) = save_name { d = d.set_file_name(n); }
+                async_std::task::block_on(d.save_file())
+            } else {
+                async_std::task::block_on(d.pick_file())
+            };
+            let _ = tx.send(handle.map(|h| h.path().to_path_buf()));
+        });
+        self.pending_file = Some((action, rx));
+    }
+
+    /// Poll the in-flight native chooser (call once per frame). Dispatches the
+    /// chosen path to open / import / save when it arrives.
+    fn poll_pending_file(&mut self) {
+        use std::sync::mpsc::TryRecvError;
+        let Some((action, rx)) = self.pending_file.as_ref() else { return; };
+        let action = *action;
+        let path = match rx.try_recv() {
+            Ok(p) => p,                                // Some(path) or None (cancel)
+            Err(TryRecvError::Empty) => return,        // still waiting on the user
+            Err(TryRecvError::Disconnected) => None,   // worker died (no portal?) → clear
+        };
+        self.pending_file = None;
+        if let Some(path) = path {
+            if let Some(parent) = path.parent() {
+                self.file_dialog_dir = Some(parent.to_path_buf());
+            }
+            let p = path.to_string_lossy().to_string();
+            match action {
+                FileAction::Open        => self.do_open(&p),
+                FileAction::ImportImage => self.do_import_image(&p),
+                FileAction::SaveDxf | FileAction::SaveRsm => self.do_save(&p),
+            }
+        }
+    }
+
     /// Render the file browser window. Pure `std::fs` — lists sub-dirs and
     /// .dxf/.rsm files, supports navigation (`..`, click a folder), name
     /// entry, and a format toggle for Save. Confirm routes to do_open /
     /// do_save.
+    /// Raster→vector EDITOR window (Slice 4 v1): examine + adjust an imported
+    /// scan. Analyzer verdict is advisory; the app never refuses an image.
+    fn render_raster_editor(&mut self, ctx: &egui::Context) {
+        let Some(mut ed) = self.raster_editor.take() else { return; };
+        let mut open = true;
+        let mut do_convert = false;
+
+        // Rebuild the display when an adjustment (dirty) OR a carve / layer
+        // visibility change (composite_dirty) happened. The displayed texture is
+        // the COMPOSITE: adjusted source with each layer's carved pixels tinted /
+        // shown / hidden in place.
+        if ed.dirty || ed.composite_dirty {
+            let work = ed.working();
+            if ed.dirty { ed.report = Some(cad_raster::analyze(&work)); }
+            let comp = ed.composite_image(&work);
+            let size = [comp.width() as usize, comp.height() as usize];
+            let ci = egui::ColorImage::from_rgba_unmultiplied(size, comp.as_raw());
+            ed.tex = Some(ctx.load_texture("raster_editor", ci, egui::TextureOptions::LINEAR));
+            ed.dirty = false;
+            ed.composite_dirty = false;
+        }
+
+        egui::Window::new(format!("Raster → Vector — {}", ed.name))
+            .id(egui::Id::new("raster_editor"))
+            .open(&mut open)
+            .resizable(true)
+            .default_size(egui::vec2(900.0, 640.0))
+            .default_pos(egui::pos2(120.0, 60.0))
+            .show(ctx, |ui| {
+                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                ui.horizontal_top(|ui| {
+                    // LEFT — adjustments + buffer layers (scroll, fixed width).
+                    ui.allocate_ui_with_layout(egui::vec2(268.0, 580.0),
+                        egui::Layout::top_down(egui::Align::Min), |ui| {
+                      egui::ScrollArea::vertical().id_salt("rast_left").show(ui, |ui| {
+                        ui.label(egui::RichText::new("Adjustments").strong());
+                        let mut changed = false;
+                        changed |= ui.checkbox(&mut ed.grayscale, "Grayscale").changed();
+                        changed |= ui.add(egui::Slider::new(&mut ed.brightness, -128..=128)
+                            .text("brightness")).changed();
+                        changed |= ui.add(egui::Slider::new(&mut ed.contrast, 0.0..=4.0)
+                            .text("contrast")).changed();
+                        changed |= ui.checkbox(&mut ed.invert, "Invert").changed();
+                        changed |= ui.checkbox(&mut ed.threshold_on, "Threshold (B/W)").changed();
+                        if ed.threshold_on {
+                            changed |= ui.add(egui::Slider::new(&mut ed.threshold, 0..=255)
+                                .text("level")).changed();
+                        }
+                        if ui.button("Reset").clicked() { ed.reset(); }
+                        if changed { ed.dirty = true; }
+
+                        ui.add_space(6.0);
+                        if let Some(r) = &ed.report {
+                            ui.small(format!("Looks like: {:?} · ~{} colours · edge {:.3}",
+                                r.class, r.approx_colors, r.edge_density));
+                        }
+                        ui.add_space(6.0);
+                        ui.separator();
+
+                        // ---- Buffer layers ----------------------------------
+                        ui.label(egui::RichText::new("Buffer layers").strong());
+                        ui.small("Brush-mark line-work → those pixels MOVE into the \
+                                  active layer (👁 hide a layer to watch the source \
+                                  peel apart; 🎨 toggles the colour tint).");
+                        ui.add(egui::Slider::new(&mut ed.brush, 2.0..=60.0).text("brush"));
+                        if ui.button("➕ New buffer layer").clicked() { ed.add_buffer(); }
+                        ui.add_space(2.0);
+
+                        let mut del: Option<usize> = None;
+                        let mut recomposite = false;
+                        for i in 0..ed.buffers.len() {
+                            let active = ed.active_buf == Some(i);
+                            ui.horizontal(|ui| {
+                                // marker swatch = active selector.
+                                let (rect, sresp) = ui.allocate_exact_size(
+                                    egui::vec2(16.0, 16.0), egui::Sense::click());
+                                ui.painter().rect_filled(rect, 2.0, ed.buffers[i].marker);
+                                if active {
+                                    ui.painter().rect_stroke(rect, 2.0,
+                                        egui::Stroke::new(2.0, egui::Color32::WHITE));
+                                }
+                                if sresp.clicked() { ed.active_buf = Some(i); }
+                                let b = &mut ed.buffers[i];
+                                ui.add(egui::TextEdit::singleline(&mut b.name)
+                                    .desired_width(56.0));
+                                if ui.color_edit_button_srgba(&mut b.marker).changed() {
+                                    recomposite = true;
+                                }
+                                if ui.selectable_label(b.visible, "👁")
+                                    .on_hover_text("show / hide this layer").clicked() {
+                                    b.visible = !b.visible; recomposite = true;
+                                }
+                                if ui.selectable_label(b.tint, "🎨")
+                                    .on_hover_text("tint carved pixels by marker").clicked() {
+                                    b.tint = !b.tint; recomposite = true;
+                                }
+                                if ui.small_button("✕").clicked() { del = Some(i); }
+                            });
+                            let b = &mut ed.buffers[i];
+                            ui.horizontal(|ui| {
+                                egui::ComboBox::from_id_salt(("geom", b.id))
+                                    .selected_text(b.geom.label())
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut b.geom, BufferGeom::Lines, "Straight lines");
+                                        ui.selectable_value(&mut b.geom, BufferGeom::Arcs, "Arcs");
+                                        ui.selectable_value(&mut b.geom, BufferGeom::Nurbs, "NURBS");
+                                    });
+                                ui.label("ACI");
+                                ui.add(egui::DragValue::new(&mut b.dobject_aci).range(0..=255));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("CAD layer");
+                                ui.add(egui::TextEdit::singleline(&mut b.cad_layer)
+                                    .desired_width(90.0));
+                            });
+                            ui.separator();
+                        }
+                        if let Some(i) = del {
+                            ed.buffers.remove(i);
+                            ed.active_buf = match ed.active_buf {
+                                Some(a) if a == i => None,
+                                Some(a) if a > i => Some(a - 1),
+                                other => other,
+                            };
+                            recomposite = true;
+                        }
+                        if recomposite { ed.composite_dirty = true; }
+                        if ui.add(egui::Button::new(
+                            egui::RichText::new("Convert to DObjects ▶").strong())).clicked() {
+                            do_convert = true;
+                        }
+                        ui.small("Trace engines (line/arc/NURBS fit) land next slice; \
+                                  strokes + settings are captured now.");
+                      });
+                    });
+
+                    ui.separator();
+                    // RIGHT — the composite image; the brush CARVES into the
+                    // active layer (the displayed texture already reflects each
+                    // layer's tint / visibility, so there are no overlays to draw).
+                    let avail = ui.available_size();
+                    let (resp, painter) = ui.allocate_painter(avail, egui::Sense::click_and_drag());
+                    let pr = resp.rect;
+                    painter.rect_filled(pr, 0.0, egui::Color32::from_rgb(16, 20, 26));
+                    // Fit the image into the canvas; capture its rect + pixel size.
+                    let img_rect = ed.tex.as_ref().map(|tex| {
+                        let ts = tex.size_vec2();
+                        let s = ((pr.width() - 8.0) / ts.x)
+                            .min((pr.height() - 8.0) / ts.y).max(0.01);
+                        let r = egui::Rect::from_center_size(pr.center(), egui::vec2(ts.x * s, ts.y * s));
+                        painter.image(tex.id(), r, uv, egui::Color32::WHITE);
+                        (r, ts)
+                    });
+                    if let Some((r, ts)) = img_rect {
+                        if let Some(ai) = ed.active_buf {
+                            // CARVE the active layer where the brush drags.
+                            if resp.dragged() || resp.clicked() {
+                                if let Some(cur) = resp.interact_pointer_pos() {
+                                    if r.contains(cur) {
+                                        let u = (cur.x - r.min.x) / r.width();
+                                        let v = (cur.y - r.min.y) / r.height();
+                                        let px = (u * ts.x) as i32;
+                                        let py = (v * ts.y) as i32;
+                                        let rad = (ed.brush * ts.x / r.width()).max(1.0) as i32;
+                                        ed.carve(ai, px, py, rad);
+                                    }
+                                }
+                            }
+                            // Brush cursor (marker colour) for feedback.
+                            if let Some(cur) = resp.hover_pos().or(resp.interact_pointer_pos()) {
+                                if r.contains(cur) {
+                                    let col = ed.buffers.get(ai).map(|b| b.marker)
+                                        .unwrap_or(egui::Color32::WHITE);
+                                    painter.circle_stroke(cur, ed.brush,
+                                        egui::Stroke::new(1.5, col));
+                                }
+                            }
+                        }
+                    }
+                });
+            });
+        // A carve / toggle done this frame needs one more frame to re-composite.
+        if ed.composite_dirty { ctx.request_repaint(); }
+
+        if do_convert {
+            if ed.buffers.is_empty() {
+                self.history.push(
+                    "  raster→vector: add a buffer layer and paint line-work first".into());
+            } else {
+                self.history.push(format!(
+                    "  raster→vector: {} buffer layer(s) ready —", ed.buffers.len()));
+                for b in &ed.buffers {
+                    self.history.push(format!(
+                        "    • {} → {} on CAD '{}' (ACI {}) — {} px carved",
+                        b.name, b.geom.label(), b.cad_layer, b.dobject_aci, b.marked()));
+                }
+                self.history.push(
+                    "    trace engines (line/arc/NURBS fit) arrive next slice".into());
+            }
+        }
+        if !open {
+            self.history.push("  raster editor closed".into());
+            return;
+        }
+        self.raster_editor = Some(ed);
+    }
+
     fn render_file_dialog(&mut self, ctx: &egui::Context) {
         let Some(mut dlg) = self.file_dialog.take() else { return; };
         let mut open      = true;
@@ -9494,121 +10140,275 @@ impl CadApp {
         let mut do_cancel  = false;
         let mut navigate: Option<std::path::PathBuf> = None;
 
-        // List the current directory (dirs + .dxf/.rsm files).
-        let mut dirs: Vec<String> = Vec::new();
-        let mut files: Vec<String> = Vec::new();
+        // ---- list the current directory (folders + filtered files) -------
+        let mut entries: Vec<EntryInfo> = Vec::new();
         match std::fs::read_dir(&dlg.dir) {
             Ok(rd) => {
                 for e in rd.flatten() {
                     let name = e.file_name().to_string_lossy().to_string();
                     if name.starts_with('.') { continue; }   // hide dotfiles
-                    let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                    if is_dir {
-                        dirs.push(name);
-                    } else {
+                    let md = e.metadata().ok();
+                    let is_dir = md.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+                    if !is_dir {
                         let l = name.to_ascii_lowercase();
-                        if l.ends_with(".dxf") || l.ends_with(".rsm") {
-                            files.push(name);
-                        }
+                        let keep = if dlg.mode == FileDialogMode::ImportImage {
+                            l.ends_with(".png") || l.ends_with(".jpg")
+                                || l.ends_with(".jpeg") || l.ends_with(".bmp")
+                                || l.ends_with(".tif") || l.ends_with(".tiff")
+                        } else {
+                            l.ends_with(".dxf") || l.ends_with(".rsm")
+                        };
+                        if !keep { continue; }
                     }
+                    let len = md.as_ref().map(|m| m.len()).unwrap_or(0);
+                    let modified = md.as_ref().and_then(|m| m.modified().ok())
+                        .map(fmt_mtime).unwrap_or_default();
+                    entries.push(EntryInfo { name, is_dir, len, modified });
                 }
-                dirs.sort_unstable();
-                files.sort_unstable();
+                // Folders first, then case-insensitive by name (GIMP order).
+                entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir)
+                    .then(a.name.to_lowercase().cmp(&b.name.to_lowercase())));
             }
             Err(e) => dlg.error = Some(format!("cannot read directory: {}", e)),
         }
 
         let title = match dlg.mode {
-            FileDialogMode::Open => "Open  .dxf / .rsm",
-            FileDialogMode::Save => "Save As",
+            FileDialogMode::Open        => "Open  ·  .dxf / .rsm",
+            FileDialogMode::Save        => "Save As",
+            FileDialogMode::ImportImage => "Open Image  ·  raster → vector",
         };
+
+        // Rebuild the preview ONLY when the selection changes — build_file_preview
+        // does disk I/O + a texture upload, not something to run every frame.
+        let sel_path = {
+            let n = dlg.filename.trim();
+            if n.is_empty() { None } else { Some(dlg.dir.join(n)) }
+        };
+        if sel_path != dlg.preview_path {
+            dlg.preview = match &sel_path {
+                Some(p) if p.is_file() => build_file_preview(ctx, p),
+                _ => PreviewState::None,
+            };
+            dlg.preview_path = sel_path;
+        }
+        // Bytes-on-disk of the current selection (for the preview metadata line).
+        let sel_bytes: Option<u64> = entries.iter()
+            .find(|en| !en.is_dir && en.name.eq_ignore_ascii_case(dlg.filename.trim()))
+            .map(|en| en.len);
+
         egui::Window::new(title)
             .id(egui::Id::new("file_dialog"))
             .open(&mut open)
             .resizable(true)
             .collapsible(false)
-            .default_size(egui::vec2(460.0, 420.0))
-            .default_pos(egui::pos2(220.0, 90.0))
+            .default_size(egui::vec2(940.0, 560.0))
+            .min_width(720.0)
+            .default_pos(egui::pos2(140.0, 60.0))
             .show(ctx, |ui| {
-                // Path bar (editable — paste a path then Enter to jump).
+                // ---- breadcrumb path bar (Up + clickable components) ------
                 ui.horizontal(|ui| {
-                    ui.label("Path");
-                    let mut path_str = dlg.dir.to_string_lossy().to_string();
-                    let resp = ui.add(egui::TextEdit::singleline(&mut path_str)
-                        .desired_width(360.0));
-                    if resp.changed() { dlg.dir = std::path::PathBuf::from(path_str); }
+                    if ui.button("⬅ Up").clicked() {
+                        navigate = dlg.dir.parent().map(|p| p.to_path_buf());
+                    }
+                    ui.separator();
+                    let mut acc = std::path::PathBuf::new();
+                    for comp in dlg.dir.iter() {
+                        acc.push(comp);
+                        let txt = comp.to_string_lossy();
+                        let label = if txt == "/" { "/".to_string() } else { txt.to_string() };
+                        if ui.button(label).clicked() { navigate = Some(acc.clone()); }
+                    }
                 });
-                ui.add_space(4.0);
+                ui.separator();
 
-                // Directory + file list.
-                egui::ScrollArea::vertical().max_height(280.0)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        // Up one level.
-                        if dlg.dir.parent().is_some()
-                            && ui.selectable_label(false, "📁 ..").clicked()
-                        {
-                            if let Some(p) = dlg.dir.parent() {
-                                navigate = Some(p.to_path_buf());
+                // Three fixed-size panes: Places | file list | preview. Fixed
+                // sizing (allocate_ui_with_layout) avoids the layout-feedback loop
+                // that set_min_width + auto_shrink-false once caused (full-screen
+                // grow → crash); top_down keeps the lists from flowing sideways.
+                let body_h = (ui.available_height() - 70.0).max(240.0);
+                ui.horizontal_top(|ui| {
+                    // ---- PLACES sidebar -----------------------------------
+                    ui.allocate_ui_with_layout(egui::vec2(150.0, body_h),
+                        egui::Layout::top_down(egui::Align::Min), |ui| {
+                        ui.label(egui::RichText::new("Places").strong());
+                        ui.add_space(2.0);
+                        egui::ScrollArea::vertical().id_salt("places")
+                            .auto_shrink([false, false]).show(ui, |ui| {
+                            for (label, path) in user_places() {
+                                let here = dlg.dir == path;
+                                if ui.selectable_label(here, label).clicked() {
+                                    navigate = Some(path);
+                                }
+                            }
+                            // Project bookmark (jump straight to the workspace).
+                            let ws = std::path::PathBuf::from("/home/HSI/workspace");
+                            if ws.is_dir() {
+                                ui.separator();
+                                if ui.selectable_label(dlg.dir == ws, "📌 workspace").clicked() {
+                                    navigate = Some(ws);
+                                }
+                            }
+                        });
+                    });
+                    ui.separator();
+
+                    // ---- FILE LIST  (Name | Size | Type | Modified) -------
+                    ui.allocate_ui_with_layout(egui::vec2(430.0, body_h),
+                        egui::Layout::top_down(egui::Align::Min), |ui| {
+                        egui::ScrollArea::vertical().id_salt("file_list")
+                            .auto_shrink([false, false]).show(ui, |ui| {
+                            egui::Grid::new("file_grid").num_columns(4)
+                                .striped(true).spacing(egui::vec2(14.0, 3.0))
+                                .show(ui, |ui| {
+                                    ui.label(egui::RichText::new("Name").strong());
+                                    ui.label(egui::RichText::new("Size").strong());
+                                    ui.label(egui::RichText::new("Type").strong());
+                                    ui.label(egui::RichText::new("Modified").strong());
+                                    ui.end_row();
+                                    for en in &entries {
+                                        let icon = if en.is_dir { "📁" } else { "📄" };
+                                        // Truncate long names so rows stay one line.
+                                        let disp = if en.name.chars().count() > 34 {
+                                            let s: String = en.name.chars().take(31).collect();
+                                            format!("{}…", s)
+                                        } else { en.name.clone() };
+                                        let sel = !en.is_dir
+                                            && dlg.filename.eq_ignore_ascii_case(&en.name);
+                                        let resp = ui.selectable_label(
+                                            sel, format!("{} {}", icon, disp));
+                                        ui.label(if en.is_dir { String::new() }
+                                                 else { human_size(en.len) });
+                                        ui.label(file_kind_label(&en.name, en.is_dir));
+                                        ui.label(en.modified.as_str());
+                                        ui.end_row();
+                                        if en.is_dir {
+                                            if resp.clicked() || resp.double_clicked() {
+                                                navigate = Some(dlg.dir.join(&en.name));
+                                            }
+                                        } else {
+                                            if resp.clicked() {
+                                                dlg.filename = en.name.clone();
+                                                let l = en.name.to_ascii_lowercase();
+                                                if l.ends_with(".rsm") { dlg.ext = ".rsm".into(); }
+                                                else if l.ends_with(".dxf") { dlg.ext = ".dxf".into(); }
+                                            }
+                                            if resp.double_clicked() {
+                                                dlg.filename = en.name.clone();
+                                                do_confirm = true;
+                                            }
+                                        }
+                                    }
+                                });
+                            if entries.is_empty() { ui.weak("(no matching files)"); }
+                        });
+                    });
+                    ui.separator();
+
+                    // ---- PREVIEW pane (image/drawing + metadata) ----------
+                    ui.allocate_ui_with_layout(egui::vec2(300.0, body_h),
+                        egui::Layout::top_down(egui::Align::Min), |ui| {
+                        ui.label(egui::RichText::new("Preview").strong());
+                        ui.add_space(2.0);
+                        let (p_resp, painter) = ui.allocate_painter(
+                            egui::vec2(290.0, (body_h - 96.0).max(120.0)),
+                            egui::Sense::hover());
+                        let pr = p_resp.rect;
+                        painter.rect_filled(pr, 4.0, egui::Color32::from_rgb(16, 20, 26));
+                        painter.rect_stroke(pr, 4.0,
+                            egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 80, 95)));
+                        let note = |painter: &egui::Painter, txt: &str, col: egui::Color32| {
+                            painter.text(pr.center(), egui::Align2::CENTER_CENTER, txt,
+                                egui::FontId::proportional(13.0), col);
+                        };
+                        let dim = egui::Color32::from_rgb(120, 130, 145);
+                        let mut meta: Vec<String> = Vec::new();   // lines under the box
+                        match &dlg.preview {
+                            PreviewState::None         => note(&painter, "select a file", dim),
+                            PreviewState::Unsupported  => note(&painter, "no preview for this type", dim),
+                            PreviewState::Error(e)     => note(&painter, e, egui::Color32::from_rgb(230, 120, 120)),
+                            PreviewState::Image { tex, w, h } => {
+                                let ts = tex.size_vec2();
+                                let s = ((pr.width() - 12.0) / ts.x)
+                                    .min((pr.height() - 12.0) / ts.y).min(1.0).max(0.01);
+                                let img_rect = egui::Rect::from_center_size(
+                                    pr.center(), egui::vec2(ts.x * s, ts.y * s));
+                                painter.image(tex.id(), img_rect,
+                                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                    egui::Color32::WHITE);
+                                meta.push(format!("{} × {} pixels", w, h));
+                            }
+                            PreviewState::Drawing { polys, count } => {
+                                let mut mn = Vec2::new(f64::INFINITY, f64::INFINITY);
+                                let mut mx = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+                                for pl in polys { for p in pl {
+                                    mn.x = mn.x.min(p.x); mn.y = mn.y.min(p.y);
+                                    mx.x = mx.x.max(p.x); mx.y = mx.y.max(p.y);
+                                }}
+                                if mx.x >= mn.x && mx.y >= mn.y {
+                                    let sz = mx - mn;
+                                    let s = ((pr.width() as f64 - 16.0) / sz.x.max(1e-9))
+                                        .min((pr.height() as f64 - 16.0) / sz.y.max(1e-9));
+                                    let cw = (mn + mx) * 0.5;
+                                    let ctr = pr.center();
+                                    let w2s = |p: Vec2| egui::pos2(
+                                        ctr.x + ((p.x - cw.x) * s) as f32,
+                                        ctr.y - ((p.y - cw.y) * s) as f32);
+                                    let col = egui::Color32::from_rgb(150, 200, 235);
+                                    for pl in polys { if pl.len() >= 2 {
+                                        let pts: Vec<egui::Pos2> = pl.iter().map(|p| w2s(*p)).collect();
+                                        painter.add(egui::Shape::line(pts, egui::Stroke::new(1.0, col)));
+                                    }}
+                                } else { note(&painter, "(empty drawing)", dim); }
+                                meta.push(format!("{} objects", count));
                             }
                         }
-                        for d in &dirs {
-                            if ui.selectable_label(false, format!("📁 {}", d)).clicked() {
-                                navigate = Some(dlg.dir.join(d));
+                        // metadata block (GIMP-style: name / size / dimensions)
+                        ui.add_space(6.0);
+                        let name = dlg.filename.trim();
+                        if !name.is_empty() {
+                            ui.label(egui::RichText::new(name).italics());
+                            if let Some(b) = sel_bytes {
+                                ui.label(egui::RichText::new(human_size(b)).weak());
                             }
-                        }
-                        for f in &files {
-                            let selected = dlg.filename.eq_ignore_ascii_case(f);
-                            let resp = ui.selectable_label(
-                                selected, format!("📄 {}", f));
-                            if resp.clicked() {
-                                dlg.filename = f.clone();
-                                // Sync the Save format toggle to the picked file.
-                                let l = f.to_ascii_lowercase();
-                                if l.ends_with(".rsm") { dlg.ext = ".rsm".into(); }
-                                else if l.ends_with(".dxf") { dlg.ext = ".dxf".into(); }
-                            }
-                            if resp.double_clicked() {
-                                dlg.filename = f.clone();
-                                do_confirm = true;
-                            }
-                        }
-                        if dirs.is_empty() && files.is_empty() {
-                            ui.weak("(no folders or .dxf/.rsm files here)");
+                            for m in &meta { ui.label(egui::RichText::new(m).weak()); }
                         }
                     });
+                });
 
                 ui.separator();
-                // Filename + (Save) format.
+                // ---- filename + (Save) format + actions -------------------
                 ui.horizontal(|ui| {
                     ui.label("File");
                     ui.add(egui::TextEdit::singleline(&mut dlg.filename)
-                        .desired_width(260.0)
+                        .desired_width(360.0)
                         .hint_text(match dlg.mode {
                             FileDialogMode::Open => "pick a file above",
                             FileDialogMode::Save => "drawing name",
+                            FileDialogMode::ImportImage => "pick an image above",
                         }));
-                });
-                if dlg.mode == FileDialogMode::Save {
-                    ui.horizontal(|ui| {
+                    if dlg.mode == FileDialogMode::Save {
+                        ui.separator();
                         ui.label("Format");
-                        ui.selectable_value(&mut dlg.ext, ".dxf".to_string(), "DXF (.dxf)");
-                        ui.selectable_value(&mut dlg.ext, ".rsm".to_string(), "Native (.rsm)");
-                    });
-                }
+                        ui.selectable_value(&mut dlg.ext, ".dxf".to_string(), "DXF");
+                        ui.selectable_value(&mut dlg.ext, ".rsm".to_string(), "RSM");
+                    }
+                });
                 if let Some(err) = &dlg.error {
                     ui.colored_label(egui::Color32::from_rgb(240, 120, 120), err);
                 }
-                ui.add_space(6.0);
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Cancel").clicked() { do_cancel = true; }
                         let label = match dlg.mode {
-                            FileDialogMode::Open => "Open",
-                            FileDialogMode::Save => "Save",
+                            FileDialogMode::Open        => "Open",
+                            FileDialogMode::Save        => "Save",
+                            FileDialogMode::ImportImage => "Open",
                         };
-                        if ui.button(label).clicked() { do_confirm = true; }
+                        if ui.button(egui::RichText::new(label).strong()).clicked() {
+                            do_confirm = true;
+                        }
+                        if ui.button("Cancel").clicked() { do_cancel = true; }
                     });
                 });
             });
@@ -9637,6 +10437,10 @@ impl CadApp {
                 FileDialogMode::Open => {
                     let path = dlg.dir.join(name);
                     self.do_open(&path.to_string_lossy());
+                }
+                FileDialogMode::ImportImage => {
+                    let path = dlg.dir.join(name);
+                    self.do_import_image(&path.to_string_lossy());
                 }
                 FileDialogMode::Save => {
                     // Ensure the chosen extension; if the name already ends
@@ -16435,6 +17239,14 @@ impl eframe::App for CadApp {
                         self.open_file_dialog(FileDialogMode::Open, ".dxf");
                         ui.close_menu();
                     }
+                    ui.menu_button("Import", |ui| {
+                        if ui.button("Image (raster → vector)…").clicked() {
+                            self.open_file_dialog(FileDialogMode::ImportImage, "");
+                            ui.close_menu();
+                        }
+                        // Future imports land here (PDF, SVG, point-cloud…).
+                    });
+                    ui.separator();
                     if ui.button("Save As .dxf…").clicked() {
                         self.open_file_dialog(FileDialogMode::Save, ".dxf");
                         ui.close_menu();
@@ -17566,6 +18378,8 @@ impl eframe::App for CadApp {
         self.render_param_name_dialog(ctx);
         self.render_block_editor(ctx);
         self.render_file_dialog(ctx);
+        self.poll_pending_file();
+        self.render_raster_editor(ctx);
         self.render_dim_style_dialog(ctx);
         self.render_text_input_dialog(ctx);
         self.render_dbg_recorder_window(ctx);
