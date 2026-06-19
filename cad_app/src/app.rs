@@ -393,6 +393,17 @@ fn parse_xy(s: &str) -> Option<Vec2> {
     Some(Vec2::new(a.trim().parse::<f64>().ok()?, b.trim().parse::<f64>().ok()?))
 }
 
+/// Parse an `nX` relative-scale factor (case-insensitive), e.g. `2x` → 2.0,
+/// `0.5x` → 0.5. Returns None for a bare number or an `nXP` (paper-space)
+/// factor — this app is model-space only and has no drawing limits, so only
+/// the view-relative `nX` form is supported. See the ZOOM Scale wiring.
+fn parse_scale_x(s: &str) -> Option<f64> {
+    let body = s.trim().to_ascii_lowercase();
+    let body = body.strip_suffix('x')?;        // must end in a lone 'x' (not 'xp')
+    if body.is_empty() { return None; }
+    body.parse::<f64>().ok().filter(|v| *v > 0.0)
+}
+
 /// Shortest distance from point `p` to segment `a`→`b` (world units).
 fn point_seg_dist(p: Vec2, a: Vec2, b: Vec2) -> f64 {
     let ab = b - a;
@@ -694,6 +705,14 @@ pub struct CadApp {
 
     scale:        f32,
     world_offset: egui::Vec2,
+
+    // ---- ZOOM command ----------------------------------------------------
+    /// Active ZOOM sub-flow; `Off` when no ZOOM command is running.
+    zoom_state:   ZoomState,
+    /// View history for ZOOM Previous — `(scale, world_offset)` snapshots,
+    /// most recent last, capped at 10 (AutoCAD's depth). Pushed before any
+    /// programmatic view change so Previous steps back through zoom history.
+    view_history: Vec<(f32, egui::Vec2)>,
 
     // array dialog
     array_open:      bool,
@@ -1421,6 +1440,43 @@ pub enum CircleStep {
     TtrRadius(usize, Vec2, usize, Vec2),
 }
 
+/// ZOOM command sub-option flow (AutoCAD-style). `zoom` / `z` enters `Menu`;
+/// the user then types an option letter / `nX` scale / coordinate, or picks
+/// point(s) on the canvas. Interactive point steps capture clicks through
+/// `zoom_input_point`; `Object` reuses the normal pointer selection and applies
+/// on Enter; `RealTime` consumes a primary drag to zoom. See the `zoom_*`
+/// methods. Dynamic is intentionally not implemented (use Window / wheel).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ZoomState {
+    Off,
+    /// Top-level prompt: awaiting an option letter, an `nX` factor, a
+    /// coordinate, or a canvas click (= first corner of an implicit Window).
+    Menu,
+    /// Center: awaiting the center point.
+    CenterPoint,
+    /// Center: center captured; awaiting magnification (`nX`) or height (`n`).
+    CenterMag(Vec2),
+    /// Window: awaiting the first corner.
+    WinFirst,
+    /// Window: first corner captured; awaiting the opposite corner.
+    WinSecond(Vec2),
+    /// Object: awaiting object selection, then Enter to fit them.
+    ObjectSel,
+    /// Real-time: primary drag UP = zoom in, DOWN = out; Enter / Esc exits.
+    RealTime,
+}
+
+impl ZoomState {
+    /// Steps where a canvas click supplies a POINT (handled by
+    /// `zoom_input_point`). A click at the top-level `Menu` starts an implicit
+    /// Window. `ObjectSel` is excluded — it uses the normal selection handler.
+    fn wants_point(self) -> bool {
+        matches!(self,
+            ZoomState::Menu | ZoomState::CenterPoint
+            | ZoomState::WinFirst | ZoomState::WinSecond(_))
+    }
+}
+
 /// Block Task Recorder session — the block is exploded into a TEMP sandbox
 /// (tracked by handle); each stretch the user demonstrates is recorded as a
 /// `ParamRow` (base-relative). On Finish the sandbox is deleted and the
@@ -1978,6 +2034,8 @@ impl Default for CadApp {
             pline_arc_sub: PlineArcSub::Normal,
             scale:         6.0,
             world_offset:  egui::Vec2::ZERO,
+            zoom_state:    ZoomState::Off,
+            view_history:  Vec::new(),
             array_open:     false,
             picking_source: false,
             array_cols:     10,
@@ -2236,6 +2294,27 @@ impl CadApp {
         {
             self.circle_flow_start();
             return;
+        }
+        // ---- ZOOM command flow -------------------------------------------
+        // `zoom` / `z` (optionally `zoom <opt>`) runs an AutoCAD-style
+        // sub-option flow. While active the command line is captured here, so
+        // sub-option letters (A/C/E/P/S/W/O) never reach the parser. Point
+        // picks come in via zoom_input_point; empty Enter via update(). See
+        // the zoom_* methods.
+        if self.zoom_state != ZoomState::Off {
+            self.zoom_input_text(trimmed);
+            return;
+        }
+        {
+            let lc = trimmed.to_ascii_lowercase();
+            if lc == "zoom" || lc == "z" {
+                self.zoom_start("");
+                return;
+            }
+            if let Some(rest) = lc.strip_prefix("zoom ").or_else(|| lc.strip_prefix("z ")) {
+                self.zoom_start(rest.trim());
+                return;
+            }
         }
         // `preview [on|off]` — toggle drafting-command live preview.
         {
@@ -11590,6 +11669,327 @@ impl CadApp {
         best.map(|(_, c)| c)
     }
 
+    // ===================================================================
+    // ZOOM command — AutoCAD-style sub-option flow.
+    //
+    // Entry: `zoom` / `z` (optionally with an inline argument) → zoom_start().
+    // While `zoom_state != Off` the command line is captured (zoom_input_text)
+    // and canvas clicks at point steps route to zoom_input_point(). Empty Enter
+    // is handled in the update() Enter cascade (RealTime exit / Object apply /
+    // Center default). The view is driven purely through `scale` + `world_offset`
+    // (w2s: screen = center + (world + world_offset) * scale).
+    // ===================================================================
+
+    /// World-space bbox of every dobject (None when the drawing is empty).
+    fn doc_extents(&self) -> Option<(Vec2, Vec2)> {
+        let mut it = self.doc.dobjects.iter();
+        let (mut min, mut max) = it.next()?.bbox();
+        for d in it {
+            let (a, b) = d.bbox();
+            if a.x < min.x { min.x = a.x; }
+            if a.y < min.y { min.y = a.y; }
+            if b.x > max.x { max.x = b.x; }
+            if b.y > max.y { max.y = b.y; }
+        }
+        Some((min, max))
+    }
+
+    /// World-space bbox of the current selection (None when nothing selected).
+    fn selection_extents(&self) -> Option<(Vec2, Vec2)> {
+        let mut acc: Option<(Vec2, Vec2)> = None;
+        for &i in &self.selection {
+            let Some(d) = self.doc.dobjects.get(i) else { continue; };
+            let (a, b) = d.bbox();
+            acc = Some(match acc {
+                None => (a, b),
+                Some((mn, mx)) => (
+                    Vec2::new(mn.x.min(a.x), mn.y.min(a.y)),
+                    Vec2::new(mx.x.max(b.x), mx.y.max(b.y)),
+                ),
+            });
+        }
+        acc
+    }
+
+    /// The canvas viewport rect (stashed each frame). Falls back to a nominal
+    /// size only if a zoom is somehow requested before the first canvas layout.
+    fn view_rect_or(&self) -> egui::Rect {
+        self.canvas_screen_rect.unwrap_or_else(||
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0)))
+    }
+
+    /// Push the current view onto the history stack (cap 10) so ZOOM Previous
+    /// can step back. Call BEFORE mutating `scale` / `world_offset`.
+    fn view_push_history(&mut self) {
+        self.view_history.push((self.scale, self.world_offset));
+        let n = self.view_history.len();
+        if n > 10 { self.view_history.drain(0..n - 10); }
+    }
+
+    /// Set scale + offset so `min..max` fills `frac` of the viewport, centered.
+    /// `frac` < 1.0 leaves a margin (0.9 for extents, 1.0 for a tight window).
+    fn zoom_fit_bbox(&mut self, min: Vec2, max: Vec2, frac: f32) {
+        self.view_push_history();
+        let center = (min + max) * 0.5;
+        let w = (max.x - min.x).abs();
+        let h = (max.y - min.y).abs();
+        let rect = self.view_rect_or();
+        // Fit the LIMITING axis so the whole bbox is visible at this aspect.
+        let sx = if w > 1e-9 { rect.width()  as f64 / w } else { f64::INFINITY };
+        let sy = if h > 1e-9 { rect.height() as f64 / h } else { f64::INFINITY };
+        let mut s = sx.min(sy);
+        if !s.is_finite() { s = self.scale as f64; }   // degenerate (point) bbox
+        self.scale = ((s * frac as f64) as f32).clamp(0.01, 5000.0);
+        self.world_offset = egui::vec2(-center.x as f32, -center.y as f32);
+    }
+
+    /// ZOOM Extents — fit all objects.
+    fn zoom_extents(&mut self) {
+        match self.doc_extents() {
+            Some((mn, mx)) => {
+                self.zoom_fit_bbox(mn, mx, 0.9);
+                self.history.push("  ✔ zoom: extents".into());
+            }
+            None => self.history.push("  zoom: nothing to fit (drawing is empty)".into()),
+        }
+    }
+
+    /// ZOOM All — limits-or-extents. This app has no drawing-limits concept, so
+    /// All == Extents; an empty drawing resets to a default view.
+    fn zoom_all(&mut self) {
+        match self.doc_extents() {
+            Some((mn, mx)) => {
+                self.zoom_fit_bbox(mn, mx, 0.9);
+                self.history.push("  ✔ zoom: all (= extents)".into());
+            }
+            None => {
+                self.view_push_history();
+                self.scale = 20.0;
+                self.world_offset = egui::Vec2::ZERO;
+                self.history.push("  zoom: all — empty drawing, default view".into());
+            }
+        }
+    }
+
+    /// ZOOM Object — fit the current selection.
+    fn zoom_object(&mut self) {
+        match self.selection_extents() {
+            Some((mn, mx)) => {
+                let n = self.selection.len();
+                self.zoom_fit_bbox(mn, mx, 0.85);
+                self.history.push(format!("  ✔ zoom: object(s) — {} selected", n));
+            }
+            None => self.history.push("  ! zoom object: nothing selected".into()),
+        }
+    }
+
+    /// ZOOM Previous — restore the last saved view (up to 10 deep).
+    fn zoom_previous(&mut self) {
+        match self.view_history.pop() {
+            Some((s, off)) => {
+                self.scale = s;
+                self.world_offset = off;
+                self.history.push(format!(
+                    "  ✔ zoom: previous  ({} left)", self.view_history.len()));
+            }
+            None => self.history.push("  zoom: no previous view".into()),
+        }
+    }
+
+    /// ZOOM Scale `nX` — multiply the current view scale (objects appear n×).
+    fn zoom_scale_factor(&mut self, factor: f64) {
+        if factor <= 1e-9 {
+            self.history.push("  ! zoom scale: factor must be > 0".into());
+            return;
+        }
+        self.view_push_history();
+        self.scale = ((self.scale as f64 * factor) as f32).clamp(0.01, 5000.0);
+        self.history.push(format!("  ✔ zoom: scale {}×", factor));
+    }
+
+    /// ZOOM Window — fit the rectangle defined by two opposite corners.
+    fn zoom_window(&mut self, a: Vec2, b: Vec2) {
+        let mn = Vec2::new(a.x.min(b.x), a.y.min(b.y));
+        let mx = Vec2::new(a.x.max(b.x), a.y.max(b.y));
+        if (mx.x - mn.x) < 1e-9 || (mx.y - mn.y) < 1e-9 {
+            self.history.push("  ! zoom window: zero-area box — cancelled".into());
+            return;
+        }
+        self.zoom_fit_bbox(mn, mx, 1.0);
+        self.history.push("  ✔ zoom: window".into());
+    }
+
+    /// ZOOM Center — recenter on `c`. Magnification is `Some(factor)` for an
+    /// `nX` entry, or `height` (new view height in drawing units) for a plain
+    /// number; both `None` = recenter only, keep the current zoom.
+    fn zoom_center(&mut self, c: Vec2, height: Option<f64>, factor: Option<f64>) {
+        self.view_push_history();
+        self.world_offset = egui::vec2(-c.x as f32, -c.y as f32);
+        if let Some(f) = factor.filter(|f| *f > 1e-9) {
+            self.scale = ((self.scale as f64 * f) as f32).clamp(0.01, 5000.0);
+        } else if let Some(h) = height.filter(|h| *h > 1e-9) {
+            let rect = self.view_rect_or();
+            self.scale = ((rect.height() as f64 / h) as f32).clamp(0.01, 5000.0);
+        }
+        self.history.push(format!("  ✔ zoom: center ({:.3},{:.3})", c.x, c.y));
+    }
+
+    /// The top-level ZOOM prompt line.
+    fn zoom_menu_prompt() -> &'static str {
+        "ZOOM — window corner, scale (nX), or \
+         [All/Center/Dynamic/Extents/Previous/Scale/Window/Object] <real time>:"
+    }
+
+    /// Transition to a ZOOM sub-state and show its prompt.
+    fn zoom_set_state(&mut self, st: ZoomState, prompt: impl Into<String>) {
+        self.zoom_state = st;
+        let p = prompt.into();
+        self.history.push(format!("  {}", p));
+        self.set_prompt(p);
+        self.refocus_cmd = true;
+    }
+
+    /// End the flow and return the command line to idle.
+    fn zoom_finish(&mut self) {
+        self.zoom_state = ZoomState::Off;
+        self.clear_prompt();
+    }
+
+    /// Cancel an active ZOOM flow (called from the global Esc handler).
+    fn zoom_cancel(&mut self) {
+        if self.zoom_state != ZoomState::Off {
+            self.zoom_state = ZoomState::Off;
+            self.clear_prompt();
+            self.history.push("  zoom: cancelled".into());
+        }
+    }
+
+    /// Entry point: `zoom` / `z`, optionally with an inline argument
+    /// (`zoom e`, `z 2x`, `zoom 10,10`, …).
+    fn zoom_start(&mut self, arg: &str) {
+        self.last_command = Some("zoom".into());
+        let arg = arg.trim();
+        if arg.is_empty() {
+            self.history.push("  command: zoom".into());
+            self.zoom_set_state(ZoomState::Menu, Self::zoom_menu_prompt());
+        } else {
+            self.zoom_state = ZoomState::Menu;
+            self.history.push(format!("  command: zoom {}", arg));
+            self.zoom_input_text(arg);
+        }
+    }
+
+    /// A TYPED answer (option letter / number / coordinate) while ZOOM is live.
+    fn zoom_input_text(&mut self, raw: &str) {
+        let s = raw.trim();
+        let low = s.to_ascii_lowercase();
+        match self.zoom_state {
+            ZoomState::Off => {}
+            ZoomState::Menu => {
+                // (empty Enter → real-time is handled in the update() cascade)
+                if let Some(p) = parse_xy(s) {
+                    // typed coordinate = first corner of an implicit Window
+                    self.zoom_set_state(ZoomState::WinSecond(p),
+                        "zoom window: specify OPPOSITE corner");
+                } else if let Some(f) = parse_scale_x(&low) {
+                    self.zoom_scale_factor(f);
+                    self.zoom_finish();
+                } else {
+                    match low.as_str() {
+                        "a" | "all"      => { self.zoom_all();      self.zoom_finish(); }
+                        "e" | "extents"  => { self.zoom_extents();  self.zoom_finish(); }
+                        "p" | "previous" => { self.zoom_previous(); self.zoom_finish(); }
+                        "c" | "center"   => self.zoom_set_state(ZoomState::CenterPoint,
+                            "zoom center: specify center point"),
+                        "w" | "window"   => self.zoom_set_state(ZoomState::WinFirst,
+                            "zoom window: specify FIRST corner"),
+                        "o" | "object"   => self.zoom_set_state(ZoomState::ObjectSel,
+                            "zoom object: select objects, then Enter  [Esc=cancel]"),
+                        "s" | "scale"    => {
+                            self.history.push(
+                                "  zoom scale: enter a factor as nX (e.g. 2X)".into());
+                            self.set_prompt("zoom scale: enter factor (nX, e.g. 2X)");
+                            self.refocus_cmd = true;
+                        }
+                        "r" | "realtime" | "real" => self.zoom_set_state(ZoomState::RealTime,
+                            "real-time zoom: drag UP = in, DOWN = out  [Enter/Esc = exit]"),
+                        "d" | "dynamic"  => {
+                            self.history.push(
+                                "  zoom: Dynamic is not implemented — use Window or the scroll wheel".into());
+                            self.zoom_finish();
+                        }
+                        _ => self.history.push(format!(
+                            "  ! zoom: '{}' — type A/C/E/P/S/W/O, an nX factor, x,y, or Enter for real-time", s)),
+                    }
+                }
+            }
+            ZoomState::CenterPoint => {
+                if let Some(p) = parse_xy(s) {
+                    self.zoom_set_state(ZoomState::CenterMag(p),
+                        "zoom center: enter magnification (nX) or height <Enter=keep>");
+                } else {
+                    self.history.push("  ! zoom center: pick a point or type x,y".into());
+                }
+            }
+            ZoomState::CenterMag(c) => {
+                // (empty Enter → recenter only is handled in the update() cascade)
+                if let Some(f) = parse_scale_x(&low) {
+                    self.zoom_center(c, None, Some(f));
+                    self.zoom_finish();
+                } else if let Ok(h) = low.parse::<f64>() {
+                    self.zoom_center(c, Some(h), None);
+                    self.zoom_finish();
+                } else {
+                    self.history.push("  ! zoom center: enter a height number or nX".into());
+                }
+            }
+            ZoomState::WinFirst => {
+                if let Some(p) = parse_xy(s) {
+                    self.zoom_set_state(ZoomState::WinSecond(p),
+                        "zoom window: specify OPPOSITE corner");
+                } else {
+                    self.history.push("  ! zoom window: pick the first corner or type x,y".into());
+                }
+            }
+            ZoomState::WinSecond(a) => {
+                if let Some(p) = parse_xy(s) {
+                    self.zoom_window(a, p);
+                    self.zoom_finish();
+                } else {
+                    self.history.push("  ! zoom window: pick the opposite corner or type x,y".into());
+                }
+            }
+            ZoomState::ObjectSel => {
+                // (empty Enter → apply is handled in the update() cascade)
+                self.history.push("  zoom object: click objects on the canvas, then Enter".into());
+            }
+            ZoomState::RealTime => {
+                // Any typed input ends real-time mode.
+                self.zoom_finish();
+                self.history.push("  zoom: real-time done".into());
+            }
+        }
+    }
+
+    /// A canvas POINT (already snap-applied) during a ZOOM flow.
+    fn zoom_input_point(&mut self, p: Vec2) {
+        match self.zoom_state {
+            // A click at the top-level prompt OR at WinFirst = first corner.
+            ZoomState::Menu | ZoomState::WinFirst =>
+                self.zoom_set_state(ZoomState::WinSecond(p),
+                    "zoom window: specify OPPOSITE corner"),
+            ZoomState::WinSecond(a) => {
+                self.zoom_window(a, p);
+                self.zoom_finish();
+            }
+            ZoomState::CenterPoint =>
+                self.zoom_set_state(ZoomState::CenterMag(p),
+                    "zoom center: enter magnification (nX) or height <Enter=keep>"),
+            // CenterMag waits for a TYPED value; a stray click is ignored.
+            _ => {}
+        }
+    }
+
     fn apply_insert(&mut self, block: u32, insert: Vec2, rotation: f64) {
         let (names, defaults): (Vec<String>, Vec<f64>) =
             match self.doc.blocks.get(block) {
@@ -15979,6 +16379,7 @@ impl eframe::App for CadApp {
                 self.history.push("  insert cancelled".into());
             }
             self.flow_cancel();   // cancel an active prompt-driven flow (CIRCLE)
+            self.zoom_cancel();   // cancel an active ZOOM sub-flow
             self.tool = Tool::None;
             self.picking_source = false;
             // Set the cooperative-cancellation flag for any long-
@@ -16197,6 +16598,25 @@ impl eframe::App for CadApp {
                 self.apply_insert(block, insert, 0.0);
                 return;
             }
+        }
+        // ZOOM flow — empty Enter (or Space) advances/exits the active flow.
+        // Empty input never reaches run_command, so it must be handled here.
+        if trigger && cmd_is_empty && self.zoom_state != ZoomState::Off {
+            if space_now { self.cmd.clear(); }
+            match self.zoom_state {
+                // Menu default = real-time zoom.
+                ZoomState::Menu => self.zoom_set_state(ZoomState::RealTime,
+                    "real-time zoom: drag UP = in, DOWN = out  [Enter/Esc = exit]"),
+                ZoomState::RealTime => {
+                    self.zoom_finish();
+                    self.history.push("  zoom: real-time done".into());
+                }
+                ZoomState::ObjectSel    => { self.zoom_object(); self.zoom_finish(); }
+                ZoomState::CenterMag(c) => { self.zoom_center(c, None, None); self.zoom_finish(); }
+                // Point-pick steps: empty Enter just keeps waiting for the pick.
+                _ => {}
+            }
+            return;
         }
         if trigger && cmd_is_empty {
             if self.select_mode != SelectMode::Off {
@@ -16480,27 +16900,19 @@ impl eframe::App for CadApp {
                 });
                 ui.menu_button("View", |ui| {
                     if ui.button("Zoom Extents (fit all)").clicked() {
-                        if !self.doc.dobjects.is_empty() {
-                            let mut min = self.doc.dobjects[0].bbox().0;
-                            let mut max = self.doc.dobjects[0].bbox().1;
-                            for d in &self.doc.dobjects {
-                                let (a, b) = d.bbox();
-                                if a.x < min.x { min.x = a.x; }
-                                if a.y < min.y { min.y = a.y; }
-                                if b.x > max.x { max.x = b.x; }
-                                if b.y > max.y { max.y = b.y; }
-                            }
-                            let center = (min + max) * 0.5;
-                            let w = (max.x - min.x).max(max.y - min.y).max(1.0);
-                            let r = ctx.screen_rect();
-                            let target_px = (r.width().min(r.height()) * 0.85) as f64;
-                            self.scale = (target_px / w) as f32;
-                            self.world_offset = egui::vec2(
-                                -center.x as f32, -center.y as f32);
-                        }
+                        self.zoom_extents();
+                        ui.close_menu();
+                    }
+                    if ui.button("Zoom Window").clicked() {
+                        self.zoom_start("w");
+                        ui.close_menu();
+                    }
+                    if ui.button("Zoom Previous").clicked() {
+                        self.zoom_previous();
                         ui.close_menu();
                     }
                     if ui.button("Reset View").clicked() {
+                        self.view_push_history();
                         self.scale = 20.0;
                         self.world_offset = egui::vec2(0.0, 0.0);
                         ui.close_menu();
@@ -17981,6 +18393,10 @@ impl eframe::App for CadApp {
             // all block editing happens inside that window. Every interaction
             // gate below is AND-ed with `!canvas_locked`. See `BlockEditor`.
             let canvas_locked = self.block_editor.is_some();
+            // ZOOM real-time mode: a primary drag zooms the view instead of
+            // selecting / drawing. Gates the click/grip handlers below so the
+            // drag is consumed only by the zoom logic. See the zoom_* methods.
+            let rt_zoom = !canvas_locked && self.zoom_state == ZoomState::RealTime;
             // Stash the live cursor (raw world) so the command line's
             // direct-distance entry knows which way to throw a typed
             // distance (CARD-locked when CARD is on).
@@ -18042,6 +18458,18 @@ impl eframe::App for CadApp {
                     let dx = (after.x - before.x) as f32;
                     let dy = (after.y - before.y) as f32;
                     self.world_offset += egui::vec2(dx, dy);
+                }
+            }
+
+            // ---- ZOOM real-time (press-drag) -------------------------------
+            // Primary drag up = zoom in, down = zoom out, about the viewport
+            // center. The click/grip handlers below are gated with `!rt_zoom`
+            // so they don't also fire. Enter/Esc exit (command line / Esc).
+            if rt_zoom && resp.dragged_by(egui::PointerButton::Primary) {
+                let dy = resp.drag_delta().y;
+                if dy.abs() > 0.0 {
+                    let factor = (-dy as f64 * 0.005).exp();
+                    self.scale = ((self.scale as f64 * factor) as f32).clamp(0.01, 5000.0);
                 }
             }
 
@@ -18196,8 +18624,8 @@ impl eframe::App for CadApp {
             // resp.clicked() fires only when egui classifies the press+release
             // as a click (small motion); drag_stopped() fires when a release
             // ends a drag — including a "click" that egui saw as a tiny drag.
-            let click_now    = resp.clicked() && !canvas_locked;
-            let drag_stopped = resp.drag_stopped() && !canvas_locked;
+            let click_now    = resp.clicked() && !canvas_locked && !rt_zoom;
+            let drag_stopped = resp.drag_stopped() && !canvas_locked && !rt_zoom;
             // SESSION RECORDER — every mouse press/release with the
             // FULL gesture context. Press position is stashed on self
             // and re-read at release time to derive the real drag
@@ -18396,6 +18824,11 @@ impl eframe::App for CadApp {
                 || self.cmd_flow.is_some()
                 || self.blockdiff_pick  != BlockDiffPick::Off
                 || self.picking_source
+                // ZOOM point steps (center / window corners) capture a single
+                // click each, so they're click-only like a drafting pick.
+                // (ObjectSel and RealTime are excluded — they want the normal
+                // selection handler / a drag, respectively.)
+                || self.zoom_state.wants_point()
                 || self.intersect_pending_click;
             // Pointer mode (Tool::None, no edit phase, no active select
             // session) is the always-on selection tool per
@@ -18441,6 +18874,7 @@ impl eframe::App for CadApp {
             // is drawn iff in_click_only_phase.
             let press_fires_click = in_click_only_phase;
             let press_now = press_fires_click
+                && !rt_zoom
                 && ctx.input(|i| i.pointer.primary_pressed())
                 && resp.contains_pointer();
             let click_now = if press_fires_click { press_now } else { click_now };
@@ -18456,7 +18890,7 @@ impl eframe::App for CadApp {
             // Geom::with_grip_moved() decides what changes (e.g. circle
             // quadrant → radius; line midpoint → translate whole line).
             let mut grip_drag_consumed_click = false;
-            if pointer_mode_idle && self.env.GrpEnb {
+            if pointer_mode_idle && self.env.GrpEnb && !rt_zoom {
                 let drag_started = resp.drag_started_by(egui::PointerButton::Primary)
                     && !canvas_locked;
                 // (a) Drag-grab: a primary-button drag begins near a grip.
@@ -18677,6 +19111,15 @@ impl eframe::App for CadApp {
                                 active_tool:  format!("{:?}", self.tool),
                                 active_state,
                             });
+                    }
+
+                    // ZOOM point pick (center / window corners). Consumes the
+                    // click before any selection/tool handler. ObjectSel is NOT
+                    // a point step — it falls through to normal selection.
+                    if self.zoom_state.wants_point() {
+                        self.zoom_input_point(click_world);
+                        self.refocus_cmd = true;
+                        return;
                     }
 
                     // Prompt-driven flow (CIRCLE) — a point answer. Consumes
@@ -20302,6 +20745,7 @@ impl eframe::App for CadApp {
             // gets discarded as a click on release.
             let preview_pointer_mode_idle = !in_click_only_phase && !in_select;
             if resp.dragged()
+                && !rt_zoom    // a real-time-zoom drag is not a selection marquee
                 && ((in_select && hold_threshold_passed)
                     || (preview_pointer_mode_idle && hold_threshold_passed)
                     || (shift_held && !in_click_only_phase))
@@ -20371,6 +20815,29 @@ impl eframe::App for CadApp {
                             d, dx, dy, ang),
                         egui::FontId::monospace(11.0),
                         egui::Color32::from_rgb(255, 220, 140));
+                }
+            }
+
+            // ---- ZOOM Window preview --------------------------------------
+            // Once the first corner is captured (WinSecond), draw a live
+            // rectangle from that corner to the cursor so the user sees the
+            // area that will fill the viewport before picking corner 2. Amber,
+            // to read differently from the green/blue selection marquee above.
+            if let ZoomState::WinSecond(a) = self.zoom_state {
+                if let Some(cur_s) = resp.hover_pos() {
+                    let r = egui::Rect::from_two_pos(self.w2s(a, rect), cur_s);
+                    painter.rect_filled(r, 0.0,
+                        egui::Color32::from_rgba_unmultiplied(255, 200, 100, 26));
+                    painter.rect_stroke(r, 0.0,
+                        egui::Stroke::new(1.2, egui::Color32::from_rgb(255, 200, 100)));
+                    painter.text(
+                        cur_s + egui::vec2(12.0, 12.0),
+                        egui::Align2::LEFT_TOP,
+                        "zoom window",
+                        egui::FontId::monospace(11.0),
+                        egui::Color32::from_rgb(255, 220, 140));
+                    // Keep the preview tracking the cursor smoothly.
+                    ctx.request_repaint();
                 }
             }
 
