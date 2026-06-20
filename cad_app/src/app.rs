@@ -1022,6 +1022,12 @@ pub struct CadApp {
     raster_doc: Option<cad_raster::RasterDoc>,
     /// The open raster→vector editor (examine + adjust). `Some` after import.
     raster_editor: Option<RasterEditor>,
+    /// GPU texture cache for the document's raster underlays
+    /// (`doc.raster_images`), index-aligned. Rebuilt by `sync_underlay_textures`
+    /// whenever `underlay_sig` (a cheap signature of the image set) changes —
+    /// covers import, detach, file-open, and undo/redo in one place.
+    underlay_tex: Vec<egui::TextureHandle>,
+    underlay_sig: u64,
 
     // ---- Slice L: medium editing actions ----
     offset_state:   OffsetState,
@@ -1609,7 +1615,7 @@ pub struct BlockTaskRec {
 
 /// Open vs Save As vs Import-image for the in-app file browser.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum FileDialogMode { Open, Save, ImportImage }
+pub enum FileDialogMode { Open, Save, ImportImage, ImportRaster }
 
 /// What a NATIVE file-chooser result should do once the user picks a path.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -2404,6 +2410,8 @@ impl Default for CadApp {
             pending_file: None,
             raster_doc: None,
             raster_editor: None,
+            underlay_tex: Vec::new(),
+            underlay_sig: 0,
             insert_state:    InsertState::Off,
             block_dialog:    None,
             offset_state:   OffsetState::Off,
@@ -9861,6 +9869,87 @@ impl CadApp {
         }
     }
 
+    /// File ▸ Import ▸ Image as raster — embed the image in the DOCUMENT as a
+    /// reference UNDERLAY (no vectorization; persisted in RSM). Stores the raw
+    /// encoded bytes + placement at 1 unit/px with its bottom-left corner at the
+    /// world origin, then fits the view to it. The GPU texture is built lazily
+    /// by `sync_underlay_textures`.
+    fn import_raster_underlay(&mut self, path: &str) {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => { self.history.push(format!("  ! import raster '{}': {}", path, e)); return; }
+        };
+        // Decode once just to learn the pixel dimensions for placement.
+        let (w, h) = match image::load_from_memory(&bytes) {
+            Ok(im) => (im.width(), im.height()),
+            Err(e) => { self.history.push(format!("  ! import raster '{}': {}", path, e)); return; }
+        };
+        let name = std::path::Path::new(path).file_name()
+            .map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string());
+        let (world_w, world_h) = (w as f64, h as f64);
+        self.snapshot_doc();
+        self.doc.raster_images.push(cad_kernel::RasterImage {
+            name: name.clone(), data: std::sync::Arc::new(bytes),
+            insert: Vec2::new(0.0, world_h), world_w, world_h,
+        });
+        // Fit the view to the freshly placed image (centre + scale to canvas).
+        if let Some(rect) = self.canvas_screen_rect {
+            self.world_offset = egui::vec2(-(world_w as f32) / 2.0, -(world_h as f32) / 2.0);
+            let s = ((rect.width() / world_w as f32).min(rect.height() / world_h as f32)) * 0.9;
+            if s.is_finite() && s > 0.0 { self.scale = s; }
+        }
+        self.gpu_dirty = true;
+        self.history.push(format!(
+            "  ✔ embedded raster underlay '{}'  {}×{}  (saved in RSM; drafted over, not vectorized)",
+            name, w, h));
+    }
+
+    /// Rebuild the underlay texture cache from `doc.raster_images` when the set
+    /// changes (import / detach / file-open / undo / redo). A cheap signature
+    /// (count + each Arc identity + insert) detects the change without flags.
+    fn sync_underlay_textures(&mut self, ctx: &egui::Context) {
+        let mut sig = self.doc.raster_images.len() as u64;
+        for img in &self.doc.raster_images {
+            sig = sig.wrapping_mul(1099511628211)
+                     .wrapping_add(std::sync::Arc::as_ptr(&img.data) as u64);
+            sig = sig.wrapping_add(img.insert.x.to_bits());
+        }
+        if sig == self.underlay_sig && self.underlay_tex.len() == self.doc.raster_images.len() {
+            return;
+        }
+        self.underlay_tex.clear();
+        for (i, img) in self.doc.raster_images.iter().enumerate() {
+            let tex = match image::load_from_memory(&img.data) {
+                Ok(im) => {
+                    // Cap the texture so huge scans don't blow the GPU budget.
+                    let im = if im.width().max(im.height()) > 4000 { im.thumbnail(4000, 4000) } else { im };
+                    let rgba = im.to_rgba8();
+                    let ci = egui::ColorImage::from_rgba_unmultiplied(
+                        [rgba.width() as usize, rgba.height() as usize], rgba.as_raw());
+                    ctx.load_texture(format!("underlay_{}", i), ci, egui::TextureOptions::LINEAR)
+                }
+                Err(_) => {
+                    // Keep index alignment with a 1×1 transparent placeholder.
+                    let ci = egui::ColorImage::new([1, 1], egui::Color32::TRANSPARENT);
+                    ctx.load_texture(format!("underlay_bad_{}", i), ci, egui::TextureOptions::NEAREST)
+                }
+            };
+            self.underlay_tex.push(tex);
+        }
+        self.underlay_sig = sig;
+    }
+
+    /// Draw the reference raster underlays behind the geometry.
+    fn draw_raster_underlays(&self, painter: &egui::Painter, rect: egui::Rect) {
+        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        for (img, tex) in self.doc.raster_images.iter().zip(&self.underlay_tex) {
+            let tl = self.w2s(img.insert, rect);                                  // top-left
+            let br = self.w2s(Vec2::new(img.insert.x + img.world_w,
+                                        img.insert.y - img.world_h), rect);       // bottom-right
+            painter.image(tex.id(), egui::Rect::from_two_pos(tl, br), uv, egui::Color32::WHITE);
+        }
+    }
+
     // (file preview helpers are free fns below: `build_file_preview` + `preview_polys`)
 
     /// Open the NATIVE OS file chooser (XDG portal) on a worker thread for the
@@ -10111,19 +10200,57 @@ impl CadApp {
         if ed.composite_dirty { ctx.request_repaint(); }
 
         if do_convert {
-            if ed.buffers.is_empty() {
+            if !ed.buffers.iter().any(|b| b.marked() > 0) {
                 self.history.push(
-                    "  raster→vector: add a buffer layer and paint line-work first".into());
+                    "  raster→vector: paint line-work into a buffer layer first".into());
             } else {
+                self.snapshot_doc();
+                let work = ed.working();
+                let img_h = work.height();
+                let mut grand = 0usize;
                 self.history.push(format!(
-                    "  raster→vector: {} buffer layer(s) ready —", ed.buffers.len()));
+                    "  raster→vector: converting {} buffer layer(s) —", ed.buffers.len()));
                 for b in &ed.buffers {
+                    if b.marked() == 0 { continue; }
+                    // Ensure the target CAD layer exists — if the drawing has no
+                    // such layer, CREATE it from this buffer layer (name + ACI).
+                    let lname = {
+                        let t = b.cad_layer.trim();
+                        if t.is_empty() { format!("RASTER_{}", b.id) } else { t.to_string() }
+                    };
+                    let lid = match self.doc.layers.find(&lname) {
+                        Some(id) => id,
+                        None => {
+                            let id = self.doc.layers.add(Layer {
+                                name: lname.clone(), color: Color::Aci(b.dobject_aci),
+                                ..Layer::layer_zero()
+                            });
+                            self.history.push(format!(
+                                "    + new CAD layer '{}' (ACI {})", lname, b.dobject_aci));
+                            id
+                        }
+                    };
+                    let fit = match b.geom {
+                        BufferGeom::Lines => cad_raster::FitKind::Lines,
+                        BufferGeom::Arcs  => cad_raster::FitKind::Arcs,
+                        BufferGeom::Nurbs => cad_raster::FitKind::Nurbs,
+                    };
+                    let params = cad_raster::TraceParams { img_height: img_h, ..Default::default() };
+                    let geoms = cad_raster::trace_layer(&b.mask, &work, fit, &params);
+                    // DObjects inherit the layer colour (ByLayer) so the CAD layer
+                    // drives their appearance.
+                    let style = Style { layer: lid, color: Color::ByLayer, ..Style::default() };
+                    let n = geoms.len();
+                    for g in geoms { self.doc.push(DObject::with_style(g, style)); }
+                    grand += n;
                     self.history.push(format!(
-                        "    • {} → {} on CAD '{}' (ACI {}) — {} px carved",
-                        b.name, b.geom.label(), b.cad_layer, b.dobject_aci, b.marked()));
+                        "    • {} → {} {} on '{}'  ({} px)",
+                        b.name, n, b.geom.label(), lname, b.marked()));
                 }
-                self.history.push(
-                    "    trace engines (line/arc/NURBS fit) arrive next slice".into());
+                self.index_dirty = true;
+                self.history.push(format!(
+                    "  raster→vector: added {} DObject(s) — close this window to see them \
+                     (geometry is at ~1 unit/px near the origin).", grand));
             }
         }
         if !open {
@@ -10151,7 +10278,8 @@ impl CadApp {
                     let is_dir = md.as_ref().map(|m| m.is_dir()).unwrap_or(false);
                     if !is_dir {
                         let l = name.to_ascii_lowercase();
-                        let keep = if dlg.mode == FileDialogMode::ImportImage {
+                        let keep = if matches!(dlg.mode,
+                            FileDialogMode::ImportImage | FileDialogMode::ImportRaster) {
                             l.ends_with(".png") || l.ends_with(".jpg")
                                 || l.ends_with(".jpeg") || l.ends_with(".bmp")
                                 || l.ends_with(".tif") || l.ends_with(".tiff")
@@ -10173,9 +10301,10 @@ impl CadApp {
         }
 
         let title = match dlg.mode {
-            FileDialogMode::Open        => "Open  ·  .dxf / .rsm",
-            FileDialogMode::Save        => "Save As",
-            FileDialogMode::ImportImage => "Open Image  ·  raster → vector",
+            FileDialogMode::Open         => "Open  ·  .dxf / .rsm",
+            FileDialogMode::Save         => "Save As",
+            FileDialogMode::ImportImage  => "Open Image  ·  raster → vector",
+            FileDialogMode::ImportRaster => "Open Image  ·  raster underlay",
         };
 
         // Rebuild the preview ONLY when the selection changes — build_file_preview
@@ -10384,7 +10513,8 @@ impl CadApp {
                         .hint_text(match dlg.mode {
                             FileDialogMode::Open => "pick a file above",
                             FileDialogMode::Save => "drawing name",
-                            FileDialogMode::ImportImage => "pick an image above",
+                            FileDialogMode::ImportImage | FileDialogMode::ImportRaster
+                                => "pick an image above",
                         }));
                     if dlg.mode == FileDialogMode::Save {
                         ui.separator();
@@ -10401,9 +10531,10 @@ impl CadApp {
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let label = match dlg.mode {
-                            FileDialogMode::Open        => "Open",
-                            FileDialogMode::Save        => "Save",
-                            FileDialogMode::ImportImage => "Open",
+                            FileDialogMode::Open         => "Open",
+                            FileDialogMode::Save         => "Save",
+                            FileDialogMode::ImportImage  => "Open",
+                            FileDialogMode::ImportRaster => "Place",
                         };
                         if ui.button(egui::RichText::new(label).strong()).clicked() {
                             do_confirm = true;
@@ -10441,6 +10572,10 @@ impl CadApp {
                 FileDialogMode::ImportImage => {
                     let path = dlg.dir.join(name);
                     self.do_import_image(&path.to_string_lossy());
+                }
+                FileDialogMode::ImportRaster => {
+                    let path = dlg.dir.join(name);
+                    self.import_raster_underlay(&path.to_string_lossy());
                 }
                 FileDialogMode::Save => {
                     // Ensure the chosen extension; if the name already ends
@@ -17240,8 +17375,21 @@ impl eframe::App for CadApp {
                         ui.close_menu();
                     }
                     ui.menu_button("Import", |ui| {
-                        if ui.button("Image (raster → vector)…").clicked() {
+                        if ui.button("Image as raster (underlay)…").clicked() {
+                            self.open_file_dialog(FileDialogMode::ImportRaster, "");
+                            ui.close_menu();
+                        }
+                        if ui.button("Image → vector (trace editor)…").clicked() {
                             self.open_file_dialog(FileDialogMode::ImportImage, "");
+                            ui.close_menu();
+                        }
+                        if !self.doc.raster_images.is_empty()
+                            && ui.button(format!("Detach raster underlay(s) ({})",
+                                                 self.doc.raster_images.len())).clicked() {
+                            let n = self.doc.raster_images.len();
+                            self.snapshot_doc();
+                            self.doc.raster_images.clear();
+                            self.history.push(format!("  detached {} raster underlay(s)", n));
                             ui.close_menu();
                         }
                         // Future imports land here (PDF, SVG, point-cloud…).
@@ -18781,6 +18929,9 @@ impl eframe::App for CadApp {
         self.cmd_window_open = cmd_open;
 
         // ---- central panel: canvas --------------------------------------
+        // Keep the underlay texture cache in step with the document (covers
+        // import / detach / open / undo-redo) before the canvas draws.
+        self.sync_underlay_textures(ctx);
         egui::CentralPanel::default().show(ctx, |ui| {
             let avail = ui.available_size();
             let (resp, painter) =
@@ -18802,6 +18953,9 @@ impl eframe::App for CadApp {
             if lc.is_some() { self.last_cursor_raw_world = lc; }
 
             painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(18, 22, 28));
+
+            // ---- Reference raster underlays (behind everything) -----------
+            self.draw_raster_underlays(&painter, rect);
 
             // ---- Background grid (GrdEnb) ---------------------------------
             //

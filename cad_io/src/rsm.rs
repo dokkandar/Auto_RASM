@@ -56,15 +56,17 @@
 use cad_kernel::{
     Arc, Circle, Color, DObject, Document, Ellipse, EllipseArc, Geom, Hatch,
     HatchPattern, Layer, LayerTable, Line, Lineweight, Linetype, LinetypeTable,
-    Pen, PenTable, Point, PolyVertex, Polyline, Spline, Style, Vec2, Wall,
+    Pen, PenTable, Point, PolyVertex, Polyline, RasterImage, Spline, Style, Vec2, Wall,
 };
+use std::sync::Arc as StdArc;
 
 const MAGIC: [u8; 4] = *b"RSM\x01";
 // v2: + blocks table (after dobjects) and geom tag 12 = BlockRef. The
 // reader accepts ANY version <= VERSION and skips sections newer files
 // would have — old drawings keep loading.
 // v3: + block `smart` flag, + text/dim/wall style tables (after blocks).
-const VERSION: u16  = 3;
+// v4: + embedded raster-image underlays section (after wall styles).
+const VERSION: u16  = 4;
 
 // =============================================================================
 //   WRITER
@@ -86,8 +88,23 @@ pub fn write_rsm(doc: &Document) -> Vec<u8> {
     write_text_style_table(&mut w, &doc.text_styles);
     write_dim_style_table(&mut w, &doc.dim_styles);
     write_wall_style_table(&mut w, &doc.wall_styles);
+    write_raster_images(&mut w, &doc.raster_images);          // v4
 
     w
+}
+
+/// v4 — embedded raster underlays. Per image: name, placement (insert + world
+/// size), then the raw encoded file bytes (PNG/JPEG/…) length-prefixed.
+fn write_raster_images(w: &mut Vec<u8>, imgs: &[RasterImage]) {
+    write_u32(w, imgs.len() as u32);
+    for img in imgs {
+        write_str(w, &img.name);
+        write_vec2(w, img.insert);
+        write_f64(w, img.world_w);
+        write_f64(w, img.world_h);
+        write_u64(w, img.data.len() as u64);
+        w.extend_from_slice(&img.data);
+    }
 }
 
 /// v2 — block definitions. Per block: name, base point, then the
@@ -584,10 +601,28 @@ pub fn read_rsm(bytes: &[u8]) -> Result<Document, String> {
          cad_kernel::DimStyleTable::default(),
          cad_kernel::WallStyleTable::default())
     };
+    // v4 — embedded raster underlays. Older files have no section.
+    let raster_images = if ver >= 4 { read_raster_images(&mut r)? } else { Vec::new() };
     Ok(Document {
         dobjects, layers, linetypes, pens, truecolors,
-        text_styles, dim_styles, wall_styles, blocks,
+        text_styles, dim_styles, wall_styles, blocks, raster_images,
     })
+}
+
+/// v4 — embedded raster underlays (mirror of `write_raster_images`).
+fn read_raster_images(r: &mut R) -> Result<Vec<RasterImage>, String> {
+    let n = r.u32()? as usize;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let name    = r.str()?;
+        let insert  = r.vec2()?;
+        let world_w = r.f64()?;
+        let world_h = r.f64()?;
+        let len     = r.u64()? as usize;
+        let data    = r.take(len)?.to_vec();
+        out.push(RasterImage { name, data: StdArc::new(data), insert, world_w, world_h });
+    }
+    Ok(out)
 }
 
 fn read_color(r: &mut R, tc: &mut cad_kernel::TrueColorTable) -> Result<Color, String> {
@@ -905,6 +940,28 @@ mod tests {
     fn round_trip(doc: &Document) -> Document {
         let bytes = write_rsm(doc);
         read_rsm(&bytes).expect("rsm round-trip")
+    }
+
+    #[test]
+    fn raster_images_round_trip() {
+        // v4 — an embedded raster underlay: name, placement and raw bytes must
+        // survive the save/load byte-for-byte.
+        let mut doc = Document::default();
+        let data = vec![137u8, 80, 78, 71, 1, 2, 3, 4, 250, 0, 99];   // fake PNG-ish bytes
+        doc.raster_images.push(RasterImage {
+            name: "site_scan.png".into(),
+            data: StdArc::new(data.clone()),
+            insert: Vec2::new(-5.0, 42.0),
+            world_w: 1408.0, world_h: 768.0,
+        });
+        let back = round_trip(&doc);
+        assert_eq!(back.raster_images.len(), 1);
+        let r = &back.raster_images[0];
+        assert_eq!(r.name, "site_scan.png");
+        assert_eq!(&*r.data, &data);
+        assert_eq!(r.insert, Vec2::new(-5.0, 42.0));
+        assert_eq!(r.world_w, 1408.0);
+        assert_eq!(r.world_h, 768.0);
     }
 
     #[test]

@@ -16,9 +16,11 @@
 pub mod adjust;
 pub mod analyze;
 pub mod doc;
+pub mod fit;
 pub mod trace;
 
 pub use adjust::{AdjustKind, Adjustment};
 pub use analyze::{analyze, RasterClass, Report};
 pub use doc::{LayerKind, Mask, RasterDoc, RasterLayer};
+pub use fit::{trace_layer, FitKind, TraceParams};
 pub use trace::{convert, AssetKind};

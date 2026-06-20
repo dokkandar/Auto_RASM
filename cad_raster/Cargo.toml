@@ -11,3 +11,7 @@ cad_kernel = { path = "../cad_kernel" }
 # Pure-Rust, permissive (MIT/Apache) raster library — decode + grayscale +
 # pixel access. The high-level analysis / tracing is ours (cad_raster).
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tiff"] }
+
+[dev-dependencies]
+# Only the `trace_to_dxf` example needs the DXF writer.
+cad_io = { path = "../cad_io" }
