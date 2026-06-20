@@ -434,6 +434,50 @@ fn preview_polys(g: &Geom, blocks: &cad_kernel::BlockTable, out: &mut Vec<Vec<Ve
 
 /// Build the file-browser preview for a path: raster → texture thumbnail,
 /// drawing (.dxf/.rsm) → wireframe polylines, else Unsupported.
+/// Locate the DWG→DXF converter (RUSTCAD_DWGCONV → wrapper beside the binary →
+/// ~/.local/bin → on PATH). None if unavailable.
+fn dwg_converter() -> Option<String> {
+    if let Ok(c) = std::env::var("RUSTCAD_DWGCONV") {
+        let c = c.trim().to_string();
+        if !c.is_empty() { return Some(c); }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(repo) = exe.ancestors().nth(3) {
+            let w = repo.join("tools/dwgconv/dwgconv.sh");
+            if w.is_file() { return Some(w.to_string_lossy().to_string()); }
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let w = std::path::Path::new(&home).join(".local/bin/dwgconv");
+        if w.is_file() { return Some(w.to_string_lossy().to_string()); }
+    }
+    for name in ["dwgconv", "dwgconv.sh"] {
+        if std::process::Command::new(name).output().is_ok() {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+/// Run the converter `conv` to turn `dwg` into `out` (a .dxf). Bare-exe form is
+/// spawned directly (cross-platform); a `{in}/{out}` template runs via the shell.
+fn run_dwg_conversion(conv: &str, dwg: &str, out: &std::path::Path) -> Result<(), String> {
+    let _ = std::fs::remove_file(out);
+    let out_s = out.to_string_lossy().to_string();
+    let status = if conv.contains("{in}") {
+        let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+        let cmd = conv.replace("{in}", &q(dwg)).replace("{out}", &q(&out_s));
+        std::process::Command::new("sh").arg("-c").arg(&cmd).status()
+    } else {
+        std::process::Command::new(conv).arg(dwg).arg(&out_s).status()
+    };
+    match status {
+        Ok(_) if out.exists() => Ok(()),
+        Ok(s) => Err(format!("converter exited {s} (no DXF produced)")),
+        Err(e) => Err(format!("could not run converter '{conv}': {e}")),
+    }
+}
+
 fn build_file_preview(ctx: &egui::Context, path: &std::path::Path) -> PreviewState {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     match ext.as_str() {
@@ -462,6 +506,33 @@ fn build_file_preview(ctx: &egui::Context, path: &std::path::Path) -> PreviewSta
                     PreviewState::Drawing { polys, count: d.dobjects.len() }
                 }
                 None => PreviewState::Error("could not read drawing".into()),
+            }
+        }
+        "dwg" => {
+            // Convert to a temp DXF (separate file from the open path) then
+            // reuse the wireframe preview. Synchronous — fine for the small
+            // drawings typical here; very large files are skipped to avoid a
+            // long UI stall while arrowing through the list.
+            let big = std::fs::metadata(path).map(|m| m.len() > 40_000_000).unwrap_or(false);
+            if big { return PreviewState::Error("DWG too large to preview".into()); }
+            let Some(conv) = dwg_converter() else {
+                return PreviewState::Error("DWG preview needs the converter\n(see tools/dwgconv)".into());
+            };
+            let tmp = std::env::temp_dir().join("rustcad_preview.dxf");
+            match run_dwg_conversion(&conv, &path.to_string_lossy(), &tmp) {
+                Ok(()) => {
+                    let doc = std::fs::read_to_string(&tmp).ok()
+                        .and_then(|t| cad_io::dxf::read_dxf(&t).ok());
+                    match doc {
+                        Some(d) => {
+                            let mut polys = Vec::new();
+                            for ob in &d.dobjects { preview_polys(&ob.geom, &d.blocks, &mut polys); }
+                            PreviewState::Drawing { polys, count: d.dobjects.len() }
+                        }
+                        None => PreviewState::Error("could not read converted DXF".into()),
+                    }
+                }
+                Err(e) => PreviewState::Error(format!("DWG convert: {e}")),
             }
         }
         _ => PreviewState::Unsupported,
@@ -9852,64 +9923,16 @@ impl CadApp {
     // Slice H — File I/O (DXF for now; .rsm in Slice I)
     // ===================================================================
 
-    /// Locate the DWG→DXF converter. Priority:
-    ///  1. `$RUSTCAD_DWGCONV` — a command template containing `{in}`/`{out}`,
-    ///     or a bare executable path (in/out are appended).
-    ///  2. `dwgconv` / `dwgconv.sh` on `PATH`.
-    /// Returns None if no converter is available (DWG open then errors clearly).
-    fn dwg_converter() -> Option<String> {
-        // 1. explicit override (template with {in}/{out}, or a bare exe path)
-        if let Ok(c) = std::env::var("RUSTCAD_DWGCONV") {
-            let c = c.trim().to_string();
-            if !c.is_empty() { return Some(c); }
-        }
-        // 2. the wrapper shipped beside the binary's source tree:
-        //    <repo>/target/release/rust_cad → <repo>/tools/dwgconv/dwgconv.sh
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(repo) = exe.ancestors().nth(3) {
-                let w = repo.join("tools/dwgconv/dwgconv.sh");
-                if w.is_file() { return Some(w.to_string_lossy().to_string()); }
-            }
-        }
-        // 3. user bin
-        if let Some(home) = std::env::var_os("HOME") {
-            let w = std::path::Path::new(&home).join(".local/bin/dwgconv");
-            if w.is_file() { return Some(w.to_string_lossy().to_string()); }
-        }
-        // 4. on PATH (spawn-probe: Ok means the binary was found)
-        for name in ["dwgconv", "dwgconv.sh"] {
-            if std::process::Command::new(name).output().is_ok() {
-                return Some(name.to_string());
-            }
-        }
-        None
-    }
-
-    /// Convert a `.dwg` to a temp `.dxf` via the external converter. The bare-exe
-    /// form is spawned directly (cross-platform); a `{in}/{out}` template runs
-    /// through the shell.
+    /// Convert a `.dwg` to a temp `.dxf` via the external converter (free fns
+    /// `dwg_converter` / `run_dwg_conversion`, shared with the file-preview path).
     fn convert_dwg_to_dxf(&self, dwg: &str) -> Result<std::path::PathBuf, String> {
-        let conv = Self::dwg_converter().ok_or_else(|| {
+        let conv = dwg_converter().ok_or_else(|| {
             "no DWG converter found — set RUSTCAD_DWGCONV to \"cmd {in} {out}\" \
              or put dwgconv on PATH".to_string()
         })?;
         let out = std::env::temp_dir().join("rustcad_dwg_open.dxf");
-        let _ = std::fs::remove_file(&out);   // avoid reading a stale conversion
-        let out_s = out.to_string_lossy().to_string();
-        let status = if conv.contains("{in}") {
-            let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
-            let cmd = conv.replace("{in}", &q(dwg)).replace("{out}", &q(&out_s));
-            std::process::Command::new("sh").arg("-c").arg(&cmd).status()
-        } else {
-            std::process::Command::new(&conv).arg(dwg).arg(&out_s).status()
-        };
-        match status {
-            // Some converters return nonzero yet still emit the DXF — accept any
-            // run that produced the output file.
-            Ok(_) if out.exists() => Ok(out),
-            Ok(s) => Err(format!("converter exited {s} (no DXF produced)")),
-            Err(e) => Err(format!("could not run converter '{conv}': {e}")),
-        }
+        run_dwg_conversion(&conv, dwg, &out)?;
+        Ok(out)
     }
 
     fn do_open(&mut self, path: &str) {
@@ -9933,7 +9956,7 @@ impl CadApp {
         } else if lower.ends_with(".dwg") {
             // DWG isn't read natively — convert to DXF via the external
             // converter (ACadSharp), then parse the DXF.
-            let conv = Self::dwg_converter();
+            let conv = dwg_converter();
             crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::Note {
                 message: format!("DWG open '{}' — converter: {}", path,
                     conv.clone().unwrap_or_else(|| "<NONE FOUND>".into())),
