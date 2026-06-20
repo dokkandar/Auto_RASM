@@ -236,12 +236,35 @@ fn read_entities(pairs: &[(i32, String)], start: usize, doc: &mut Document) -> u
 /// blocks) are skipped: their geometry already lives in ENTITIES, and importing
 /// them would duplicate it. INSERTs in ENTITIES resolve to these by name.
 fn read_blocks(pairs: &[(i32, String)], start: usize, doc: &mut Document) -> usize {
+    // TWO passes so nested INSERTs resolve regardless of definition order:
+    //   pass 1 registers every real block name (empty placeholder, fixes ids);
+    //   pass 2 fills each block's base + entities (build_entity now resolves
+    //   nested INSERTs by name — forward references included).
+    // ---- pass 1: register names -----------------------------------------
+    let end;
     let mut i = start;
-    while i < pairs.len() {
+    loop {
+        if i >= pairs.len() { end = pairs.len(); break; }
         let (c, v) = &pairs[i];
-        if *c == 0 && v == "ENDSEC" { return i + 1; }
+        if *c == 0 && v == "ENDSEC" { end = i + 1; break; }
         if *c == 0 && v == "BLOCK" {
-            // ---- block header: name (2) + base point (10/20) -------------
+            let name = block_name(pairs, i + 1);
+            if is_real_block(&name) && doc.blocks.find(&name).is_none() {
+                doc.blocks.add(Block {
+                    name, base: Vec2::new(0.0, 0.0), dobjects: Vec::new(),
+                    smart: false, params: Vec::new(), cut_edges: Vec::new(),
+                });
+            }
+            i = skip_to_endblk(pairs, i + 1);
+            continue;
+        }
+        i += 1;
+    }
+    // ---- pass 2: fill base point + contained entities -------------------
+    let mut i = start;
+    while i < end {
+        let (c, v) = &pairs[i];
+        if *c == 0 && v == "BLOCK" {
             i += 1;
             let mut name = String::new();
             let mut base = Vec2::new(0.0, 0.0);
@@ -254,7 +277,6 @@ fn read_blocks(pairs: &[(i32, String)], start: usize, doc: &mut Document) -> usi
                 }
                 i += 1;
             }
-            // ---- contained entities until ENDBLK ------------------------
             let mut dobjects: Vec<DObject> = Vec::new();
             while i < pairs.len() {
                 let (c2, v2) = &pairs[i];
@@ -270,23 +292,54 @@ fn read_blocks(pairs: &[(i32, String)], start: usize, doc: &mut Document) -> usi
                         fields.push(pairs[i].clone());
                         i += 1;
                     }
+                    // build_entity resolves nested INSERTs via doc.blocks (all
+                    // names are registered now, so order doesn't matter).
                     if let Some(d) = build_entity(&kind, &fields, doc) { dobjects.push(d); }
                     continue;
                 }
                 i += 1;
             }
-            // Register real blocks only (skip * specials/anonymous + dupes).
-            if !name.is_empty() && !name.starts_with('*') && doc.blocks.find(&name).is_none() {
-                doc.blocks.add(Block {
-                    name, base, dobjects,
-                    smart: false, params: Vec::new(), cut_edges: Vec::new(),
-                });
+            if let Some(id) = doc.blocks.find(&name) {
+                doc.blocks.blocks[id as usize].base = base;
+                doc.blocks.blocks[id as usize].dobjects = dobjects;
             }
             continue;
         }
         i += 1;
     }
+    end
+}
+
+/// First `2` (name) group of a BLOCK header, scanning until the next 0-group.
+fn block_name(pairs: &[(i32, String)], start: usize) -> String {
+    let mut i = start;
+    while i < pairs.len() && pairs[i].0 != 0 {
+        if pairs[i].0 == 2 { return pairs[i].1.clone(); }
+        i += 1;
+    }
+    String::new()
+}
+
+fn skip_to_endblk(pairs: &[(i32, String)], start: usize) -> usize {
+    let mut i = start;
+    while i < pairs.len() {
+        let (c, v) = &pairs[i];
+        if *c == 0 && v == "ENDBLK" { return i + 1; }
+        if *c == 0 && v == "ENDSEC" { return i; }
+        i += 1;
+    }
     pairs.len()
+}
+
+/// Whether to import a block's geometry. Skip ONLY the model/paper-space layout
+/// records (their entities live in the ENTITIES section — importing them would
+/// duplicate). Anonymous blocks (`*U##`/`*D##`/`*X##`, used by hatches, dynamic
+/// blocks and groups) hold REAL geometry referenced by nested INSERTs, so they
+/// MUST be kept — skipping them scatters fixtures into missing parts.
+fn is_real_block(name: &str) -> bool {
+    if name.is_empty() { return false; }
+    let u = name.to_ascii_uppercase();
+    !(u.starts_with("*MODEL_SPACE") || u.starts_with("*PAPER_SPACE"))
 }
 
 fn build_entity(kind: &str, fields: &[(i32, String)], doc: &Document) -> Option<DObject> {
@@ -400,15 +453,24 @@ fn build_entity(kind: &str, fields: &[(i32, String)], doc: &Document) -> Option<
         }
         "INSERT" => {
             // Block reference: 2 = block name, 10/20 = insertion point,
-            // 41 = x-scale (used as uniform scale — BlockRef has one scale),
-            // 50 = rotation (degrees). MINSERT arrays (70/71) are ignored.
+            // 41/42 = x/y scale, 50 = rotation (degrees). MINSERT arrays
+            // (70/71) ignored. A negative axis scale = a MIRROR — encode it as
+            // a positive magnitude + mirror_x + a rotation adjustment so the
+            // |sx|==|sy| (similarity) case (the common furniture mirror) is
+            // exact. Non-uniform |sx|≠|sy| isn't modelled (uses |41|).
             let bname = fields.iter().find(|(c, _)| *c == 2).map(|(_, v)| v.clone())?;
             let block = doc.blocks.find(&bname)?;   // unknown/skipped block → drop
+            let sx = get_f(41).unwrap_or(1.0);
+            let sy = get_f(42).unwrap_or(1.0);
+            let mirror_x = (sx < 0.0) != (sy < 0.0);
+            // diag(sx,sy) with |sx|=|sy| = R(π if sy<0) · |s| · diag(mirror?-1:1, 1)
+            let extra = if sy < 0.0 { std::f64::consts::PI } else { 0.0 };
             Geom::BlockRef(BlockRef {
                 block,
                 insert:   Vec2::new(get_f(10)?, get_f(20)?),
-                scale:    get_f(41).unwrap_or(1.0),
-                rotation: get_f(50).unwrap_or(0.0).to_radians(),
+                scale:    sx.abs().max(1e-9),
+                rotation: get_f(50).unwrap_or(0.0).to_radians() + extra,
+                mirror_x,
                 param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
             })
         }
@@ -754,6 +816,52 @@ mod tests {
 0\nENDSEC\n0\nEOF\n";
         let doc = read_dxf(dxf).expect("parse");
         assert_eq!(doc.blocks.blocks.len(), 0);
+    }
+
+    #[test]
+    fn anonymous_blocks_are_kept_and_nested_insert_resolves() {
+        // *U1 is an anonymous block holding real geometry; FRAME nests an
+        // INSERT of it. Both must import and the nested ref must resolve.
+        let dxf = "\
+0\nSECTION\n2\nBLOCKS\n\
+0\nBLOCK\n2\n*U1\n10\n0.0\n20\n0.0\n\
+0\nLINE\n8\n0\n10\n0.0\n20\n0.0\n11\n1.0\n21\n0.0\n0\nENDBLK\n\
+0\nBLOCK\n2\nFRAME\n10\n0.0\n20\n0.0\n\
+0\nINSERT\n2\n*U1\n10\n5.0\n20\n0.0\n0\nENDBLK\n\
+0\nENDSEC\n\
+0\nSECTION\n2\nENTITIES\n0\nINSERT\n2\nFRAME\n10\n0.0\n20\n0.0\n0\nENDSEC\n0\nEOF\n";
+        let doc = read_dxf(dxf).expect("parse");
+        // both *U1 and FRAME imported
+        assert_eq!(doc.blocks.blocks.len(), 2);
+        let frame = doc.blocks.find("FRAME").expect("FRAME");
+        // FRAME's single contained entity is a BlockRef resolving to *U1
+        let inner = &doc.blocks.blocks[frame as usize].dobjects;
+        assert_eq!(inner.len(), 1);
+        match &inner[0].geom {
+            Geom::BlockRef(br) => assert_eq!(br.block, doc.blocks.find("*U1").unwrap()),
+            other => panic!("expected nested BlockRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn forward_referenced_nested_block_resolves() {
+        // Block A (defined FIRST) inserts B, which is defined AFTER it.
+        // Two-pass reading must still resolve A's nested insert to B.
+        let dxf = "\
+0\nSECTION\n2\nBLOCKS\n\
+0\nBLOCK\n2\nA\n10\n0.0\n20\n0.0\n\
+0\nINSERT\n2\nB\n10\n0.0\n20\n0.0\n0\nENDBLK\n\
+0\nBLOCK\n2\nB\n10\n0.0\n20\n0.0\n\
+0\nLINE\n8\n0\n10\n0.0\n20\n0.0\n11\n1.0\n21\n0.0\n0\nENDBLK\n\
+0\nENDSEC\n0\nEOF\n";
+        let doc = read_dxf(dxf).expect("parse");
+        let a = doc.blocks.find("A").expect("A");
+        let inner = &doc.blocks.blocks[a as usize].dobjects;
+        assert_eq!(inner.len(), 1, "A's forward INSERT of B should resolve");
+        match &inner[0].geom {
+            Geom::BlockRef(br) => assert_eq!(br.block, doc.blocks.find("B").unwrap()),
+            other => panic!("expected BlockRef to B, got {other:?}"),
+        }
     }
 
     #[test]

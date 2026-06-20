@@ -9848,6 +9848,66 @@ impl CadApp {
     // Slice H — File I/O (DXF for now; .rsm in Slice I)
     // ===================================================================
 
+    /// Locate the DWG→DXF converter. Priority:
+    ///  1. `$RUSTCAD_DWGCONV` — a command template containing `{in}`/`{out}`,
+    ///     or a bare executable path (in/out are appended).
+    ///  2. `dwgconv` / `dwgconv.sh` on `PATH`.
+    /// Returns None if no converter is available (DWG open then errors clearly).
+    fn dwg_converter() -> Option<String> {
+        // 1. explicit override (template with {in}/{out}, or a bare exe path)
+        if let Ok(c) = std::env::var("RUSTCAD_DWGCONV") {
+            let c = c.trim().to_string();
+            if !c.is_empty() { return Some(c); }
+        }
+        // 2. the wrapper shipped beside the binary's source tree:
+        //    <repo>/target/release/rust_cad → <repo>/tools/dwgconv/dwgconv.sh
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(repo) = exe.ancestors().nth(3) {
+                let w = repo.join("tools/dwgconv/dwgconv.sh");
+                if w.is_file() { return Some(w.to_string_lossy().to_string()); }
+            }
+        }
+        // 3. user bin
+        if let Some(home) = std::env::var_os("HOME") {
+            let w = std::path::Path::new(&home).join(".local/bin/dwgconv");
+            if w.is_file() { return Some(w.to_string_lossy().to_string()); }
+        }
+        // 4. on PATH (spawn-probe: Ok means the binary was found)
+        for name in ["dwgconv", "dwgconv.sh"] {
+            if std::process::Command::new(name).output().is_ok() {
+                return Some(name.to_string());
+            }
+        }
+        None
+    }
+
+    /// Convert a `.dwg` to a temp `.dxf` via the external converter. The bare-exe
+    /// form is spawned directly (cross-platform); a `{in}/{out}` template runs
+    /// through the shell.
+    fn convert_dwg_to_dxf(&self, dwg: &str) -> Result<std::path::PathBuf, String> {
+        let conv = Self::dwg_converter().ok_or_else(|| {
+            "no DWG converter found — set RUSTCAD_DWGCONV to \"cmd {in} {out}\" \
+             or put dwgconv on PATH".to_string()
+        })?;
+        let out = std::env::temp_dir().join("rustcad_dwg_open.dxf");
+        let _ = std::fs::remove_file(&out);   // avoid reading a stale conversion
+        let out_s = out.to_string_lossy().to_string();
+        let status = if conv.contains("{in}") {
+            let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+            let cmd = conv.replace("{in}", &q(dwg)).replace("{out}", &q(&out_s));
+            std::process::Command::new("sh").arg("-c").arg(&cmd).status()
+        } else {
+            std::process::Command::new(&conv).arg(dwg).arg(&out_s).status()
+        };
+        match status {
+            // Some converters return nonzero yet still emit the DXF — accept any
+            // run that produced the output file.
+            Ok(_) if out.exists() => Ok(out),
+            Ok(s) => Err(format!("converter exited {s} (no DXF produced)")),
+            Err(e) => Err(format!("could not run converter '{conv}': {e}")),
+        }
+    }
+
     fn do_open(&mut self, path: &str) {
         let lower = path.to_ascii_lowercase();
         let doc_result = if lower.ends_with(".dxf") {
@@ -9866,8 +9926,33 @@ impl CadApp {
                     return;
                 }
             }
+        } else if lower.ends_with(".dwg") {
+            // DWG isn't read natively — convert to DXF via the external
+            // converter (ACadSharp), then parse the DXF.
+            let conv = Self::dwg_converter();
+            crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::Note {
+                message: format!("DWG open '{}' — converter: {}", path,
+                    conv.clone().unwrap_or_else(|| "<NONE FOUND>".into())),
+            });
+            match self.convert_dwg_to_dxf(path) {
+                Ok(dxf) => match std::fs::read_to_string(&dxf) {
+                    Ok(text) => cad_io::dxf::read_dxf(&text),
+                    Err(e) => {
+                        crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::Note {
+                            message: format!("DWG open: DXF read failed: {}", e) });
+                        self.history.push(format!("  ! open '{}' failed: {}", path, e));
+                        return;
+                    }
+                },
+                Err(e) => {
+                    crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::Note {
+                        message: format!("DWG convert FAILED: {}", e) });
+                    self.history.push(format!("  ! DWG convert '{}': {}", path, e));
+                    return;
+                }
+            }
         } else {
-            Err(format!("unknown extension on '{}': expected .dxf or .rsm", path))
+            Err(format!("unknown extension on '{}': expected .dxf, .dwg or .rsm", path))
         };
         match doc_result {
             Ok(doc) => {
@@ -10294,6 +10379,9 @@ impl CadApp {
                             l.ends_with(".png") || l.ends_with(".jpg")
                                 || l.ends_with(".jpeg") || l.ends_with(".bmp")
                                 || l.ends_with(".tif") || l.ends_with(".tiff")
+                        } else if dlg.mode == FileDialogMode::Open {
+                            // .dwg opens via the external converter (→ DXF).
+                            l.ends_with(".dxf") || l.ends_with(".rsm") || l.ends_with(".dwg")
                         } else {
                             l.ends_with(".dxf") || l.ends_with(".rsm")
                         };
@@ -10312,7 +10400,7 @@ impl CadApp {
         }
 
         let title = match dlg.mode {
-            FileDialogMode::Open         => "Open  ·  .dxf / .rsm",
+            FileDialogMode::Open         => "Open  ·  .dxf / .rsm / .dwg",
             FileDialogMode::Save         => "Save As",
             FileDialogMode::ImportImage  => "Open Image  ·  raster → vector",
             FileDialogMode::ImportRaster => "Open Image  ·  raster underlay",
@@ -11834,7 +11922,7 @@ impl CadApp {
         }
         self.selection.clear();
         let geom = Geom::BlockRef(cad_kernel::BlockRef {
-            block: id, insert: base, scale: 1.0, rotation: 0.0,
+            block: id, insert: base, scale: 1.0, rotation: 0.0, mirror_x: false,
             param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
         });
         let mut d = match inst_style {
@@ -12874,7 +12962,7 @@ impl CadApp {
             // Plain block — place now, then cut the host opening (if any).
             self.snapshot_doc();
             let br = cad_kernel::BlockRef {
-                block, insert, scale: 1.0, rotation,
+                block, insert, scale: 1.0, rotation, mirror_x: false,
                 param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
             };
             self.add_dobject(Geom::BlockRef(br), "insert");
@@ -12898,7 +12986,8 @@ impl CadApp {
             if k < cad_kernel::MAX_BLOCK_PARAMS { param_values[k] = *v; }
         }
         let br = cad_kernel::BlockRef {
-            block: p.block, insert: p.insert, scale: 1.0, rotation: p.rotation, param_values,
+            block: p.block, insert: p.insert, scale: 1.0, rotation: p.rotation,
+            mirror_x: false, param_values,
         };
         self.add_dobject(Geom::BlockRef(br), "insert");
         self.apply_block_cut(br);
@@ -17722,7 +17811,7 @@ impl eframe::App for CadApp {
                         self.run_command("clear");
                         ui.close_menu();
                     }
-                    if ui.button("Open .dxf / .rsm…").clicked() {
+                    if ui.button("Open .dxf / .rsm / .dwg…").clicked() {
                         self.open_file_dialog(FileDialogMode::Open, ".dxf");
                         ui.close_menu();
                     }

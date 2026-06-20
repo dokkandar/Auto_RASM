@@ -776,6 +776,7 @@ impl Geom {
                 Geom::BlockRef(crate::block::BlockRef {
                     insert:   mirror(br.insert),
                     rotation: 2.0 * axis_angle - br.rotation,
+                    mirror_x: !br.mirror_x,   // reflecting flips the parity
                     ..*br
                 })
             }
