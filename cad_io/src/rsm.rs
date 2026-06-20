@@ -67,7 +67,8 @@ const MAGIC: [u8; 4] = *b"RSM\x01";
 // v3: + block `smart` flag, + text/dim/wall style tables (after blocks).
 // v4: + embedded raster-image underlays section (after wall styles).
 // v5: + BlockRef `mirror_x` flag (after rotation in the geom-12 record).
-const VERSION: u16  = 5;
+// v6: + BlockRef `scale_y` (after mirror_x) — per-axis scale / stretched blocks.
+const VERSION: u16  = 6;
 
 // =============================================================================
 //   WRITER
@@ -512,6 +513,7 @@ fn write_geom(w: &mut Vec<u8>, g: &Geom) {
             write_f64(w, br.scale);
             write_f64(w, br.rotation);
             write_u8(w, br.mirror_x as u8);          // v5
+            write_f64(w, br.scale_y);                // v6
         }
     }
 }
@@ -925,8 +927,9 @@ fn read_geom(r: &mut R, ver: u16) -> Result<Geom, String> {
             let scale    = r.f64()?;
             let rotation = r.f64()?;
             let mirror_x = if ver >= 5 { r.u8()? != 0 } else { false };
-            Geom::BlockRef(cad_kernel::BlockRef { block, insert, scale, rotation, mirror_x,
-                param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS] })
+            let scale_y  = if ver >= 6 { r.f64()? } else { scale };
+            Geom::BlockRef(cad_kernel::BlockRef { block, insert, scale, scale_y, rotation,
+                mirror_x, param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS] })
         }
         t => return Err(format!("RSM: unknown geom tag {}", t)),
     })
@@ -988,7 +991,7 @@ mod tests {
         let inner = vec![cad_kernel::DObject::new(Geom::BlockRef(
             cad_kernel::BlockRef {
                 block: id, insert: Vec2::new(1.0, 1.0),
-                scale: 0.5, rotation: 0.25, mirror_x: false,
+                scale: 0.5, scale_y: 0.5, rotation: 0.25, mirror_x: false,
                 param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
             }))];
         doc.blocks.add(cad_kernel::Block {
@@ -997,7 +1000,7 @@ mod tests {
         });
         doc.push(DObject::new(Geom::BlockRef(cad_kernel::BlockRef {
             block: id, insert: Vec2::new(10.0, -3.0),
-            scale: 2.0, rotation: std::f64::consts::FRAC_PI_4, mirror_x: true,
+            scale: 2.0, scale_y: 1.5, rotation: std::f64::consts::FRAC_PI_4, mirror_x: true,
             param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
         })));
 
@@ -1017,6 +1020,7 @@ mod tests {
         assert_eq!(br.block, id);
         assert!((br.insert - Vec2::new(10.0, -3.0)).len() < 1e-12);
         assert!((br.scale - 2.0).abs() < 1e-12);
+        assert!((br.scale_y - 1.5).abs() < 1e-12, "scale_y must survive the v6 round-trip");
         assert!((br.rotation - std::f64::consts::FRAC_PI_4).abs() < 1e-12);
         assert!(br.mirror_x, "mirror_x must survive the v5 round-trip");
         assert!(!nb.mirror_x, "nested instance was not mirrored");

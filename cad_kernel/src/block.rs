@@ -37,9 +37,13 @@ pub struct BlockRef {
     pub block:    u32,
     /// World-space insertion point (where the definition's base lands).
     pub insert:   Vec2,
-    /// Uniform scale MAGNITUDE (> 0). A reflected instance keeps a positive
+    /// X-axis scale MAGNITUDE (> 0). A reflected instance keeps a positive
     /// scale and sets `mirror_x` instead (so circles/arcs stay correct).
     pub scale:    f64,
+    /// Y-axis scale MAGNITUDE (> 0). Equals `scale` for a uniform instance;
+    /// when it differs (a stretched block) circles/arcs become ellipses on
+    /// insert/explode. From DXF group 42.
+    pub scale_y:  f64,
     /// Rotation in radians, CCW.
     pub rotation: f64,
     /// Mirrored: reflect the definition across its local Y axis (through the
@@ -106,7 +110,7 @@ impl BlockRef {
         } else {
             g
         };
-        src.scaled(base, self.scale)
+        src.scaled_xy(base, self.scale, self.scale_y)
             .rotated(base, self.rotation)
             .translated(self.insert - base)
     }
@@ -183,7 +187,7 @@ mod tests {
         let br = BlockRef {
             block: 0,
             insert: Vec2::new(10.0, 10.0),
-            scale: 2.0,
+            scale: 2.0, scale_y: 2.0,
             rotation: std::f64::consts::FRAC_PI_2,
             mirror_x: false,
             param_values: [0.0; MAX_BLOCK_PARAMS],
@@ -201,7 +205,7 @@ mod tests {
         let br = BlockRef {
             block: 0,
             insert: Vec2::new(5.0, 0.0),
-            scale: 3.0,
+            scale: 3.0, scale_y: 3.0,
             rotation: 1.234,
             mirror_x: false,
             param_values: [0.0; MAX_BLOCK_PARAMS],
@@ -219,12 +223,31 @@ mod tests {
         // base BEFORE scale/rotation. base=(0,0), no scale/rotation/insert:
         // line (1,0)→(2,0) ⇒ (-1,0)→(-2,0).
         let br = BlockRef {
-            block: 0, insert: Vec2::new(0.0, 0.0), scale: 1.0, rotation: 0.0,
+            block: 0, insert: Vec2::new(0.0, 0.0), scale: 1.0, scale_y: 1.0, rotation: 0.0,
             mirror_x: true, param_values: [0.0; MAX_BLOCK_PARAMS],
         };
         let g = Geom::Line(Line { a: Vec2::new(1.0, 0.0), b: Vec2::new(2.0, 0.0) });
         let Geom::Line(l) = br.transform_geom(&g, Vec2::new(0.0, 0.0)) else { panic!() };
         assert!(close(l.a, Vec2::new(-1.0, 0.0)), "a={:?}", l.a);
         assert!(close(l.b, Vec2::new(-2.0, 0.0)), "b={:?}", l.b);
+    }
+
+    #[test]
+    fn nonuniform_scale_turns_circle_into_ellipse() {
+        // A block inserted with scale (2,1) stretches a unit circle into an
+        // ellipse: semi-major 2 along x, ratio 0.5 (LibreCAD parity).
+        let br = BlockRef {
+            block: 0, insert: Vec2::new(0.0, 0.0), scale: 2.0, scale_y: 1.0,
+            rotation: 0.0, mirror_x: false, param_values: [0.0; MAX_BLOCK_PARAMS],
+        };
+        let g = Geom::Circle(Circle { center: Vec2::new(0.0, 0.0), radius: 1.0 });
+        match br.transform_geom(&g, Vec2::new(0.0, 0.0)) {
+            Geom::Ellipse(e) => {
+                assert!((e.major.len() - 2.0).abs() < 1e-9, "major={:?}", e.major);
+                assert!((e.ratio - 0.5).abs() < 1e-9, "ratio={}", e.ratio);
+                assert!(e.major.y.abs() < 1e-9, "major should lie on x: {:?}", e.major);
+            }
+            other => panic!("expected ellipse, got {other:?}"),
+        }
     }
 }

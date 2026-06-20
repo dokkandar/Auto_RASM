@@ -462,13 +462,15 @@ fn build_entity(kind: &str, fields: &[(i32, String)], doc: &Document) -> Option<
             let block = doc.blocks.find(&bname)?;   // unknown/skipped block → drop
             let sx = get_f(41).unwrap_or(1.0);
             let sy = get_f(42).unwrap_or(1.0);
+            // Factor signs out into mirror_x + a π rotation; the per-axis
+            // MAGNITUDES go to scale / scale_y (non-uniform → ellipses).
             let mirror_x = (sx < 0.0) != (sy < 0.0);
-            // diag(sx,sy) with |sx|=|sy| = R(π if sy<0) · |s| · diag(mirror?-1:1, 1)
             let extra = if sy < 0.0 { std::f64::consts::PI } else { 0.0 };
             Geom::BlockRef(BlockRef {
                 block,
                 insert:   Vec2::new(get_f(10)?, get_f(20)?),
                 scale:    sx.abs().max(1e-9),
+                scale_y:  sy.abs().max(1e-9),
                 rotation: get_f(50).unwrap_or(0.0).to_radians() + extra,
                 mirror_x,
                 param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],

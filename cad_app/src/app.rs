@@ -9766,7 +9766,11 @@ impl CadApp {
                     if resp.changed() {
                         self.props_gesture_snapshot(&resp);
                         self.props_apply(targets, false, |d| {
-                            if let Geom::BlockRef(b) = &mut d.geom { b.scale = sc; } });
+                            if let Geom::BlockRef(b) = &mut d.geom {
+                                // Keep the block's aspect ratio when rescaling.
+                                let r = if b.scale.abs() > 1e-12 { b.scale_y / b.scale } else { 1.0 };
+                                b.scale = sc; b.scale_y = sc * r;
+                            } });
                     } else { self.props_gesture_snapshot(&resp); }
                     ui.end_row();
 
@@ -11922,7 +11926,7 @@ impl CadApp {
         }
         self.selection.clear();
         let geom = Geom::BlockRef(cad_kernel::BlockRef {
-            block: id, insert: base, scale: 1.0, rotation: 0.0, mirror_x: false,
+            block: id, insert: base, scale: 1.0, scale_y: 1.0, rotation: 0.0, mirror_x: false,
             param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
         });
         let mut d = match inst_style {
@@ -12962,7 +12966,7 @@ impl CadApp {
             // Plain block — place now, then cut the host opening (if any).
             self.snapshot_doc();
             let br = cad_kernel::BlockRef {
-                block, insert, scale: 1.0, rotation, mirror_x: false,
+                block, insert, scale: 1.0, scale_y: 1.0, rotation, mirror_x: false,
                 param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
             };
             self.add_dobject(Geom::BlockRef(br), "insert");
@@ -12986,7 +12990,7 @@ impl CadApp {
             if k < cad_kernel::MAX_BLOCK_PARAMS { param_values[k] = *v; }
         }
         let br = cad_kernel::BlockRef {
-            block: p.block, insert: p.insert, scale: 1.0, rotation: p.rotation,
+            block: p.block, insert: p.insert, scale: 1.0, scale_y: 1.0, rotation: p.rotation,
             mirror_x: false, param_values,
         };
         self.add_dobject(Geom::BlockRef(br), "insert");

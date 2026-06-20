@@ -507,6 +507,79 @@ pub enum Geom {
 
 impl Geom {
     /// Return a copy rotated by `angle` radians around `pivot` (CCW).
+    /// Non-uniform scale about `pivot` by POSITIVE magnitudes (sx, sy). Signs
+    /// (mirroring) are handled by the caller (block insert) via a reflection +
+    /// rotation, so this never reflects. When sx≈sy it's a uniform scale
+    /// (delegates to `scaled`, keeping circles/arcs). When they differ a
+    /// circle/arc/ellipse becomes an ellipse / elliptical-arc — matching
+    /// AutoCAD/LibreCAD block-insert behaviour for stretched blocks.
+    pub fn scaled_xy(&self, pivot: Vec2, sx: f64, sy: f64) -> Geom {
+        if (sx - sy).abs() < 1e-9 { return self.scaled(pivot, sx); }
+        let sc  = |p: Vec2| Vec2::new(pivot.x + (p.x - pivot.x) * sx,
+                                      pivot.y + (p.y - pivot.y) * sy);
+        let scd = |v: Vec2| Vec2::new(v.x * sx, v.y * sy);   // linear part (no shift)
+        // Two CONJUGATE semi-diameters u,v (point = cos t·u + sin t·v) → axis
+        // form: (major vector, ratio, param phase). The image param t maps to
+        // ellipse param (t − phase). sx,sy>0 ⇒ orientation preserved.
+        let to_axes = |u: Vec2, v: Vec2| -> (Vec2, f64, f64) {
+            let (a, b, c) = (u.dot(u), v.dot(v), u.dot(v));
+            let sstar = 0.5 * (2.0 * c).atan2(a - b);
+            let pp = |s: f64| u * s.cos() + v * s.sin();
+            let (mut major, mut minor, mut phase) =
+                (pp(sstar), pp(sstar + std::f64::consts::FRAC_PI_2), sstar);
+            if minor.len() > major.len() {
+                std::mem::swap(&mut major, &mut minor);
+                phase += std::f64::consts::FRAC_PI_2;
+            }
+            let ratio = (minor.len() / major.len().max(1e-12)).clamp(1e-6, 1.0);
+            (major, ratio, phase)
+        };
+        match self {
+            Geom::Line(l) => Geom::Line(Line { a: sc(l.a), b: sc(l.b) }),
+            Geom::Point(pt) => Geom::Point(Point { location: sc(pt.location),
+                style: pt.style, size: pt.size }),
+            Geom::Polyline(p) => Geom::Polyline(Polyline {
+                vertices: p.vertices.iter()
+                    .map(|v| PolyVertex { pos: sc(v.pos), bulge: v.bulge }).collect(),
+                closed: p.closed }),
+            Geom::Spline(s) => Geom::Spline(Spline { degree: s.degree,
+                control_points: s.control_points.iter().map(|p| sc(*p)).collect(),
+                weights: s.weights.clone() }),
+            Geom::Circle(c) => {
+                let (major, ratio, _) = to_axes(
+                    Vec2::new(sx * c.radius, 0.0), Vec2::new(0.0, sy * c.radius));
+                Geom::Ellipse(Ellipse { center: sc(c.center), major, ratio })
+            }
+            Geom::Arc(arc) => {
+                let (major, ratio, phase) = to_axes(
+                    Vec2::new(sx * arc.radius, 0.0), Vec2::new(0.0, sy * arc.radius));
+                Geom::EllipseArc(EllipseArc {
+                    ellipse: Ellipse { center: sc(arc.center), major, ratio },
+                    start_param: arc.start_angle - phase, sweep_param: arc.sweep_angle })
+            }
+            Geom::Ellipse(e) => {
+                let (major, ratio, _) = to_axes(scd(e.major), scd(e.major.perp() * e.ratio));
+                Geom::Ellipse(Ellipse { center: sc(e.center), major, ratio })
+            }
+            Geom::EllipseArc(ea) => {
+                let (major, ratio, phase) =
+                    to_axes(scd(ea.ellipse.major), scd(ea.ellipse.major.perp() * ea.ellipse.ratio));
+                Geom::EllipseArc(EllipseArc {
+                    ellipse: Ellipse { center: sc(ea.ellipse.center), major, ratio },
+                    start_param: ea.start_param - phase, sweep_param: ea.sweep_param })
+            }
+            Geom::Dimension(d) => Geom::Dimension(d.with_points_mapped(sc)),
+            Geom::Hatch(h) => Geom::Hatch(h.clone()),
+            // Best-effort for the rare cases — non-uniform on these is approximate.
+            Geom::Wall(w) => Geom::Wall(Wall { start: sc(w.start), end: sc(w.end),
+                thickness: w.thickness * 0.5 * (sx + sy), style: w.style, bulge: w.bulge }),
+            Geom::Text(t) => { let mut nt = t.clone(); nt.position = sc(t.position);
+                nt.height *= sy; Geom::Text(nt) }
+            Geom::BlockRef(br) => Geom::BlockRef(crate::block::BlockRef {
+                insert: sc(br.insert), scale: br.scale * sx, scale_y: br.scale_y * sy, ..*br }),
+        }
+    }
+
     pub fn rotated(&self, pivot: Vec2, angle: f64) -> Geom {
         let c = angle.cos();
         let s = angle.sin();
@@ -671,7 +744,8 @@ impl Geom {
             // thickness; negative factors don't reflect a block in v1).
             Geom::BlockRef(br) => Geom::BlockRef(crate::block::BlockRef {
                 insert: sc(br.insert),
-                scale:  br.scale * f_abs,
+                scale:   br.scale   * f_abs,
+                scale_y: br.scale_y * f_abs,
                 ..*br
             }),
         }
