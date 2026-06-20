@@ -128,7 +128,7 @@ logic in the feature crate, and egui only in the app.
 | `cad_wall`   | Architectural wall command (chained draw, junctions, openings) | **none** |
 | `cad_raster` | Raster→vector: layer stack, adjustments, convertibility analysis, trace dispatch | `image` |
 | `cad_cli`    | Headless command pipe for inspecting kernel output | **none** |
-| `cad_app`    | The GPU application: eframe/egui + glow renderer, all interaction | `eframe`, `egui`, `egui_glow`, `glow`, `image`, `rfd` |
+| `cad_app`    | The GPU application: eframe/egui + glow renderer, all interaction | `eframe`, `egui`, `egui_glow`, `glow`, `image` |
 
 ~43k lines of Rust across the workspace.
 
@@ -154,7 +154,7 @@ cargo test
 cargo run -p cad_cli
 ```
 
-The app uses egui + glow and runs under both Wayland and X11.
+The app uses egui + glow and runs on Linux (Wayland / X11) and Windows.
 
 ---
 
