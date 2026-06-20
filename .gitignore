@@ -7,3 +7,6 @@
 # "Save mapping" in the picker. Per-user, not per-codebase.
 /aci_mapping.json
 target-docker/
+
+# Local build / install logs captured during dev iteration (not source).
+*.log
