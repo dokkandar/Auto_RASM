@@ -20,7 +20,8 @@
 use cad_kernel::{Document, Geom};
 
 /// DXF entity names RUST_CAD's `read_dxf` currently turns into geometry.
-const SUPPORTED: &[&str] = &["LINE", "CIRCLE", "ARC", "ELLIPSE", "POINT", "LWPOLYLINE"];
+/// (INSERT → BlockRef, with the BLOCKS section parsed into the block table.)
+const SUPPORTED: &[&str] = &["LINE", "CIRCLE", "ARC", "ELLIPSE", "POINT", "LWPOLYLINE", "INSERT"];
 
 /// Common DXF entity names we tally when scanning a file (everything not in
 /// SUPPORTED is reported as DROPPED, so we can see what coverage is missing).

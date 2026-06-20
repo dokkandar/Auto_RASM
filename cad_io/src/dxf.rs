@@ -13,8 +13,8 @@
 // and AutoCAD.
 
 use cad_kernel::{
-    Arc, Circle, Color, DObject, Document, Ellipse, EllipseArc, Geom, Layer,
-    Line, Lineweight, Linetype, LinetypeTable, Point, PolyVertex,
+    Arc, Block, BlockRef, Circle, Color, DObject, Document, Ellipse, EllipseArc,
+    Geom, Layer, Line, Lineweight, Linetype, LinetypeTable, Point, PolyVertex,
     Polyline, Vec2,
 };
 
@@ -36,6 +36,9 @@ pub fn read_dxf(text: &str) -> Result<Document, String> {
             if *c2 == 2 {
                 match name.as_str() {
                     "TABLES"   => i = read_tables(&pairs, i + 2, &mut doc),
+                    // BLOCKS precedes ENTITIES in the file, so block defs land
+                    // in the table before any INSERT in ENTITIES resolves them.
+                    "BLOCKS"   => i = read_blocks(&pairs, i + 2, &mut doc),
                     "ENTITIES" => i = read_entities(&pairs, i + 2, &mut doc),
                     _ => i = skip_to_endsec(&pairs, i + 2),
                 }
@@ -226,6 +229,66 @@ fn read_entities(pairs: &[(i32, String)], start: usize, doc: &mut Document) -> u
     pairs.len()
 }
 
+/// Read the BLOCKS section into `doc.blocks`. Each `BLOCK … ENDBLK` becomes a
+/// `Block` (name + base point + contained entities, parsed with `build_entity`,
+/// so nested INSERTs and every supported geom work). Special/anonymous records
+/// (names starting with `*` — *Model_Space, *Paper_Space, *U### hatch/dim
+/// blocks) are skipped: their geometry already lives in ENTITIES, and importing
+/// them would duplicate it. INSERTs in ENTITIES resolve to these by name.
+fn read_blocks(pairs: &[(i32, String)], start: usize, doc: &mut Document) -> usize {
+    let mut i = start;
+    while i < pairs.len() {
+        let (c, v) = &pairs[i];
+        if *c == 0 && v == "ENDSEC" { return i + 1; }
+        if *c == 0 && v == "BLOCK" {
+            // ---- block header: name (2) + base point (10/20) -------------
+            i += 1;
+            let mut name = String::new();
+            let mut base = Vec2::new(0.0, 0.0);
+            while i < pairs.len() && pairs[i].0 != 0 {
+                match pairs[i].0 {
+                    2  => name   = pairs[i].1.clone(),
+                    10 => base.x = pairs[i].1.parse().unwrap_or(0.0),
+                    20 => base.y = pairs[i].1.parse().unwrap_or(0.0),
+                    _  => {}
+                }
+                i += 1;
+            }
+            // ---- contained entities until ENDBLK ------------------------
+            let mut dobjects: Vec<DObject> = Vec::new();
+            while i < pairs.len() {
+                let (c2, v2) = &pairs[i];
+                if *c2 == 0 && (v2 == "ENDBLK" || v2 == "ENDSEC") {
+                    if v2 == "ENDBLK" { i += 1; }
+                    break;
+                }
+                if *c2 == 0 {
+                    let kind = v2.clone();
+                    i += 1;
+                    let mut fields: Vec<(i32, String)> = Vec::new();
+                    while i < pairs.len() && pairs[i].0 != 0 {
+                        fields.push(pairs[i].clone());
+                        i += 1;
+                    }
+                    if let Some(d) = build_entity(&kind, &fields, doc) { dobjects.push(d); }
+                    continue;
+                }
+                i += 1;
+            }
+            // Register real blocks only (skip * specials/anonymous + dupes).
+            if !name.is_empty() && !name.starts_with('*') && doc.blocks.find(&name).is_none() {
+                doc.blocks.add(Block {
+                    name, base, dobjects,
+                    smart: false, params: Vec::new(), cut_edges: Vec::new(),
+                });
+            }
+            continue;
+        }
+        i += 1;
+    }
+    pairs.len()
+}
+
 fn build_entity(kind: &str, fields: &[(i32, String)], doc: &Document) -> Option<DObject> {
     let mut layer_name = String::new();
     let mut color: Option<Color> = None;
@@ -334,6 +397,20 @@ fn build_entity(kind: &str, fields: &[(i32, String)], doc: &Document) -> Option<
             }
             if vertices.is_empty() { return None; }
             Geom::Polyline(Polyline { vertices, closed })
+        }
+        "INSERT" => {
+            // Block reference: 2 = block name, 10/20 = insertion point,
+            // 41 = x-scale (used as uniform scale — BlockRef has one scale),
+            // 50 = rotation (degrees). MINSERT arrays (70/71) are ignored.
+            let bname = fields.iter().find(|(c, _)| *c == 2).map(|(_, v)| v.clone())?;
+            let block = doc.blocks.find(&bname)?;   // unknown/skipped block → drop
+            Geom::BlockRef(BlockRef {
+                block,
+                insert:   Vec2::new(get_f(10)?, get_f(20)?),
+                scale:    get_f(41).unwrap_or(1.0),
+                rotation: get_f(50).unwrap_or(0.0).to_radians(),
+                param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
+            })
         }
         _ => return None,   // unknown entity type — silently skip
     };
@@ -636,6 +713,47 @@ mod tests {
         // Layer "0" + 3 default linetypes round-trip.
         assert_eq!(back.layers.len(), doc.layers.len());
         assert!(back.dobjects.is_empty());
+    }
+
+    #[test]
+    fn block_and_insert_are_read() {
+        // BLOCKS section defines CHAIR (one line); ENTITIES has an INSERT of it.
+        let dxf = "\
+0\nSECTION\n2\nBLOCKS\n\
+0\nBLOCK\n2\nCHAIR\n10\n0.0\n20\n0.0\n\
+0\nLINE\n8\n0\n10\n0.0\n20\n0.0\n11\n4.0\n21\n0.0\n\
+0\nENDBLK\n\
+0\nENDSEC\n\
+0\nSECTION\n2\nENTITIES\n\
+0\nINSERT\n2\nCHAIR\n8\n0\n10\n10.0\n20\n5.0\n41\n2.0\n50\n90.0\n\
+0\nENDSEC\n0\nEOF\n";
+        let doc = read_dxf(dxf).expect("parse");
+        // The block definition landed in the table with its one line.
+        assert_eq!(doc.blocks.blocks.len(), 1);
+        let bid = doc.blocks.find("CHAIR").expect("CHAIR block");
+        assert_eq!(doc.blocks.blocks[bid as usize].dobjects.len(), 1);
+        // The INSERT became a BlockRef with the right transform.
+        assert_eq!(doc.dobjects.len(), 1);
+        match &doc.dobjects[0].geom {
+            Geom::BlockRef(br) => {
+                assert_eq!(br.block, bid);
+                assert_eq!(br.insert, Vec2::new(10.0, 5.0));
+                assert_eq!(br.scale, 2.0);
+                assert!((br.rotation - std::f64::consts::FRAC_PI_2).abs() < 1e-9);
+            }
+            other => panic!("expected BlockRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn special_blocks_are_skipped() {
+        // *Model_Space etc. must NOT be imported as blocks (would duplicate).
+        let dxf = "\
+0\nSECTION\n2\nBLOCKS\n\
+0\nBLOCK\n2\n*Model_Space\n10\n0.0\n20\n0.0\n0\nENDBLK\n\
+0\nENDSEC\n0\nEOF\n";
+        let doc = read_dxf(dxf).expect("parse");
+        assert_eq!(doc.blocks.blocks.len(), 0);
     }
 
     #[test]
