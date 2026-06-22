@@ -10418,6 +10418,10 @@ impl CadApp {
         if !self.parametric.active { return; }
         use crate::param_editor::CRef;
 
+        // Drop constraints whose geometry has been deleted (handles gone) so old
+        // edits don't linger and make every solve "apply to everything".
+        crate::param_editor::prune_constraints(&self.doc, &mut self.parametric.constraints);
+
         // ---- recompute the DOF diagnosis for this frame (drives the readout +
         //      the blue/green canvas overlay). Cheap for small sketches. ----
         let (rep, defined) = crate::param_editor::analyze_doc(&self.doc, &self.parametric);
@@ -10433,6 +10437,7 @@ impl CadApp {
 
         let mut add: Option<CRef> = None;
         let mut remove_var: Option<String> = None;
+        let mut remove_constraint: Option<usize> = None;
         let mut add_var = false;
         let (mut do_solve, mut clear_c, mut close) = (false, false, false);
 
@@ -10608,9 +10613,12 @@ impl CadApp {
                     // ===== constraint list =====
                     ui.add_space(6.0);
                     ui.separator();
-                    ui.label(format!("constraints ({})", self.parametric.constraints.len()));
+                    ui.label(format!("constraints ({}) — only these are applied", self.parametric.constraints.len()));
                     for (i, c) in self.parametric.constraints.iter().enumerate() {
-                        ui.small(format!("{}. {}", i + 1, c.label()));
+                        ui.horizontal(|ui| {
+                            if ui.small_button("✖").clicked() { remove_constraint = Some(i); }
+                            ui.small(format!("{}. {}", i + 1, c.label()));
+                        });
                     }
                 });
 
@@ -10639,10 +10647,25 @@ impl CadApp {
             self.parametric.vars.remove(&name);
         }
 
+        // Removing a single constraint re-solves with the rest.
+        if let Some(i) = remove_constraint {
+            if i < self.parametric.constraints.len() {
+                let lbl = self.parametric.constraints[i].label();
+                self.parametric.constraints.remove(i);
+                self.parametric.status = format!("removed: {lbl}");
+                do_solve = true;
+            }
+        }
+
+        // `just_added` tracks whether THIS frame added a constraint — only then
+        // do we roll back on non-convergence (a fresh constraint that conflicts).
+        let mut just_added_label: Option<String> = None;
         if let Some(c) = add {
+            let lbl = c.label();
             crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::Note {
-                message: format!("param: + {} (lines={}, circles={})", c.label(), lines.len(), circles.len()) });
+                message: format!("param: + {} (lines={}, circles={})", lbl, lines.len(), circles.len()) });
             self.parametric.constraints.push(c);
+            just_added_label = Some(lbl);
             do_solve = true;   // auto-solve so the constraint takes effect immediately
         }
         if clear_c {
@@ -10650,12 +10673,29 @@ impl CadApp {
             self.parametric.status = "constraints cleared".into();
         }
         if do_solve {
+            // keep a clean copy so a conflicting constraint can be rolled back
+            // WITHOUT leaving the geometry half-solved ("half is gone").
+            let before = self.doc.clone();
             self.snapshot_doc();
-            let msg = crate::param_editor::solve_doc(&mut self.doc, &self.parametric);
-            crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::Note {
-                message: format!("param solve: {}", msg) });
-            self.history.push(format!("  parametric: {}", msg));
-            self.parametric.status = msg;
+            let out = crate::param_editor::solve_doc(&mut self.doc, &self.parametric);
+
+            if let (Some(lbl), false) = (just_added_label.as_ref(), out.converged) {
+                // The just-added constraint conflicts / over-defines the sketch.
+                // Restore geometry, drop the constraint, and undo the snapshot so
+                // history stays clean (SolidWorks: "would over-define the sketch").
+                self.doc = before;
+                self.undo_stack.pop();
+                self.parametric.constraints.pop();
+                let msg = format!("⚠ '{lbl}' conflicts / over-defines — NOT applied (use ✖ to free up constraints first)");
+                crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::Note {
+                    message: format!("param solve: rejected {lbl} (rms NOT converged)") });
+                self.parametric.status = msg;
+            } else {
+                crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::Note {
+                    message: format!("param solve: {}", out.msg) });
+                self.history.push(format!("  parametric: {}", out.msg));
+                self.parametric.status = out.msg;
+            }
             self.index_dirty = true;
             self.gpu_dirty = true;
         }

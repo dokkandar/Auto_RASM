@@ -15,7 +15,7 @@
 
 use cad_kernel::{dobject::Handle, Document, Geom, Vec2};
 use cad_param::{dof_analysis, solve, Constraint, DofReport, Sketch, VarTable};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// A user constraint, referencing drawing geometry by stable handle. Mixed
 /// (line/circle) refs like `Tangent` are disambiguated by geometry kind at solve
@@ -55,6 +55,40 @@ impl CRef {
             CRef::Tangent(..) => "tangent".into(),
         }
     }
+
+    /// Every drawing handle this constraint references (for pruning constraints
+    /// whose geometry has been deleted).
+    pub fn handles(&self) -> Vec<Handle> {
+        match *self {
+            CRef::Horizontal(h) | CRef::Vertical(h) | CRef::Length(h, _) | CRef::Radius(h, _) => vec![h],
+            CRef::Parallel(a, b)
+            | CRef::Perpendicular(a, b)
+            | CRef::Collinear(a, b)
+            | CRef::Equal(a, b)
+            | CRef::Angle(a, b, _)
+            | CRef::Concentric(a, b)
+            | CRef::EqualRadius(a, b)
+            | CRef::Tangent(a, b) => vec![a, b],
+        }
+    }
+}
+
+/// Outcome of [`solve_doc`] — message plus whether the solve converged (the UI
+/// rolls a just-added constraint back when it does not).
+pub struct SolveOutcome {
+    pub msg: String,
+    pub converged: bool,
+}
+
+/// Remove constraints that reference geometry no longer in the drawing (handles
+/// from deleted/replaced dobjects). Without this, constraints from earlier edits
+/// linger forever and make every solve look like it "applies to everything".
+/// Returns how many were dropped.
+pub fn prune_constraints(doc: &Document, constraints: &mut Vec<CRef>) -> usize {
+    let present: HashSet<Handle> = doc.dobjects.iter().map(|d| d.handle).collect();
+    let before = constraints.len();
+    constraints.retain(|c| c.handles().iter().all(|h| present.contains(h)));
+    before - constraints.len()
 }
 
 /// Per-session parametric state held by the app. `active` gates the panel +
@@ -248,11 +282,15 @@ fn pair(m: &HashMap<Handle, usize>, a: Handle, b: Handle) -> Option<(usize, usiz
 }
 
 /// Build the sketch, apply constraints, solve, and write solved geometry back
-/// into the drawing (lines AND circles). Returns a status string.
-pub fn solve_doc(doc: &mut Document, session: &ParamSession) -> String {
+/// into the drawing (lines AND circles). Returns the outcome (message +
+/// convergence) so the caller can roll a conflicting constraint back.
+pub fn solve_doc(doc: &mut Document, session: &ParamSession) -> SolveOutcome {
     let mut map = build_doc_map(doc);
     if map.sk.lines.is_empty() && map.sk.circles.is_empty() {
-        return "parametric: no line/circle geometry to solve".into();
+        return SolveOutcome {
+            msg: "parametric: no line/circle geometry to solve".into(),
+            converged: true,
+        };
     }
     let resolved = apply_constraints(&mut map, doc, session);
     let rep = solve(&mut map.sk);
@@ -277,15 +315,17 @@ pub fn solve_doc(doc: &mut Document, session: &ParamSession) -> String {
     }
 
     let n_geom = map.sk.lines.len() + map.sk.circles.len();
-    format!(
+    let total = session.constraints.len();
+    let msg = format!(
         "solved {} entit{}: {}/{} constraints applied · rms={:.2e}{}",
         n_geom,
         if n_geom == 1 { "y" } else { "ies" },
         resolved,
-        session.constraints.len(),
+        total,
         rep.residual,
         if rep.converged { "" } else { "  (NOT converged)" }
-    )
+    );
+    SolveOutcome { msg, converged: rep.converged }
 }
 
 /// Compute the degrees-of-freedom diagnosis WITHOUT moving geometry, plus a
@@ -327,9 +367,38 @@ mod tests {
         let h0 = add_line(&mut doc, Vec2::new(0.0, 0.0), Vec2::new(10.0, 5.0));
         let mut sess = ParamSession::new();
         sess.constraints.push(CRef::Horizontal(h0));
-        let msg = solve_doc(&mut doc, &sess);
+        let out = solve_doc(&mut doc, &sess);
         let Geom::Line(l) = &doc.dobjects[0].geom else { panic!() };
-        assert!((l.a.y - l.b.y).abs() < 1e-6, "not horizontal ({msg})");
+        assert!((l.a.y - l.b.y).abs() < 1e-6, "not horizontal ({})", out.msg);
+    }
+
+    #[test]
+    fn prune_drops_constraints_for_deleted_geometry() {
+        let mut doc = Document::default();
+        let h0 = add_line(&mut doc, Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0));
+        let h1 = add_line(&mut doc, Vec2::new(0.0, 0.0), Vec2::new(0.0, 10.0));
+        let mut sess = ParamSession::new();
+        sess.constraints.push(CRef::Horizontal(h0));
+        sess.constraints.push(CRef::Vertical(h1));
+        // delete the second line
+        doc.dobjects.retain(|d| d.handle == h0);
+        let dropped = prune_constraints(&doc, &mut sess.constraints);
+        assert_eq!(dropped, 1);
+        assert_eq!(sess.constraints.len(), 1);
+    }
+
+    #[test]
+    fn conflicting_h_v_does_not_converge() {
+        // horizontal + vertical on the SAME line is impossible (non-degenerate)
+        // — solve_doc must report non-convergence so the UI can roll it back.
+        let mut doc = Document::default();
+        let h0 = add_line(&mut doc, Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0));
+        let mut sess = ParamSession::new();
+        sess.constraints.push(CRef::Horizontal(h0));
+        sess.constraints.push(CRef::Length(h0, 120.0));
+        sess.constraints.push(CRef::Vertical(h0));
+        let out = solve_doc(&mut doc, &sess);
+        assert!(!out.converged, "should NOT converge: {}", out.msg);
     }
 
     #[test]
