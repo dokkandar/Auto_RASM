@@ -1126,9 +1126,10 @@ pub struct CadApp {
     /// open. While set, the main canvas pointer interaction is GATED OFF so
     /// nothing bleeds into the main screen. See `BlockEditor`.
     block_editor:   Option<BlockEditor>,
-    /// Parametric sketch editor (cad_param constraint solver). Isolated module;
-    /// `Some` while the parametric panel is open. See `param_editor.rs`.
-    param_editor:   Option<crate::param_editor::ParamEditor>,
+    /// Parametric MODE state (cad_param constraint solver). The normal tools
+    /// draw into the drawing; this adds a constraint layer + Solve. See
+    /// `param_editor.rs`. `active` gates the Parametric panel.
+    parametric:     crate::param_editor::ParamSession,
     /// Active prompt-driven command flow (AutoCAD-style prompt sequence).
     /// `Some` while a command like CIRCLE is collecting its inputs. See
     /// `CmdFlow` + COMMAND_LINE.md.
@@ -2541,7 +2542,7 @@ impl Default for CadApp {
             dist_state:     DistState::Off,
             props_edit_gesture: false,
             block_editor:   None,
-            param_editor:   None,
+            parametric:     crate::param_editor::ParamSession::new(),
             cmd_flow:       None,
             transcript:     Vec::new(),
             draft_preview:  true,
@@ -10389,6 +10390,104 @@ impl CadApp {
         self.raster_editor = Some(ed);
     }
 
+    /// Handles of the currently-selected LINE dobjects (parametric constraints
+    /// reference geometry by stable handle).
+    fn selected_line_handles(&self) -> Vec<Handle> {
+        self.selection.iter().filter_map(|&i| {
+            self.doc.dobjects.get(i)
+                .filter(|d| matches!(d.geom, Geom::Line(_)))
+                .map(|d| d.handle)
+        }).collect()
+    }
+
+    /// Parametric MODE panel — add constraints to the selected geometry and
+    /// Solve. The drawing is built with the NORMAL tools; this only adds the
+    /// constraint layer (the cad_param solver moves the geometry on Solve).
+    fn render_param_panel(&mut self, ctx: &egui::Context) {
+        if !self.parametric.active { return; }
+        use crate::param_editor::CRef;
+        let sel = self.selected_line_handles();
+        let mut add: Option<CRef> = None;
+        let (mut do_solve, mut clear_c, mut close) = (false, false, false);
+
+        egui::Window::new("Parametric  ·  constraints")
+            .id(egui::Id::new("param_panel"))
+            .resizable(true)
+            .default_width(260.0)
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, 64.0))
+            .show(ctx, |ui| {
+                ui.small("Draw with the normal tools (Line, snaps…). Select lines, \
+                          add constraints, then Solve.");
+                ui.separator();
+                ui.label(format!("selected lines: {}", sel.len()));
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add_enabled(sel.len() == 1, egui::Button::new("Horizontal")).clicked() {
+                        add = Some(CRef::Horizontal(sel[0]));
+                    }
+                    if ui.add_enabled(sel.len() == 1, egui::Button::new("Vertical")).clicked() {
+                        add = Some(CRef::Vertical(sel[0]));
+                    }
+                    if ui.add_enabled(sel.len() == 2, egui::Button::new("Parallel")).clicked() {
+                        add = Some(CRef::Parallel(sel[0], sel[1]));
+                    }
+                    if ui.add_enabled(sel.len() == 2, egui::Button::new("Perpendicular")).clicked() {
+                        add = Some(CRef::Perpendicular(sel[0], sel[1]));
+                    }
+                    if ui.add_enabled(sel.len() == 2, egui::Button::new("Equal len")).clicked() {
+                        add = Some(CRef::Equal(sel[0], sel[1]));
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Length");
+                    ui.add(egui::TextEdit::singleline(&mut self.parametric.length_input)
+                        .desired_width(60.0));
+                    if ui.add_enabled(sel.len() == 1, egui::Button::new("set on line")).clicked() {
+                        if let Ok(d) = self.parametric.length_input.trim().parse::<f64>() {
+                            add = Some(CRef::Length(sel[0], d));
+                        }
+                    }
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new(egui::RichText::new("Solve").strong())).clicked() {
+                        do_solve = true;
+                    }
+                    if ui.button("Clear constraints").clicked() { clear_c = true; }
+                });
+                ui.label(egui::RichText::new(&self.parametric.status).weak());
+                ui.separator();
+                ui.label(format!("constraints ({})", self.parametric.constraints.len()));
+                egui::ScrollArea::vertical().max_height(150.0).id_salt("param_clist").show(ui, |ui| {
+                    for (i, c) in self.parametric.constraints.iter().enumerate() {
+                        ui.small(format!("{}. {}", i + 1, c.label()));
+                    }
+                });
+                ui.separator();
+                if ui.button("Exit parametric mode").clicked() { close = true; }
+            });
+
+        if let Some(c) = add {
+            self.parametric.status = format!("added {}", c.label());
+            self.parametric.constraints.push(c);
+        }
+        if clear_c {
+            self.parametric.constraints.clear();
+            self.parametric.status = "constraints cleared".into();
+        }
+        if do_solve {
+            self.snapshot_doc();
+            let msg = crate::param_editor::solve_doc(&mut self.doc, &self.parametric);
+            self.history.push(format!("  parametric: {}", msg));
+            self.parametric.status = msg;
+            self.index_dirty = true;
+            self.gpu_dirty = true;
+        }
+        if close {
+            self.parametric.active = false;
+            self.parametric.status = "exited parametric mode".into();
+        }
+    }
+
     fn render_file_dialog(&mut self, ctx: &egui::Context) {
         let Some(mut dlg) = self.file_dialog.take() else { return; };
         let mut open      = true;
@@ -17894,9 +17993,15 @@ impl eframe::App for CadApp {
                         self.run_command("clear");
                         ui.close_menu();
                     }
-                    if ui.button("New parametric sketch…").clicked() {
-                        // Opens the isolated cad_param constraint solver panel.
-                        self.param_editor = Some(crate::param_editor::ParamEditor::demo());
+                    if ui.button("New parametric sketch").clicked() {
+                        // Parametric MODE: clear, then draw with the NORMAL tools;
+                        // the Parametric panel adds constraints + Solve.
+                        self.run_command("clear");
+                        self.parametric = crate::param_editor::ParamSession::new();
+                        self.parametric.active = true;
+                        self.parametric.status =
+                            "parametric mode: draw lines with the Line tool, select them, \
+                             add constraints, then Solve".into();
                         ui.close_menu();
                     }
                     if ui.button("Open .dxf / .rsm / .dwg…").clicked() {
@@ -19046,12 +19151,7 @@ impl eframe::App for CadApp {
         self.render_block_dialog(ctx);
         self.render_param_name_dialog(ctx);
         self.render_block_editor(ctx);
-        // Parametric sketch editor (isolated cad_param panel). take/restore so
-        // closing it (render → false) drops it without a borrow clash.
-        if self.param_editor.is_some() {
-            let mut pe = self.param_editor.take().unwrap();
-            if pe.render(ctx) { self.param_editor = Some(pe); }
-        }
+        self.render_param_panel(ctx);   // parametric MODE constraint panel
         self.render_file_dialog(ctx);
         self.render_raster_editor(ctx);
         self.render_dim_style_dialog(ctx);
