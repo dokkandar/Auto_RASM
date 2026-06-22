@@ -1126,6 +1126,9 @@ pub struct CadApp {
     /// open. While set, the main canvas pointer interaction is GATED OFF so
     /// nothing bleeds into the main screen. See `BlockEditor`.
     block_editor:   Option<BlockEditor>,
+    /// Parametric sketch editor (cad_param constraint solver). Isolated module;
+    /// `Some` while the parametric panel is open. See `param_editor.rs`.
+    param_editor:   Option<crate::param_editor::ParamEditor>,
     /// Active prompt-driven command flow (AutoCAD-style prompt sequence).
     /// `Some` while a command like CIRCLE is collecting its inputs. See
     /// `CmdFlow` + COMMAND_LINE.md.
@@ -2538,6 +2541,7 @@ impl Default for CadApp {
             dist_state:     DistState::Off,
             props_edit_gesture: false,
             block_editor:   None,
+            param_editor:   None,
             cmd_flow:       None,
             transcript:     Vec::new(),
             draft_preview:  true,
@@ -17886,8 +17890,13 @@ impl eframe::App for CadApp {
         egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    if ui.button("New").clicked() {
+                    if ui.button("New (non-parametric)").clicked() {
                         self.run_command("clear");
+                        ui.close_menu();
+                    }
+                    if ui.button("New parametric sketch…").clicked() {
+                        // Opens the isolated cad_param constraint solver panel.
+                        self.param_editor = Some(crate::param_editor::ParamEditor::demo());
                         ui.close_menu();
                     }
                     if ui.button("Open .dxf / .rsm / .dwg…").clicked() {
@@ -19037,6 +19046,12 @@ impl eframe::App for CadApp {
         self.render_block_dialog(ctx);
         self.render_param_name_dialog(ctx);
         self.render_block_editor(ctx);
+        // Parametric sketch editor (isolated cad_param panel). take/restore so
+        // closing it (render → false) drops it without a borrow clash.
+        if self.param_editor.is_some() {
+            let mut pe = self.param_editor.take().unwrap();
+            if pe.render(ctx) { self.param_editor = Some(pe); }
+        }
         self.render_file_dialog(ctx);
         self.render_raster_editor(ctx);
         self.render_dim_style_dialog(ctx);

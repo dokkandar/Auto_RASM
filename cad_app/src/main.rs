@@ -3,6 +3,7 @@ mod app;
 mod dbg_recorder;
 mod gpu;
 mod hatch_trace;
+mod param_editor;
 mod settings;
 // wall feature logic now lives in the `cad_wall` crate (see ARCHITECTURE.md).
 

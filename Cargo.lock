@@ -207,6 +207,7 @@ version = "0.1.0"
 dependencies = [
  "cad_io",
  "cad_kernel",
+ "cad_param",
  "cad_raster",
  "cad_wall",
  "eframe",
