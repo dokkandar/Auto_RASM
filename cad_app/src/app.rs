@@ -142,6 +142,33 @@ fn rect_polyline(a: Vec2, b: Vec2) -> Geom {
     })
 }
 
+/// Explode a polyline (a rectangle is just a closed polyline) into its
+/// individual segments: a `Line` per straight span and an `Arc` per bulged
+/// span. The closing segment is included when the polyline is closed.
+fn explode_polyline(p: &Polyline) -> Vec<Geom> {
+    let n = p.vertices.len();
+    if n < 2 { return Vec::new(); }
+    let pairs = if p.closed { n } else { n - 1 };
+    let mut out = Vec::with_capacity(pairs);
+    for i in 0..pairs {
+        let v0 = &p.vertices[i];
+        let a  = v0.pos;
+        let b  = p.vertices[(i + 1) % n].pos;
+        // DXF convention: the bulge on the START vertex curves segment i→i+1.
+        if v0.bulge.abs() > 1e-9 {
+            if let Some((center, radius, a0, sweep)) =
+                cad_kernel::bulge_arc(a, b, v0.bulge)
+            {
+                out.push(Geom::Arc(cad_kernel::Arc {
+                    center, radius, start_angle: a0, sweep_angle: sweep }));
+                continue;
+            }
+        }
+        out.push(Geom::Line(Line { a, b }));
+    }
+    out
+}
+
 /// The per-vertex stretch rule (used by the live ghost preview; mirrors the
 /// logic in `apply_stretch`): any vertex / centre inside the box moves by
 /// `v`, the rest stay. Returns the moved geom (an unchanged clone when
@@ -3814,7 +3841,7 @@ impl CadApp {
                     self.begin_selection(SelectMode::ForSelect);
                     self.queued_op = QueuedOp::Explode;
                     self.set_prompt(
-                        "explode: select block instances, Enter to apply  [Esc=cancel]");
+                        "explode: select blocks / polylines / rectangles, Enter to apply  [Esc=cancel]");
                 } else {
                     self.apply_explode();
                 }
@@ -12630,25 +12657,39 @@ impl CadApp {
         let mut skipped = 0_usize;
         for &i in &sel {
             let Some(d) = self.doc.dobjects.get(i) else { continue };
-            if let Geom::BlockRef(br) = &d.geom {
-                if let Some(blk) = self.doc.blocks.get(br.block) {
-                    // Explode the DERIVED geometry (params applied), so a
-                    // parametric instance explodes to what's drawn.
-                    let derived = self.block_derived_geoms(blk, &br.param_values);
-                    for (cd, dg) in blk.dobjects.iter().zip(&derived) {
-                        let mut style = cd.style;
-                        if matches!(style.color, Color::ByBlock) {
-                            style.color = d.style.color;
+            let dstyle = d.style;
+            match &d.geom {
+                Geom::BlockRef(br) => {
+                    if let Some(blk) = self.doc.blocks.get(br.block) {
+                        // Explode the DERIVED geometry (params applied), so a
+                        // parametric instance explodes to what's drawn.
+                        let derived = self.block_derived_geoms(blk, &br.param_values);
+                        for (cd, dg) in blk.dobjects.iter().zip(&derived) {
+                            let mut style = cd.style;
+                            if matches!(style.color, Color::ByBlock) {
+                                style.color = dstyle.color;
+                            }
+                            to_add.push(DObject::with_style(
+                                br.transform_geom(dg, blk.base), style));
                         }
-                        to_add.push(DObject::with_style(
-                            br.transform_geom(dg, blk.base), style));
+                        to_remove.push(i);
+                    } else {
+                        skipped += 1;   // dangling reference
                     }
-                    to_remove.push(i);
-                } else {
-                    skipped += 1;   // dangling reference
                 }
-            } else {
-                skipped += 1;       // not a block instance
+                // Polyline / rectangle → individual Line + Arc segments.
+                Geom::Polyline(p) => {
+                    let segs = explode_polyline(p);
+                    if segs.is_empty() {
+                        skipped += 1;
+                    } else {
+                        for g in segs {
+                            to_add.push(DObject::with_style(g, dstyle));
+                        }
+                        to_remove.push(i);
+                    }
+                }
+                _ => skipped += 1,   // not explodable (line/circle/arc/…)
             }
         }
         let exploded = to_remove.len();
@@ -12661,9 +12702,9 @@ impl CadApp {
         }
         self.selection.clear();
         self.history.push(format!(
-            "  ✸ explode: {} instance(s) → {} dobject(s){}",
+            "  ✸ explode: {} object(s) → {} dobject(s){}",
             exploded, added,
-            if skipped > 0 { format!("  ({} skipped — not a block)", skipped) }
+            if skipped > 0 { format!("  ({} skipped — not explodable)", skipped) }
             else { String::new() }));
         self.intersections.clear();
         self.index_dirty = true;
