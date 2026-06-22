@@ -10418,7 +10418,7 @@ impl CadApp {
     /// layer (the cad_param solver moves the geometry on Solve).
     fn render_param_panel(&mut self, ctx: &egui::Context) {
         if !self.parametric.active { return; }
-        use crate::param_editor::CRef;
+        use crate::param_editor::{CRef, PendingKind};
 
         // Drop constraints whose geometry has been deleted (handles gone) so old
         // edits don't linger and make every solve "apply to everything".
@@ -10438,10 +10438,28 @@ impl CadApp {
         let var_env = self.parametric.vars.resolve();
 
         let mut add: Option<CRef> = None;
+        let mut arm: Option<(PendingKind, Handle)> = None;
+        let mut cancel_pending = false;
         let mut remove_var: Option<String> = None;
         let mut remove_constraint: Option<usize> = None;
         let mut add_var = false;
         let (mut do_solve, mut clear_c, mut close) = (false, false, false);
+
+        // ---- reference→target: if a constraint was armed with a first entity,
+        //      and the user has now picked a different target, complete it. ----
+        if let Some((kind, first)) = self.parametric.pending {
+            let target = if kind.target_is_circle() {
+                circles.iter().copied().find(|&h| h != first)
+            } else if kind == PendingKind::Tangent {
+                lines.iter().chain(circles.iter()).copied().find(|&h| h != first)
+            } else {
+                lines.iter().copied().find(|&h| h != first)
+            };
+            if let Some(t) = target {
+                add = Some(kind.to_cref(first, t));
+                self.parametric.pending = None;
+            }
+        }
 
         let blue = egui::Color32::from_rgb(90, 160, 255);
         let green = egui::Color32::from_rgb(120, 220, 140);
@@ -10463,6 +10481,14 @@ impl CadApp {
                     ui.colored_label(egui::Color32::from_rgb(240, 180, 80),
                         "⚠ redundant / conflicting constraints");
                 }
+                // pending reference→target prompt
+                if let Some((kind, _)) = self.parametric.pending {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(egui::Color32::from_rgb(255, 210, 120),
+                            format!("⏳ {} — now pick the target", kind.label()));
+                        if ui.small_button("cancel").clicked() { cancel_pending = true; }
+                    });
+                }
                 ui.checkbox(&mut self.parametric.show_dof, "colour geometry by DOF (blue=free, green=locked)");
                 ui.separator();
                 ui.small("Draw with the normal tools (Line, Circle, snaps…), select \
@@ -10472,6 +10498,8 @@ impl CadApp {
                     ui.label(format!("selected: {} line/wall(s), {} circle(s)", lines.len(), circles.len()));
 
                     // ===== Geometric relations (lines & straight walls) =====
+                    // Binary relations work two ways: select BOTH then click, OR
+                    // select ONE, click, then pick the target ("reference→target").
                     ui.add_space(2.0);
                     ui.strong("Lines & walls");
                     ui.horizontal_wrapped(|ui| {
@@ -10481,17 +10509,20 @@ impl CadApp {
                         if ui.add_enabled(lines.len() == 1, egui::Button::new("Vertical")).clicked() {
                             add = Some(CRef::Vertical(lines[0]));
                         }
-                        if ui.add_enabled(lines.len() == 2, egui::Button::new("Parallel")).clicked() {
-                            add = Some(CRef::Parallel(lines[0], lines[1]));
-                        }
-                        if ui.add_enabled(lines.len() == 2, egui::Button::new("Perpendicular")).clicked() {
-                            add = Some(CRef::Perpendicular(lines[0], lines[1]));
-                        }
-                        if ui.add_enabled(lines.len() == 2, egui::Button::new("Collinear")).clicked() {
-                            add = Some(CRef::Collinear(lines[0], lines[1]));
-                        }
-                        if ui.add_enabled(lines.len() == 2, egui::Button::new("Equal len")).clicked() {
-                            add = Some(CRef::Equal(lines[0], lines[1]));
+                        // (kind, label) for the line/wall binary relations
+                        for (kind, lbl) in [
+                            (PendingKind::Parallel, "Parallel"),
+                            (PendingKind::Perpendicular, "Perpendicular"),
+                            (PendingKind::Collinear, "Collinear"),
+                            (PendingKind::Equal, "Equal len"),
+                        ] {
+                            if ui.add_enabled(lines.len() >= 1, egui::Button::new(lbl)).clicked() {
+                                if lines.len() >= 2 {
+                                    add = Some(kind.to_cref(lines[0], lines[1]));
+                                } else {
+                                    arm = Some((kind, lines[0]));
+                                }
+                            }
                         }
                     });
                     // length dimension (driving) on one line
@@ -10523,11 +10554,17 @@ impl CadApp {
                     ui.add_space(4.0);
                     ui.strong("Circles");
                     ui.horizontal_wrapped(|ui| {
-                        if ui.add_enabled(circles.len() == 2, egui::Button::new("Concentric")).clicked() {
-                            add = Some(CRef::Concentric(circles[0], circles[1]));
-                        }
-                        if ui.add_enabled(circles.len() == 2, egui::Button::new("Equal radius")).clicked() {
-                            add = Some(CRef::EqualRadius(circles[0], circles[1]));
+                        for (kind, lbl) in [
+                            (PendingKind::Concentric, "Concentric"),
+                            (PendingKind::EqualRadius, "Equal radius"),
+                        ] {
+                            if ui.add_enabled(circles.len() >= 1, egui::Button::new(lbl)).clicked() {
+                                if circles.len() >= 2 {
+                                    add = Some(kind.to_cref(circles[0], circles[1]));
+                                } else {
+                                    arm = Some((kind, circles[0]));
+                                }
+                            }
                         }
                     });
                     ui.horizontal(|ui| {
@@ -10552,11 +10589,17 @@ impl CadApp {
                     ui.strong("Tangent");
                     let tan_lc = lines.len() == 1 && circles.len() == 1;
                     let tan_cc = lines.is_empty() && circles.len() == 2;
-                    if ui.add_enabled(tan_lc || tan_cc, egui::Button::new("Tangent")).clicked() {
+                    // also armable from a single entity (line OR circle) → pick target
+                    let tan_one = (lines.len() == 1 && circles.is_empty())
+                        || (circles.len() == 1 && lines.is_empty());
+                    if ui.add_enabled(tan_lc || tan_cc || tan_one, egui::Button::new("Tangent")).clicked() {
                         if tan_lc {
                             add = Some(CRef::Tangent(lines[0], circles[0]));
                         } else if tan_cc {
                             add = Some(CRef::Tangent(circles[0], circles[1]));
+                        } else if tan_one {
+                            let first = if lines.len() == 1 { lines[0] } else { circles[0] };
+                            arm = Some((PendingKind::Tangent, first));
                         }
                     }
 
@@ -10640,6 +10683,19 @@ impl CadApp {
                 ui.label(egui::RichText::new(&self.parametric.status).weak());
             });
 
+        // ---- arm / cancel a reference→target pick ----
+        if cancel_pending {
+            self.parametric.pending = None;
+            self.parametric.status = "pick cancelled".into();
+        }
+        if let Some((kind, first)) = arm {
+            self.parametric.pending = Some((kind, first));
+            self.parametric.status =
+                format!("⏳ {}: now select the target entity", kind.label());
+            crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::Note {
+                message: format!("param: armed {} (ref handle picked)", kind.label()) });
+        }
+
         // ---- apply variable edits ----
         if add_var {
             let name = self.parametric.new_var_name.trim().to_string();
@@ -10672,11 +10728,13 @@ impl CadApp {
             crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::Note {
                 message: format!("param: + {} (lines={}, circles={})", lbl, lines.len(), circles.len()) });
             self.parametric.constraints.push(c);
+            self.parametric.pending = None; // the pair is complete
             just_added_label = Some(lbl);
             do_solve = true;   // auto-solve so the constraint takes effect immediately
         }
         if clear_c {
             self.parametric.constraints.clear();
+            self.parametric.pending = None;
             self.parametric.status = "constraints cleared".into();
         }
         if do_solve {
@@ -10708,6 +10766,7 @@ impl CadApp {
         }
         if close {
             self.parametric.active = false;
+            self.parametric.pending = None;
             self.parametric.status = "exited parametric mode".into();
         }
     }

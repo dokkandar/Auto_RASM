@@ -91,11 +91,57 @@ pub fn prune_constraints(doc: &Document, constraints: &mut Vec<CRef>) -> usize {
     before - constraints.len()
 }
 
+/// A two-entity constraint that's been started with a REFERENCE entity and is
+/// waiting for the user to pick the TARGET (the "select one, choose Parallel,
+/// then pick the other" flow). The kind decides how the pair becomes a `CRef`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PendingKind {
+    Parallel,
+    Perpendicular,
+    Collinear,
+    Equal,
+    Concentric,
+    EqualRadius,
+    Tangent,
+}
+
+impl PendingKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            PendingKind::Parallel => "Parallel",
+            PendingKind::Perpendicular => "Perpendicular",
+            PendingKind::Collinear => "Collinear",
+            PendingKind::Equal => "Equal length",
+            PendingKind::Concentric => "Concentric",
+            PendingKind::EqualRadius => "Equal radius",
+            PendingKind::Tangent => "Tangent",
+        }
+    }
+    /// True for kinds whose target is a circle (concentric / equal-radius).
+    pub fn target_is_circle(&self) -> bool {
+        matches!(self, PendingKind::Concentric | PendingKind::EqualRadius)
+    }
+    /// Build the constraint from the reference + target handles.
+    pub fn to_cref(&self, first: Handle, second: Handle) -> CRef {
+        match self {
+            PendingKind::Parallel => CRef::Parallel(first, second),
+            PendingKind::Perpendicular => CRef::Perpendicular(first, second),
+            PendingKind::Collinear => CRef::Collinear(first, second),
+            PendingKind::Equal => CRef::Equal(first, second),
+            PendingKind::Concentric => CRef::Concentric(first, second),
+            PendingKind::EqualRadius => CRef::EqualRadius(first, second),
+            PendingKind::Tangent => CRef::Tangent(first, second),
+        }
+    }
+}
+
 /// Per-session parametric state held by the app. `active` gates the panel +
 /// behaviour. Constraints and variables live here, NOT in the core Document.
 pub struct ParamSession {
     pub active: bool,
     pub constraints: Vec<CRef>,
+    /// A reference→target constraint waiting for its second pick: `(kind, first)`.
+    pub pending: Option<(PendingKind, Handle)>,
     pub vars: VarTable,
     pub status: String,
     pub length_input: String,
@@ -119,6 +165,7 @@ impl ParamSession {
         Self {
             active: false,
             constraints: Vec::new(),
+            pending: None,
             vars: VarTable::new(),
             status: String::new(),
             length_input: "100".into(),
@@ -525,6 +572,18 @@ mod tests {
         // anchored first point removes 2 DOF; a free line still has DOF left
         assert!(rep.dof > 0, "expected under-defined, dof={}", rep.dof);
         assert_eq!(defined.get(&h0), Some(&false));
+    }
+
+    #[test]
+    fn pending_kind_builds_the_right_pair() {
+        let mut doc = Document::default();
+        let a = add_line(&mut doc, Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0));
+        let b = add_line(&mut doc, Vec2::new(0.0, 0.0), Vec2::new(0.0, 1.0));
+        assert!(matches!(PendingKind::Parallel.to_cref(a, b), CRef::Parallel(x, y) if x == a && y == b));
+        assert!(matches!(PendingKind::Tangent.to_cref(a, b), CRef::Tangent(..)));
+        assert!(!PendingKind::Parallel.target_is_circle());
+        assert!(PendingKind::Concentric.target_is_circle());
+        assert!(PendingKind::EqualRadius.target_is_circle());
     }
 
     #[test]
