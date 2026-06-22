@@ -10467,8 +10467,10 @@ impl CadApp {
             });
 
         if let Some(c) = add {
-            self.parametric.status = format!("added {}", c.label());
+            crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::Note {
+                message: format!("param: + {} (sel={})", c.label(), sel.len()) });
             self.parametric.constraints.push(c);
+            do_solve = true;   // auto-solve so the constraint takes effect immediately
         }
         if clear_c {
             self.parametric.constraints.clear();
@@ -10477,6 +10479,8 @@ impl CadApp {
         if do_solve {
             self.snapshot_doc();
             let msg = crate::param_editor::solve_doc(&mut self.doc, &self.parametric);
+            crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::Note {
+                message: format!("param solve: {}", msg) });
             self.history.push(format!("  parametric: {}", msg));
             self.parametric.status = msg;
             self.index_dirty = true;
@@ -18002,6 +18006,8 @@ impl eframe::App for CadApp {
                         self.parametric.status =
                             "parametric mode: draw lines with the Line tool, select them, \
                              add constraints, then Solve".into();
+                        crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::Note {
+                            message: "param: entered parametric mode".into() });
                         ui.close_menu();
                     }
                     if ui.button("Open .dxf / .rsm / .dwg…").clicked() {

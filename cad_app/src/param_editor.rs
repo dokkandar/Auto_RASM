@@ -112,27 +112,30 @@ pub fn solve_doc(doc: &mut Document, session: &ParamSession) -> String {
         let p0 = sk.points[0];
         sk.add(Constraint::Fixed { p: 0, x: p0.x, y: p0.y });
     }
-    // Translate handle-based user constraints to sketch ids.
+    // Translate handle-based user constraints to sketch ids (counting how many
+    // actually resolve — an unresolved one means the geometry it referenced is
+    // gone, which is the usual "nothing happened" cause).
+    let mut resolved = 0usize;
     for c in &session.constraints {
         match *c {
             CRef::Horizontal(h) => if let Some(&l) = line_id.get(&h) {
-                sk.add(Constraint::Horizontal { line: l });
+                sk.add(Constraint::Horizontal { line: l }); resolved += 1;
             },
             CRef::Vertical(h) => if let Some(&l) = line_id.get(&h) {
-                sk.add(Constraint::Vertical { line: l });
+                sk.add(Constraint::Vertical { line: l }); resolved += 1;
             },
             CRef::Parallel(a, b) => if let (Some(&la), Some(&lb)) = (line_id.get(&a), line_id.get(&b)) {
-                sk.add(Constraint::Parallel { a: la, b: lb });
+                sk.add(Constraint::Parallel { a: la, b: lb }); resolved += 1;
             },
             CRef::Perpendicular(a, b) => if let (Some(&la), Some(&lb)) = (line_id.get(&a), line_id.get(&b)) {
-                sk.add(Constraint::Perpendicular { a: la, b: lb });
+                sk.add(Constraint::Perpendicular { a: la, b: lb }); resolved += 1;
             },
             CRef::Equal(a, b) => if let (Some(&la), Some(&lb)) = (line_id.get(&a), line_id.get(&b)) {
-                sk.add(Constraint::EqualLength { a: la, b: lb });
+                sk.add(Constraint::EqualLength { a: la, b: lb }); resolved += 1;
             },
             CRef::Length(h, d) => if let Some(&l) = line_id.get(&h) {
                 let ln = sk.lines[l];
-                sk.add(Constraint::Distance { p: ln.a, q: ln.b, d });
+                sk.add(Constraint::Distance { p: ln.a, q: ln.b, d }); resolved += 1;
             },
         }
     }
@@ -148,7 +151,47 @@ pub fn solve_doc(doc: &mut Document, session: &ParamSession) -> String {
         }
     }
     format!(
-        "solved: {} pts, {} lines, {} constraints · dof={} · rms={:.2e}",
-        sk.points.len(), sk.lines.len(), session.constraints.len(), rep.dof, rep.residual
+        "solved {} line(s): {}/{} constraints applied · dof={} · rms={:.2e}{}",
+        sk.lines.len(), resolved, session.constraints.len(), rep.dof, rep.residual,
+        if rep.converged { "" } else { "  (NOT converged)" }
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cad_kernel::{DObject, Line};
+
+    fn add_line(doc: &mut Document, a: Vec2, b: Vec2) -> Handle {
+        let d = DObject::new(Geom::Line(Line { a, b }));
+        let h = d.handle;
+        doc.dobjects.push(d);
+        h
+    }
+
+    #[test]
+    fn solve_doc_makes_a_line_horizontal() {
+        let mut doc = Document::default();
+        let h0 = add_line(&mut doc, Vec2::new(0.0, 0.0), Vec2::new(10.0, 5.0));
+        let mut sess = ParamSession::new();
+        sess.constraints.push(CRef::Horizontal(h0));
+        let msg = solve_doc(&mut doc, &sess);
+        let Geom::Line(l) = &doc.dobjects[0].geom else { panic!() };
+        assert!((l.a.y - l.b.y).abs() < 1e-6, "not horizontal: {:?}->{:?} ({msg})", l.a, l.b);
+    }
+
+    #[test]
+    fn solve_doc_makes_two_lines_perpendicular() {
+        let mut doc = Document::default();
+        let h0 = add_line(&mut doc, Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0));
+        let h1 = add_line(&mut doc, Vec2::new(0.0, 0.0), Vec2::new(8.0, 3.0)); // shares start
+        let mut sess = ParamSession::new();
+        sess.constraints.push(CRef::Perpendicular(h0, h1));
+        let _ = solve_doc(&mut doc, &sess);
+        let Geom::Line(l0) = &doc.dobjects[0].geom else { panic!() };
+        let Geom::Line(l1) = &doc.dobjects[1].geom else { panic!() };
+        let u = l0.b - l0.a;
+        let v = l1.b - l1.a;
+        assert!(u.dot(v).abs() < 1e-5, "dot={}", u.dot(v));
+    }
 }
