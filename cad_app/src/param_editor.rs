@@ -160,32 +160,55 @@ struct DocMap {
     sk: Sketch,
     /// per collected line: (dobject idx, point a id, point b id)
     lines: Vec<(usize, usize, usize)>,
+    /// per collected STRAIGHT wall: (dobject idx, start point id, end point id).
+    /// A wall's centerline is treated exactly like a line for constraints.
+    walls: Vec<(usize, usize, usize)>,
     /// per collected circle: (dobject idx, center point id, radius scalar id)
     circles: Vec<(usize, usize, usize)>,
-    line_id: HashMap<Handle, usize>,   // handle → sketch line id
+    line_id: HashMap<Handle, usize>,   // handle → sketch line id (lines AND walls)
     circle_id: HashMap<Handle, usize>, // handle → sketch circle id
     /// handle → its parameter indices in the flat unknown vector (for colouring)
     handle_params: HashMap<Handle, Vec<usize>>,
 }
 
-/// Build a `cad_param::Sketch` from the drawing's LINE and CIRCLE dobjects.
-/// Coincident endpoints / centers are merged into shared points.
+/// True for a straight (non-curved) wall — its centerline is a plain segment.
+fn straight_wall(g: &Geom) -> Option<(Vec2, Vec2)> {
+    match g {
+        Geom::Wall(w) if w.bulge.abs() < 1e-9 => Some((w.start, w.end)),
+        _ => None,
+    }
+}
+
+/// Build a `cad_param::Sketch` from the drawing's LINE, straight WALL, and CIRCLE
+/// dobjects. A wall's centerline is modelled as a sketch line, so every line
+/// constraint (H/V/∥/⊥/collinear/equal/length/angle) works on walls too.
+/// Coincident endpoints / centers are merged into shared points (so a wall that
+/// meets a line at a corner moves with it).
 fn build_doc_map(doc: &Document) -> DocMap {
     // 1. collect geometry
     let mut raw_lines: Vec<(Handle, usize, Vec2, Vec2)> = Vec::new();
+    let mut raw_walls: Vec<(Handle, usize, Vec2, Vec2)> = Vec::new();
     let mut raw_circles: Vec<(Handle, usize, Vec2, f64)> = Vec::new();
     for (idx, d) in doc.dobjects.iter().enumerate() {
         match &d.geom {
             Geom::Line(l) => raw_lines.push((d.handle, idx, l.a, l.b)),
             Geom::Circle(c) => raw_circles.push((d.handle, idx, c.center, c.radius)),
-            _ => {}
+            _ => {
+                if let Some((s, e)) = straight_wall(&d.geom) {
+                    raw_walls.push((d.handle, idx, s, e));
+                }
+            }
         }
     }
 
-    // 2. intern all points (line endpoints + circle centers) FIRST, so scalar
-    //    indices (which follow all points) are stable.
+    // 2. intern all points (line + wall endpoints + circle centers) FIRST, so
+    //    scalar indices (which follow all points) are stable.
     let mut pts: Vec<Vec2> = Vec::new();
     let line_pt_ids: Vec<(usize, usize)> = raw_lines
+        .iter()
+        .map(|(_, _, a, b)| (intern(&mut pts, *a), intern(&mut pts, *b)))
+        .collect();
+    let wall_pt_ids: Vec<(usize, usize)> = raw_walls
         .iter()
         .map(|(_, _, a, b)| (intern(&mut pts, *a), intern(&mut pts, *b)))
         .collect();
@@ -206,17 +229,24 @@ fn build_doc_map(doc: &Document) -> DocMap {
         .map(|(_, _, _, r)| sk.add_scalar(*r))
         .collect();
 
-    // 4. build line + circle entities and the lookup maps.
+    // 4. build line + wall + circle entities and the lookup maps.
     let mut line_id = HashMap::new();
     let mut circle_id = HashMap::new();
     let mut handle_params: HashMap<Handle, Vec<usize>> = HashMap::new();
     let mut lines = Vec::with_capacity(raw_lines.len());
+    let mut walls = Vec::with_capacity(raw_walls.len());
     let mut circles = Vec::with_capacity(raw_circles.len());
 
     for (k, (h, dobj, _, _)) in raw_lines.iter().enumerate() {
         let (pa, pb) = line_pt_ids[k];
         line_id.insert(*h, sk.add_line(pa, pb));
         lines.push((*dobj, pa, pb));
+        handle_params.insert(*h, vec![2 * pa, 2 * pa + 1, 2 * pb, 2 * pb + 1]);
+    }
+    for (k, (h, dobj, _, _)) in raw_walls.iter().enumerate() {
+        let (pa, pb) = wall_pt_ids[k];
+        line_id.insert(*h, sk.add_line(pa, pb)); // a wall centerline IS a sketch line
+        walls.push((*dobj, pa, pb));
         handle_params.insert(*h, vec![2 * pa, 2 * pa + 1, 2 * pb, 2 * pb + 1]);
     }
     for (k, (h, dobj, _, _)) in raw_circles.iter().enumerate() {
@@ -227,7 +257,7 @@ fn build_doc_map(doc: &Document) -> DocMap {
         handle_params.insert(*h, vec![2 * c, 2 * c + 1, 2 * np + s]);
     }
 
-    DocMap { sk, lines, circles, line_id, circle_id, handle_params }
+    DocMap { sk, lines, walls, circles, line_id, circle_id, handle_params }
 }
 
 /// Translate the session's handle-based constraints into the sketch. Returns how
@@ -304,6 +334,15 @@ pub fn solve_doc(doc: &mut Document, session: &ParamSession) -> SolveOutcome {
             }
         }
     }
+    // write back wall centerlines (start/end)
+    for &(idx, pa, pb) in &map.walls {
+        if let Some(d) = doc.dobjects.get_mut(idx) {
+            if let Geom::Wall(w) = &mut d.geom {
+                w.start = map.sk.points[pa];
+                w.end = map.sk.points[pb];
+            }
+        }
+    }
     // write back circles
     for &(idx, c, s) in &map.circles {
         if let Some(d) = doc.dobjects.get_mut(idx) {
@@ -359,6 +398,41 @@ mod tests {
         let h = d.handle;
         doc.dobjects.push(d);
         h
+    }
+    fn add_wall(doc: &mut Document, s: Vec2, e: Vec2) -> Handle {
+        let d = DObject::new(Geom::Wall(cad_kernel::Wall {
+            start: s, end: e, thickness: 4.0, style: 0, bulge: 0.0 }));
+        let h = d.handle;
+        doc.dobjects.push(d);
+        h
+    }
+
+    #[test]
+    fn solve_doc_makes_a_wall_horizontal() {
+        let mut doc = Document::default();
+        let h0 = add_wall(&mut doc, Vec2::new(0.0, 0.0), Vec2::new(10.0, 5.0));
+        let mut sess = ParamSession::new();
+        sess.constraints.push(CRef::Horizontal(h0));
+        let out = solve_doc(&mut doc, &sess);
+        let Geom::Wall(w) = &doc.dobjects[0].geom else { panic!() };
+        assert!((w.start.y - w.end.y).abs() < 1e-6, "wall not horizontal ({})", out.msg);
+    }
+
+    #[test]
+    fn wall_and_line_can_be_made_perpendicular() {
+        // a wall and a line sharing a corner, made perpendicular — proves walls
+        // are first-class linear entities in the solver.
+        let mut doc = Document::default();
+        let hw = add_wall(&mut doc, Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0));
+        let hl = add_line(&mut doc, Vec2::new(0.0, 0.0), Vec2::new(8.0, 3.0));
+        let mut sess = ParamSession::new();
+        sess.constraints.push(CRef::Perpendicular(hw, hl));
+        let _ = solve_doc(&mut doc, &sess);
+        let Geom::Wall(w) = &doc.dobjects[0].geom else { panic!() };
+        let Geom::Line(l) = &doc.dobjects[1].geom else { panic!() };
+        let u = w.end - w.start;
+        let v = l.b - l.a;
+        assert!(u.dot(v).abs() < 1e-5, "dot={}", u.dot(v));
     }
 
     #[test]

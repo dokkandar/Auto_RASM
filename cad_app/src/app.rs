@@ -10390,12 +10390,14 @@ impl CadApp {
         self.raster_editor = Some(ed);
     }
 
-    /// Handles of the currently-selected LINE dobjects (parametric constraints
-    /// reference geometry by stable handle).
-    fn selected_line_handles(&self) -> Vec<Handle> {
+    /// Handles of the currently-selected LINEAR dobjects — lines and straight
+    /// wall centerlines, which the solver treats identically. (Curved walls have
+    /// an arc centerline and aren't constrainable yet.)
+    fn selected_linear_handles(&self) -> Vec<Handle> {
         self.selection.iter().filter_map(|&i| {
             self.doc.dobjects.get(i)
-                .filter(|d| matches!(d.geom, Geom::Line(_)))
+                .filter(|d| matches!(&d.geom, Geom::Line(_))
+                    || matches!(&d.geom, Geom::Wall(w) if w.bulge.abs() < 1e-9))
                 .map(|d| d.handle)
         }).collect()
     }
@@ -10430,7 +10432,7 @@ impl CadApp {
         self.parametric.fully_defined = rep.fully_defined;
         self.parametric.redundant = rep.redundant;
 
-        let lines = self.selected_line_handles();
+        let lines = self.selected_linear_handles();
         let circles = self.selected_circle_handles();
         // resolve variables once for value display + field evaluation
         let var_env = self.parametric.vars.resolve();
@@ -10467,11 +10469,11 @@ impl CadApp {
                           geometry, then add constraints. Adding auto-solves.");
 
                 egui::ScrollArea::vertical().max_height(440.0).id_salt("param_scroll").show(ui, |ui| {
-                    ui.label(format!("selected: {} line(s), {} circle(s)", lines.len(), circles.len()));
+                    ui.label(format!("selected: {} line/wall(s), {} circle(s)", lines.len(), circles.len()));
 
-                    // ===== Geometric relations (lines) =====
+                    // ===== Geometric relations (lines & straight walls) =====
                     ui.add_space(2.0);
-                    ui.strong("Lines");
+                    ui.strong("Lines & walls");
                     ui.horizontal_wrapped(|ui| {
                         if ui.add_enabled(lines.len() == 1, egui::Button::new("Horizontal")).clicked() {
                             add = Some(CRef::Horizontal(lines[0]));
@@ -10562,9 +10564,14 @@ impl CadApp {
                     ui.add_space(4.0);
                     ui.strong("Reference (read-only)");
                     if lines.len() == 1 {
-                        if let Some(Geom::Line(l)) =
-                            self.doc.dobjects.iter().find(|d| d.handle == lines[0]).map(|d| &d.geom) {
-                            ui.small(format!("length = ({:.4})", (l.b - l.a).len()));
+                        let ends = self.doc.dobjects.iter().find(|d| d.handle == lines[0])
+                            .and_then(|d| match &d.geom {
+                                Geom::Line(l) => Some((l.a, l.b)),
+                                Geom::Wall(w) => Some((w.start, w.end)),
+                                _ => None,
+                            });
+                        if let Some((a, b)) = ends {
+                            ui.small(format!("length = ({:.4})", (b - a).len()));
                         }
                     } else if circles.len() == 1 {
                         if let Some(Geom::Circle(c)) =
@@ -23736,6 +23743,12 @@ fn draw_param_overlay(painter: &egui::Painter, rect: egui::Rect, app: &CadApp) {
                 if r.is_finite() && r > 0.0 {
                     painter.circle_stroke(center, r, egui::Stroke::new(3.0, col));
                 }
+            }
+            // straight wall: tint its centerline (the constrained geometry)
+            Geom::Wall(w) if w.bulge.abs() < 1e-9 => {
+                let a = app.w2s(w.start, rect);
+                let b = app.w2s(w.end, rect);
+                painter.line_segment([a, b], egui::Stroke::new(3.0, col));
             }
             _ => {}
         }
