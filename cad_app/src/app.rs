@@ -10400,75 +10400,248 @@ impl CadApp {
         }).collect()
     }
 
-    /// Parametric MODE panel — add constraints to the selected geometry and
-    /// Solve. The drawing is built with the NORMAL tools; this only adds the
-    /// constraint layer (the cad_param solver moves the geometry on Solve).
+    /// Handles of the currently-selected CIRCLE dobjects (for radius / concentric
+    /// / tangent constraints).
+    fn selected_circle_handles(&self) -> Vec<Handle> {
+        self.selection.iter().filter_map(|&i| {
+            self.doc.dobjects.get(i)
+                .filter(|d| matches!(d.geom, Geom::Circle(_)))
+                .map(|d| d.handle)
+        }).collect()
+    }
+
+    /// Parametric MODE panel — add geometric/dimensional/variable constraints to
+    /// the selected geometry, see the degrees-of-freedom diagnosis, and Solve.
+    /// The drawing is built with the NORMAL tools; this only adds the constraint
+    /// layer (the cad_param solver moves the geometry on Solve).
     fn render_param_panel(&mut self, ctx: &egui::Context) {
         if !self.parametric.active { return; }
         use crate::param_editor::CRef;
-        let sel = self.selected_line_handles();
+
+        // ---- recompute the DOF diagnosis for this frame (drives the readout +
+        //      the blue/green canvas overlay). Cheap for small sketches. ----
+        let (rep, defined) = crate::param_editor::analyze_doc(&self.doc, &self.parametric);
+        self.parametric.defined = defined;
+        self.parametric.dof = rep.dof;
+        self.parametric.fully_defined = rep.fully_defined;
+        self.parametric.redundant = rep.redundant;
+
+        let lines = self.selected_line_handles();
+        let circles = self.selected_circle_handles();
+        // resolve variables once for value display + field evaluation
+        let var_env = self.parametric.vars.resolve();
+
         let mut add: Option<CRef> = None;
+        let mut remove_var: Option<String> = None;
+        let mut add_var = false;
         let (mut do_solve, mut clear_c, mut close) = (false, false, false);
+
+        let blue = egui::Color32::from_rgb(90, 160, 255);
+        let green = egui::Color32::from_rgb(120, 220, 140);
 
         egui::Window::new("Parametric  ·  constraints")
             .id(egui::Id::new("param_panel"))
             .resizable(true)
-            .default_width(260.0)
+            .default_width(300.0)
             .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, 64.0))
             .show(ctx, |ui| {
-                ui.small("Draw with the normal tools (Line, snaps…). Select lines, \
-                          add constraints, then Solve.");
+                // ---- DOF status banner ("fully defined" / "N DOF") ----
+                if self.parametric.fully_defined {
+                    ui.colored_label(green, egui::RichText::new("✔ Fully defined").strong());
+                } else {
+                    ui.colored_label(blue, egui::RichText::new(
+                        format!("◇ Under-defined — {} DOF", self.parametric.dof)).strong());
+                }
+                if self.parametric.redundant {
+                    ui.colored_label(egui::Color32::from_rgb(240, 180, 80),
+                        "⚠ redundant / conflicting constraints");
+                }
+                ui.checkbox(&mut self.parametric.show_dof, "colour geometry by DOF (blue=free, green=locked)");
                 ui.separator();
-                ui.label(format!("selected lines: {}", sel.len()));
-                ui.horizontal_wrapped(|ui| {
-                    if ui.add_enabled(sel.len() == 1, egui::Button::new("Horizontal")).clicked() {
-                        add = Some(CRef::Horizontal(sel[0]));
-                    }
-                    if ui.add_enabled(sel.len() == 1, egui::Button::new("Vertical")).clicked() {
-                        add = Some(CRef::Vertical(sel[0]));
-                    }
-                    if ui.add_enabled(sel.len() == 2, egui::Button::new("Parallel")).clicked() {
-                        add = Some(CRef::Parallel(sel[0], sel[1]));
-                    }
-                    if ui.add_enabled(sel.len() == 2, egui::Button::new("Perpendicular")).clicked() {
-                        add = Some(CRef::Perpendicular(sel[0], sel[1]));
-                    }
-                    if ui.add_enabled(sel.len() == 2, egui::Button::new("Equal len")).clicked() {
-                        add = Some(CRef::Equal(sel[0], sel[1]));
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Length");
-                    ui.add(egui::TextEdit::singleline(&mut self.parametric.length_input)
-                        .desired_width(60.0));
-                    if ui.add_enabled(sel.len() == 1, egui::Button::new("set on line")).clicked() {
-                        if let Ok(d) = self.parametric.length_input.trim().parse::<f64>() {
-                            add = Some(CRef::Length(sel[0], d));
+                ui.small("Draw with the normal tools (Line, Circle, snaps…), select \
+                          geometry, then add constraints. Adding auto-solves.");
+
+                egui::ScrollArea::vertical().max_height(440.0).id_salt("param_scroll").show(ui, |ui| {
+                    ui.label(format!("selected: {} line(s), {} circle(s)", lines.len(), circles.len()));
+
+                    // ===== Geometric relations (lines) =====
+                    ui.add_space(2.0);
+                    ui.strong("Lines");
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.add_enabled(lines.len() == 1, egui::Button::new("Horizontal")).clicked() {
+                            add = Some(CRef::Horizontal(lines[0]));
+                        }
+                        if ui.add_enabled(lines.len() == 1, egui::Button::new("Vertical")).clicked() {
+                            add = Some(CRef::Vertical(lines[0]));
+                        }
+                        if ui.add_enabled(lines.len() == 2, egui::Button::new("Parallel")).clicked() {
+                            add = Some(CRef::Parallel(lines[0], lines[1]));
+                        }
+                        if ui.add_enabled(lines.len() == 2, egui::Button::new("Perpendicular")).clicked() {
+                            add = Some(CRef::Perpendicular(lines[0], lines[1]));
+                        }
+                        if ui.add_enabled(lines.len() == 2, egui::Button::new("Collinear")).clicked() {
+                            add = Some(CRef::Collinear(lines[0], lines[1]));
+                        }
+                        if ui.add_enabled(lines.len() == 2, egui::Button::new("Equal len")).clicked() {
+                            add = Some(CRef::Equal(lines[0], lines[1]));
+                        }
+                    });
+                    // length dimension (driving) on one line
+                    ui.horizontal(|ui| {
+                        ui.label("Length");
+                        ui.add(egui::TextEdit::singleline(&mut self.parametric.length_input)
+                            .desired_width(70.0).hint_text("100 or =W/2"));
+                        let ok = lines.len() == 1;
+                        if ui.add_enabled(ok, egui::Button::new("set")).clicked() {
+                            if let Ok(d) = self.parametric.eval_field(&self.parametric.length_input) {
+                                add = Some(CRef::Length(lines[0], d));
+                            }
+                        }
+                    });
+                    // angle dimension between two lines
+                    ui.horizontal(|ui| {
+                        ui.label("Angle°");
+                        ui.add(egui::TextEdit::singleline(&mut self.parametric.angle_input)
+                            .desired_width(70.0).hint_text("90 or =A"));
+                        let ok = lines.len() == 2;
+                        if ui.add_enabled(ok, egui::Button::new("set")).clicked() {
+                            if let Ok(deg) = self.parametric.eval_field(&self.parametric.angle_input) {
+                                add = Some(CRef::Angle(lines[0], lines[1], deg.to_radians()));
+                            }
+                        }
+                    });
+
+                    // ===== Circles =====
+                    ui.add_space(4.0);
+                    ui.strong("Circles");
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.add_enabled(circles.len() == 2, egui::Button::new("Concentric")).clicked() {
+                            add = Some(CRef::Concentric(circles[0], circles[1]));
+                        }
+                        if ui.add_enabled(circles.len() == 2, egui::Button::new("Equal radius")).clicked() {
+                            add = Some(CRef::EqualRadius(circles[0], circles[1]));
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Value");
+                        ui.add(egui::TextEdit::singleline(&mut self.parametric.value_input)
+                            .desired_width(70.0).hint_text("50 or =R"));
+                        let ok = circles.len() == 1;
+                        if ui.add_enabled(ok, egui::Button::new("Radius")).clicked() {
+                            if let Ok(r) = self.parametric.eval_field(&self.parametric.value_input) {
+                                add = Some(CRef::Radius(circles[0], r));
+                            }
+                        }
+                        if ui.add_enabled(ok, egui::Button::new("Diameter")).clicked() {
+                            if let Ok(d) = self.parametric.eval_field(&self.parametric.value_input) {
+                                add = Some(CRef::Radius(circles[0], d * 0.5));
+                            }
+                        }
+                    });
+
+                    // ===== Tangent (line+circle or circle+circle) =====
+                    ui.add_space(4.0);
+                    ui.strong("Tangent");
+                    let tan_lc = lines.len() == 1 && circles.len() == 1;
+                    let tan_cc = lines.is_empty() && circles.len() == 2;
+                    if ui.add_enabled(tan_lc || tan_cc, egui::Button::new("Tangent")).clicked() {
+                        if tan_lc {
+                            add = Some(CRef::Tangent(lines[0], circles[0]));
+                        } else if tan_cc {
+                            add = Some(CRef::Tangent(circles[0], circles[1]));
                         }
                     }
+
+                    // ===== Reference (driven) measurement =====
+                    ui.add_space(4.0);
+                    ui.strong("Reference (read-only)");
+                    if lines.len() == 1 {
+                        if let Some(Geom::Line(l)) =
+                            self.doc.dobjects.iter().find(|d| d.handle == lines[0]).map(|d| &d.geom) {
+                            ui.small(format!("length = ({:.4})", (l.b - l.a).len()));
+                        }
+                    } else if circles.len() == 1 {
+                        if let Some(Geom::Circle(c)) =
+                            self.doc.dobjects.iter().find(|d| d.handle == circles[0]).map(|d| &d.geom) {
+                            ui.small(format!("radius = ({:.4})   diameter = ({:.4})", c.radius, c.radius * 2.0));
+                        }
+                    } else {
+                        ui.small("select 1 line or 1 circle to measure");
+                    }
+
+                    // ===== Global variables / equations =====
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.strong("Global variables  (use as  =name  in fields)");
+                    let mut idx_to_remove = None;
+                    for (i, v) in self.parametric.vars.vars.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::TextEdit::singleline(&mut v.name).desired_width(70.0).hint_text("name"));
+                            ui.label("=");
+                            ui.add(egui::TextEdit::singleline(&mut v.expr).desired_width(90.0).hint_text("expr"));
+                            match &var_env {
+                                Ok(env) => match env.get(&v.name) {
+                                    Some(val) => { ui.small(format!("= {val:.4}")); }
+                                    None => { ui.small(""); }
+                                },
+                                Err(_) => { ui.colored_label(egui::Color32::from_rgb(240,120,120), "err"); }
+                            }
+                            if ui.small_button("✖").clicked() { idx_to_remove = Some(i); }
+                        });
+                    }
+                    if let Some(i) = idx_to_remove {
+                        if let Some(v) = self.parametric.vars.vars.get(i) { remove_var = Some(v.name.clone()); }
+                    }
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut self.parametric.new_var_name)
+                            .desired_width(70.0).hint_text("name"));
+                        ui.label("=");
+                        ui.add(egui::TextEdit::singleline(&mut self.parametric.new_var_expr)
+                            .desired_width(90.0).hint_text("expr"));
+                        if ui.button("＋ add").clicked() { add_var = true; }
+                    });
+                    if let Err(e) = &var_env {
+                        ui.colored_label(egui::Color32::from_rgb(240,120,120), e);
+                    }
+
+                    // ===== constraint list =====
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.label(format!("constraints ({})", self.parametric.constraints.len()));
+                    for (i, c) in self.parametric.constraints.iter().enumerate() {
+                        ui.small(format!("{}. {}", i + 1, c.label()));
+                    }
                 });
+
                 ui.separator();
                 ui.horizontal(|ui| {
                     if ui.add(egui::Button::new(egui::RichText::new("Solve").strong())).clicked() {
                         do_solve = true;
                     }
                     if ui.button("Clear constraints").clicked() { clear_c = true; }
+                    if ui.button("Exit").clicked() { close = true; }
                 });
                 ui.label(egui::RichText::new(&self.parametric.status).weak());
-                ui.separator();
-                ui.label(format!("constraints ({})", self.parametric.constraints.len()));
-                egui::ScrollArea::vertical().max_height(150.0).id_salt("param_clist").show(ui, |ui| {
-                    for (i, c) in self.parametric.constraints.iter().enumerate() {
-                        ui.small(format!("{}. {}", i + 1, c.label()));
-                    }
-                });
-                ui.separator();
-                if ui.button("Exit parametric mode").clicked() { close = true; }
             });
+
+        // ---- apply variable edits ----
+        if add_var {
+            let name = self.parametric.new_var_name.trim().to_string();
+            if !name.is_empty() {
+                let expr = self.parametric.new_var_expr.clone();
+                self.parametric.vars.set(&name, &expr);
+                self.parametric.new_var_name.clear();
+                self.parametric.new_var_expr.clear();
+            }
+        }
+        if let Some(name) = remove_var {
+            self.parametric.vars.remove(&name);
+        }
 
         if let Some(c) = add {
             crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::Note {
-                message: format!("param: + {} (sel={})", c.label(), sel.len()) });
+                message: format!("param: + {} (lines={}, circles={})", c.label(), lines.len(), circles.len()) });
             self.parametric.constraints.push(c);
             do_solve = true;   // auto-solve so the constraint takes effect immediately
         }
@@ -21723,6 +21896,13 @@ impl eframe::App for CadApp {
                 }
             }
 
+            // Parametric DOF overlay: tint under-defined geometry blue and
+            // fully-defined geometry black-ish, SolidWorks style. Reads the
+            // per-handle map cached by render_param_panel earlier this frame.
+            if self.parametric.active && self.parametric.show_dof {
+                draw_param_overlay(&painter, rect, self);
+            }
+
             // OSNAP marker: glyph at the snap point + the dashed extension
             // line/arc from the on-dobject anchor when the foot lies on the
             // imaginary extension (PER/TAN past a segment endpoint or a
@@ -23487,6 +23667,38 @@ fn distance_world_to_geom(g: &Geom, p: Vec2) -> f64 {
         // refine later. (Real perpendicular-to-curve distance is a
         // separate kernel job.)
         _ => f64::NAN,
+    }
+}
+
+/// Parametric DOF overlay — tints each constrainable entity by whether the
+/// solver considers it fully defined (green, all params locked) or still free
+/// (blue), the way SolidWorks turns sketch geometry black vs. blue. Reads the
+/// per-handle map cached in `app.parametric.defined`. Drawn on top of the normal
+/// geometry as a translucent halo.
+fn draw_param_overlay(painter: &egui::Painter, rect: egui::Rect, app: &CadApp) {
+    let blue = egui::Color32::from_rgb(80, 160, 255).gamma_multiply(0.6);
+    let green = egui::Color32::from_rgb(110, 220, 140).gamma_multiply(0.55);
+    for d in &app.doc.dobjects {
+        let col = match app.parametric.defined.get(&d.handle).copied() {
+            Some(true) => green,
+            Some(false) => blue,
+            None => continue, // not part of the parametric sketch
+        };
+        match &d.geom {
+            Geom::Line(l) => {
+                let a = app.w2s(l.a, rect);
+                let b = app.w2s(l.b, rect);
+                painter.line_segment([a, b], egui::Stroke::new(3.0, col));
+            }
+            Geom::Circle(c) => {
+                let center = app.w2s(c.center, rect);
+                let r = (c.radius * app.scale as f64) as f32;
+                if r.is_finite() && r > 0.0 {
+                    painter.circle_stroke(center, r, egui::Stroke::new(3.0, col));
+                }
+            }
+            _ => {}
+        }
     }
 }
 

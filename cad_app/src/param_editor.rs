@@ -1,28 +1,41 @@
 //! Parametric MODE glue — lets the app's normal tools draw into a drawing that
 //! the `cad_param` constraint solver then governs. We deliberately reuse ALL the
 //! existing tools/modifiers (Line, Circle, trim, snaps, …); this module only
-//! adds a constraint LAYER + a Solve step. `cad_param` stays the isolated,
-//! swappable solver backend (kept separate for safety / dev / library-testing);
-//! the core kernel `Document`/`Geom` are not modified.
+//! adds a constraint LAYER + a Solve step + the "fully defined" diagnosis.
+//! `cad_param` stays the isolated, swappable solver backend (kept separate for
+//! safety / dev / library-testing); the core kernel `Document`/`Geom` are not
+//! modified.
 //!
-//! Slice 1 constrains LINE geometry (and the points where line endpoints meet —
-//! coincident endpoints are auto-merged into one sketch point, so connected
-//! lines move together). Circles/arcs are drawn normally but not yet constrained
-//! (needs scalar unknowns like radius in cad_param — a later slice).
+//! Constraints reference drawing geometry by stable HANDLE, resolved to sketch
+//! ids at solve time. LINE and CIRCLE dobjects are constrainable; coincident
+//! line endpoints are auto-merged into one sketch point so connected lines move
+//! together. Point-level constraints (Coincident/Symmetric/PointOnLine/
+//! PointOnCircle) exist in the solver but need endpoint-picking UI (a later
+//! slice), so they are not yet exposed here.
 
 use cad_kernel::{dobject::Handle, Document, Geom, Vec2};
-use cad_param::{solve, Constraint, Sketch};
+use cad_param::{dof_analysis, solve, Constraint, DofReport, Sketch, VarTable};
+use std::collections::HashMap;
 
-/// A user constraint, referencing drawing geometry by stable HANDLE (so it
-/// survives edits/index shuffles). Resolved to sketch ids at solve time.
+/// A user constraint, referencing drawing geometry by stable handle. Mixed
+/// (line/circle) refs like `Tangent` are disambiguated by geometry kind at solve
+/// time.
 #[derive(Clone, Copy, Debug)]
 pub enum CRef {
+    // line / direction
     Horizontal(Handle),
     Vertical(Handle),
     Parallel(Handle, Handle),
     Perpendicular(Handle, Handle),
+    Collinear(Handle, Handle),
     Equal(Handle, Handle),
+    Angle(Handle, Handle, f64),
     Length(Handle, f64),
+    // circle
+    Radius(Handle, f64),
+    Concentric(Handle, Handle),
+    EqualRadius(Handle, Handle),
+    Tangent(Handle, Handle), // line↔circle or circle↔circle
 }
 
 impl CRef {
@@ -32,25 +45,67 @@ impl CRef {
             CRef::Vertical(_) => "vertical".into(),
             CRef::Parallel(..) => "parallel".into(),
             CRef::Perpendicular(..) => "perpendicular".into(),
+            CRef::Collinear(..) => "collinear".into(),
             CRef::Equal(..) => "equal length".into(),
+            CRef::Angle(_, _, d) => format!("angle = {:.3}°", d.to_degrees()),
             CRef::Length(_, d) => format!("length = {d}"),
+            CRef::Radius(_, r) => format!("radius = {r}"),
+            CRef::Concentric(..) => "concentric".into(),
+            CRef::EqualRadius(..) => "equal radius".into(),
+            CRef::Tangent(..) => "tangent".into(),
         }
     }
 }
 
-/// Per-session parametric state held by the app (always present; `active` gates
-/// the panel + behaviour). Constraints live here, NOT in the core Document.
+/// Per-session parametric state held by the app. `active` gates the panel +
+/// behaviour. Constraints and variables live here, NOT in the core Document.
 pub struct ParamSession {
     pub active: bool,
     pub constraints: Vec<CRef>,
+    pub vars: VarTable,
     pub status: String,
     pub length_input: String,
+    pub value_input: String,
+    pub angle_input: String,
+    pub new_var_name: String,
+    pub new_var_expr: String,
+    /// Show the blue/black under-defined overlay on the canvas.
+    pub show_dof: bool,
+    /// Cached per-handle "fully defined" flags (true = black/locked). Recomputed
+    /// by [`analyze_doc`] each frame the panel runs; the canvas overlay reads it.
+    pub defined: HashMap<Handle, bool>,
+    /// Cached degrees-of-freedom for the readout.
+    pub dof: i64,
+    pub fully_defined: bool,
+    pub redundant: bool,
 }
 
 impl ParamSession {
     pub fn new() -> Self {
-        Self { active: false, constraints: Vec::new(), status: String::new(),
-               length_input: "100".into() }
+        Self {
+            active: false,
+            constraints: Vec::new(),
+            vars: VarTable::new(),
+            status: String::new(),
+            length_input: "100".into(),
+            value_input: "50".into(),
+            angle_input: "90".into(),
+            new_var_name: String::new(),
+            new_var_expr: String::new(),
+            show_dof: true,
+            defined: HashMap::new(),
+            dof: 0,
+            fully_defined: false,
+            redundant: false,
+        }
+    }
+
+    /// Evaluate a numeric field that may be a literal or an expression
+    /// (`=W/2 + 3`, leading `=` optional) against the variable table.
+    pub fn eval_field(&self, text: &str) -> Result<f64, String> {
+        let env = self.vars.resolve()?;
+        let s = text.trim().strip_prefix('=').unwrap_or(text);
+        cad_param::eval(s, &env)
     }
 }
 
@@ -65,105 +120,202 @@ fn intern(pts: &mut Vec<Vec2>, p: Vec2) -> usize {
     pts.len() - 1
 }
 
-/// Build a `cad_param::Sketch` from the drawing's LINE dobjects (coincident
-/// endpoints merged into shared points). Returns the sketch, the per-line
-/// (point_a, point_b) ids, and a handle→line-id map for resolving constraints.
-fn sketch_from_doc(
-    doc: &Document,
-) -> (Sketch, Vec<(usize, usize)>, std::collections::HashMap<Handle, usize>, Vec<usize>) {
-    use std::collections::HashMap;
-    let mut lines: Vec<(Handle, usize, Vec2, Vec2)> = Vec::new(); // (handle, dobj idx, a, b)
+/// Everything needed to build the sketch from the drawing, resolve handle-based
+/// constraints, write solved geometry back, and colour each entity by DOF.
+struct DocMap {
+    sk: Sketch,
+    /// per collected line: (dobject idx, point a id, point b id)
+    lines: Vec<(usize, usize, usize)>,
+    /// per collected circle: (dobject idx, center point id, radius scalar id)
+    circles: Vec<(usize, usize, usize)>,
+    line_id: HashMap<Handle, usize>,   // handle → sketch line id
+    circle_id: HashMap<Handle, usize>, // handle → sketch circle id
+    /// handle → its parameter indices in the flat unknown vector (for colouring)
+    handle_params: HashMap<Handle, Vec<usize>>,
+}
+
+/// Build a `cad_param::Sketch` from the drawing's LINE and CIRCLE dobjects.
+/// Coincident endpoints / centers are merged into shared points.
+fn build_doc_map(doc: &Document) -> DocMap {
+    // 1. collect geometry
+    let mut raw_lines: Vec<(Handle, usize, Vec2, Vec2)> = Vec::new();
+    let mut raw_circles: Vec<(Handle, usize, Vec2, f64)> = Vec::new();
     for (idx, d) in doc.dobjects.iter().enumerate() {
-        if let Geom::Line(l) = &d.geom {
-            lines.push((d.handle, idx, l.a, l.b));
+        match &d.geom {
+            Geom::Line(l) => raw_lines.push((d.handle, idx, l.a, l.b)),
+            Geom::Circle(c) => raw_circles.push((d.handle, idx, c.center, c.radius)),
+            _ => {}
         }
     }
+
+    // 2. intern all points (line endpoints + circle centers) FIRST, so scalar
+    //    indices (which follow all points) are stable.
     let mut pts: Vec<Vec2> = Vec::new();
-    let mut line_pts: Vec<(usize, usize)> = Vec::with_capacity(lines.len());
-    for (_, _, a, b) in &lines {
-        let pa = intern(&mut pts, *a);
-        let pb = intern(&mut pts, *b);
-        line_pts.push((pa, pb));
-    }
+    let line_pt_ids: Vec<(usize, usize)> = raw_lines
+        .iter()
+        .map(|(_, _, a, b)| (intern(&mut pts, *a), intern(&mut pts, *b)))
+        .collect();
+    let circ_center_ids: Vec<usize> = raw_circles
+        .iter()
+        .map(|(_, _, c, _)| intern(&mut pts, *c))
+        .collect();
+
     let mut sk = Sketch::new();
     for p in &pts {
         sk.add_point(p.x, p.y);
     }
-    let mut line_id: HashMap<Handle, usize> = HashMap::new();
-    for (k, (h, _, _, _)) in lines.iter().enumerate() {
-        let (pa, pb) = line_pts[k];
+    let np = sk.points.len();
+
+    // 3. circle radii become scalars (after all points).
+    let circ_scalar_ids: Vec<usize> = raw_circles
+        .iter()
+        .map(|(_, _, _, r)| sk.add_scalar(*r))
+        .collect();
+
+    // 4. build line + circle entities and the lookup maps.
+    let mut line_id = HashMap::new();
+    let mut circle_id = HashMap::new();
+    let mut handle_params: HashMap<Handle, Vec<usize>> = HashMap::new();
+    let mut lines = Vec::with_capacity(raw_lines.len());
+    let mut circles = Vec::with_capacity(raw_circles.len());
+
+    for (k, (h, dobj, _, _)) in raw_lines.iter().enumerate() {
+        let (pa, pb) = line_pt_ids[k];
         line_id.insert(*h, sk.add_line(pa, pb));
+        lines.push((*dobj, pa, pb));
+        handle_params.insert(*h, vec![2 * pa, 2 * pa + 1, 2 * pb, 2 * pb + 1]);
     }
-    let dobj_idx: Vec<usize> = lines.iter().map(|(_, idx, _, _)| *idx).collect();
-    (sk, line_pts, line_id, dobj_idx)
+    for (k, (h, dobj, _, _)) in raw_circles.iter().enumerate() {
+        let c = circ_center_ids[k];
+        let s = circ_scalar_ids[k];
+        circle_id.insert(*h, sk.add_circle(c, s));
+        circles.push((*dobj, c, s));
+        handle_params.insert(*h, vec![2 * c, 2 * c + 1, 2 * np + s]);
+    }
+
+    DocMap { sk, lines, circles, line_id, circle_id, handle_params }
 }
 
-/// Build the sketch, apply the session's constraints, solve, and write the
-/// solved point positions back into the drawing's lines (shared points keep
-/// connected lines together). Returns a status string.
-pub fn solve_doc(doc: &mut Document, session: &ParamSession) -> String {
-    let (mut sk, line_pts, line_id, dobj_idx) = sketch_from_doc(doc);
-    if sk.lines.is_empty() {
-        return "parametric: no lines to solve".into();
+/// Translate the session's handle-based constraints into the sketch. Returns how
+/// many resolved (an unresolved one means its geometry is gone). Anchors the
+/// first point so the sketch can't float.
+fn apply_constraints(map: &mut DocMap, doc: &Document, session: &ParamSession) -> usize {
+    if let Some(p0) = map.sk.points.first().copied() {
+        map.sk.add(Constraint::Fixed { p: 0, x: p0.x, y: p0.y });
     }
-    // Ground the sketch: anchor the first point at its current location so the
-    // solver has a fixed reference (otherwise the whole sketch can float).
-    if !sk.points.is_empty() {
-        let p0 = sk.points[0];
-        sk.add(Constraint::Fixed { p: 0, x: p0.x, y: p0.y });
-    }
-    // Translate handle-based user constraints to sketch ids (counting how many
-    // actually resolve — an unresolved one means the geometry it referenced is
-    // gone, which is the usual "nothing happened" cause).
+    let _ = doc; // doc kept for future kind lookups beyond the maps
     let mut resolved = 0usize;
     for c in &session.constraints {
-        match *c {
-            CRef::Horizontal(h) => if let Some(&l) = line_id.get(&h) {
-                sk.add(Constraint::Horizontal { line: l }); resolved += 1;
-            },
-            CRef::Vertical(h) => if let Some(&l) = line_id.get(&h) {
-                sk.add(Constraint::Vertical { line: l }); resolved += 1;
-            },
-            CRef::Parallel(a, b) => if let (Some(&la), Some(&lb)) = (line_id.get(&a), line_id.get(&b)) {
-                sk.add(Constraint::Parallel { a: la, b: lb }); resolved += 1;
-            },
-            CRef::Perpendicular(a, b) => if let (Some(&la), Some(&lb)) = (line_id.get(&a), line_id.get(&b)) {
-                sk.add(Constraint::Perpendicular { a: la, b: lb }); resolved += 1;
-            },
-            CRef::Equal(a, b) => if let (Some(&la), Some(&lb)) = (line_id.get(&a), line_id.get(&b)) {
-                sk.add(Constraint::EqualLength { a: la, b: lb }); resolved += 1;
-            },
-            CRef::Length(h, d) => if let Some(&l) = line_id.get(&h) {
-                let ln = sk.lines[l];
-                sk.add(Constraint::Distance { p: ln.a, q: ln.b, d }); resolved += 1;
-            },
+        let added = match *c {
+            CRef::Horizontal(h) => map.line_id.get(&h).map(|&l| Constraint::Horizontal { line: l }),
+            CRef::Vertical(h) => map.line_id.get(&h).map(|&l| Constraint::Vertical { line: l }),
+            CRef::Parallel(a, b) => pair(&map.line_id, a, b).map(|(la, lb)| Constraint::Parallel { a: la, b: lb }),
+            CRef::Perpendicular(a, b) => pair(&map.line_id, a, b).map(|(la, lb)| Constraint::Perpendicular { a: la, b: lb }),
+            CRef::Collinear(a, b) => pair(&map.line_id, a, b).map(|(la, lb)| Constraint::Collinear { a: la, b: lb }),
+            CRef::Equal(a, b) => pair(&map.line_id, a, b).map(|(la, lb)| Constraint::EqualLength { a: la, b: lb }),
+            CRef::Angle(a, b, d) => pair(&map.line_id, a, b).map(|(la, lb)| Constraint::Angle { a: la, b: lb, radians: d }),
+            CRef::Length(h, d) => map.line_id.get(&h).map(|&l| {
+                let ln = map.sk.lines[l];
+                Constraint::Distance { p: ln.a, q: ln.b, d }
+            }),
+            CRef::Radius(h, r) => map.circle_id.get(&h).map(|&c| Constraint::Radius { circle: c, r }),
+            CRef::Concentric(a, b) => pair(&map.circle_id, a, b).map(|(ca, cb)| Constraint::Concentric { a: ca, b: cb }),
+            CRef::EqualRadius(a, b) => pair(&map.circle_id, a, b).map(|(ca, cb)| Constraint::EqualRadius { a: ca, b: cb }),
+            CRef::Tangent(a, b) => {
+                let (la, ca) = (map.line_id.get(&a).copied(), map.circle_id.get(&a).copied());
+                let (lb, cb) = (map.line_id.get(&b).copied(), map.circle_id.get(&b).copied());
+                match (la, ca, lb, cb) {
+                    (Some(l), _, _, Some(c)) => Some(Constraint::TangentLineCircle { line: l, circle: c }),
+                    (_, Some(c), Some(l), _) => Some(Constraint::TangentLineCircle { line: l, circle: c }),
+                    (_, Some(x), _, Some(y)) => Some(Constraint::TangentCircleCircle { a: x, b: y, internal: false }),
+                    _ => None,
+                }
+            }
+        };
+        if let Some(con) = added {
+            map.sk.add(con);
+            resolved += 1;
         }
     }
-    let rep = solve(&mut sk);
-    // Write solved coords back into the drawing's lines.
-    for (k, &idx) in dobj_idx.iter().enumerate() {
-        let (pa, pb) = line_pts[k];
+    resolved
+}
+
+fn pair(m: &HashMap<Handle, usize>, a: Handle, b: Handle) -> Option<(usize, usize)> {
+    match (m.get(&a), m.get(&b)) {
+        (Some(&x), Some(&y)) => Some((x, y)),
+        _ => None,
+    }
+}
+
+/// Build the sketch, apply constraints, solve, and write solved geometry back
+/// into the drawing (lines AND circles). Returns a status string.
+pub fn solve_doc(doc: &mut Document, session: &ParamSession) -> String {
+    let mut map = build_doc_map(doc);
+    if map.sk.lines.is_empty() && map.sk.circles.is_empty() {
+        return "parametric: no line/circle geometry to solve".into();
+    }
+    let resolved = apply_constraints(&mut map, doc, session);
+    let rep = solve(&mut map.sk);
+
+    // write back lines
+    for &(idx, pa, pb) in &map.lines {
         if let Some(d) = doc.dobjects.get_mut(idx) {
             if let Geom::Line(l) = &mut d.geom {
-                l.a = sk.points[pa];
-                l.b = sk.points[pb];
+                l.a = map.sk.points[pa];
+                l.b = map.sk.points[pb];
             }
         }
     }
+    // write back circles
+    for &(idx, c, s) in &map.circles {
+        if let Some(d) = doc.dobjects.get_mut(idx) {
+            if let Geom::Circle(circ) = &mut d.geom {
+                circ.center = map.sk.points[c];
+                circ.radius = map.sk.scalars[s].abs();
+            }
+        }
+    }
+
+    let n_geom = map.sk.lines.len() + map.sk.circles.len();
     format!(
-        "solved {} line(s): {}/{} constraints applied · dof={} · rms={:.2e}{}",
-        sk.lines.len(), resolved, session.constraints.len(), rep.dof, rep.residual,
+        "solved {} entit{}: {}/{} constraints applied · rms={:.2e}{}",
+        n_geom,
+        if n_geom == 1 { "y" } else { "ies" },
+        resolved,
+        session.constraints.len(),
+        rep.residual,
         if rep.converged { "" } else { "  (NOT converged)" }
     )
+}
+
+/// Compute the degrees-of-freedom diagnosis WITHOUT moving geometry, plus a
+/// per-handle "fully defined" map for the canvas overlay. Cheap for the small
+/// sketches parametric mode targets.
+pub fn analyze_doc(doc: &Document, session: &ParamSession) -> (DofReport, HashMap<Handle, bool>) {
+    let mut map = build_doc_map(doc);
+    let _ = apply_constraints(&mut map, doc, session);
+    let rep = dof_analysis(&map.sk);
+    let mut defined = HashMap::new();
+    for (h, params) in &map.handle_params {
+        let all_locked = params.iter().all(|&i| !rep.param_free.get(i).copied().unwrap_or(true));
+        defined.insert(*h, all_locked);
+    }
+    (rep, defined)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cad_kernel::{DObject, Line};
+    use cad_kernel::{Circle, DObject, Line};
 
     fn add_line(doc: &mut Document, a: Vec2, b: Vec2) -> Handle {
         let d = DObject::new(Geom::Line(Line { a, b }));
+        let h = d.handle;
+        doc.dobjects.push(d);
+        h
+    }
+    fn add_circle(doc: &mut Document, c: Vec2, r: f64) -> Handle {
+        let d = DObject::new(Geom::Circle(Circle { center: c, radius: r }));
         let h = d.handle;
         doc.dobjects.push(d);
         h
@@ -177,14 +329,14 @@ mod tests {
         sess.constraints.push(CRef::Horizontal(h0));
         let msg = solve_doc(&mut doc, &sess);
         let Geom::Line(l) = &doc.dobjects[0].geom else { panic!() };
-        assert!((l.a.y - l.b.y).abs() < 1e-6, "not horizontal: {:?}->{:?} ({msg})", l.a, l.b);
+        assert!((l.a.y - l.b.y).abs() < 1e-6, "not horizontal ({msg})");
     }
 
     #[test]
     fn solve_doc_makes_two_lines_perpendicular() {
         let mut doc = Document::default();
         let h0 = add_line(&mut doc, Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0));
-        let h1 = add_line(&mut doc, Vec2::new(0.0, 0.0), Vec2::new(8.0, 3.0)); // shares start
+        let h1 = add_line(&mut doc, Vec2::new(0.0, 0.0), Vec2::new(8.0, 3.0));
         let mut sess = ParamSession::new();
         sess.constraints.push(CRef::Perpendicular(h0, h1));
         let _ = solve_doc(&mut doc, &sess);
@@ -193,5 +345,50 @@ mod tests {
         let u = l0.b - l0.a;
         let v = l1.b - l1.a;
         assert!(u.dot(v).abs() < 1e-5, "dot={}", u.dot(v));
+    }
+
+    #[test]
+    fn solve_doc_sets_circle_radius() {
+        let mut doc = Document::default();
+        let h = add_circle(&mut doc, Vec2::new(2.0, 2.0), 3.0);
+        let mut sess = ParamSession::new();
+        sess.constraints.push(CRef::Radius(h, 9.0));
+        let _ = solve_doc(&mut doc, &sess);
+        let Geom::Circle(c) = &doc.dobjects[0].geom else { panic!() };
+        assert!((c.radius - 9.0).abs() < 1e-6, "r={}", c.radius);
+    }
+
+    #[test]
+    fn solve_doc_makes_circles_concentric_and_equal() {
+        let mut doc = Document::default();
+        let h0 = add_circle(&mut doc, Vec2::new(0.0, 0.0), 5.0);
+        let h1 = add_circle(&mut doc, Vec2::new(4.0, 1.0), 2.0);
+        let mut sess = ParamSession::new();
+        sess.constraints.push(CRef::Concentric(h0, h1));
+        sess.constraints.push(CRef::EqualRadius(h0, h1));
+        let _ = solve_doc(&mut doc, &sess);
+        let Geom::Circle(c0) = &doc.dobjects[0].geom else { panic!() };
+        let Geom::Circle(c1) = &doc.dobjects[1].geom else { panic!() };
+        assert!((c0.center - c1.center).len() < 1e-5, "centers differ");
+        assert!((c0.radius - c1.radius).abs() < 1e-5, "radii differ");
+    }
+
+    #[test]
+    fn analyze_reports_underdefined_then_defined() {
+        let mut doc = Document::default();
+        let h0 = add_line(&mut doc, Vec2::new(0.0, 0.0), Vec2::new(10.0, 1.0));
+        let sess = ParamSession::new();
+        let (rep, defined) = analyze_doc(&doc, &sess);
+        // anchored first point removes 2 DOF; a free line still has DOF left
+        assert!(rep.dof > 0, "expected under-defined, dof={}", rep.dof);
+        assert_eq!(defined.get(&h0), Some(&false));
+    }
+
+    #[test]
+    fn eval_field_uses_variables() {
+        let mut sess = ParamSession::new();
+        sess.vars.set("W", "120");
+        assert!((sess.eval_field("=W/2").unwrap() - 60.0).abs() < 1e-9);
+        assert!((sess.eval_field("25").unwrap() - 25.0).abs() < 1e-9);
     }
 }

@@ -16,10 +16,12 @@
 //! Under-constrained sketches still solve (LM stays near the current guess);
 //! over/well-constrained ones converge to residual ≈ 0.
 
+pub mod expr;
+pub mod io;
 pub mod model;
 pub mod solve;
-pub mod io;
 
-pub use model::{Constraint, Line, LineId, PointId, Sketch};
-pub use solve::{residuals, solve, SolveReport};
+pub use expr::{eval, Var, VarTable};
 pub use io::{read_rsmp, write_rsmp};
+pub use model::{Circle, CircleId, Constraint, Line, LineId, PointId, ScalarId, Sketch};
+pub use solve::{dof_analysis, residuals, solve, DofReport, SolveReport};
