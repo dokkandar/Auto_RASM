@@ -91,6 +91,28 @@ AutoCAD-style `zoom`/`z` sub-option flow (`ZoomState` enum + `zoom_*` methods in
 
 ---
 
+## Groups — PLANNED (deferred 2026-06-20)
+
+Requested: an AutoCAD-style **GROUP** — a named set where objects stay
+individual/editable but selecting one selects the whole set. The app currently
+has **Blocks** (named INSTANCE collections) but **no Group concept**.
+
+Driving use case (user's AutoLISP `c:PasteGroup`): paste clipboard as individual
+entities, place them, then ask *"Group pasted objects? [Yes/No]"* and, if Yes,
+`_.group` them under a unique name.
+
+**Decision 2026-06-20:** SKIP grouping for now — current Paste already pastes
+individual entities + places them (base→dest ghost) + leaves them selected,
+which covers the non-group part. Build real Groups later as its own task:
+- data model: `groups: Vec<{ name, members: Vec<Handle> }>` (handles, not
+  indices, so they survive reindex);
+- selection: clicking a grouped object selects the whole group (toggle to edit
+  one);
+- persistence: store in `.rsm`; DXF GROUPS section later;
+- then wire the post-paste "Group? [Y/N]" prompt to create one.
+
+---
+
 ## Hatch rules — TO DISCUSS / DECIDE (open)
 
 **Observed (2026-06-19):** selecting a hatch and running Move selects it but it
