@@ -213,3 +213,32 @@ Remove the diagnostic once fixed.
 - Move ghost preview.
 - Reconcile origin/main's +commits with this branch (overlapping file-dialog/zoom
   work — do NOT blind-merge).
+
+---
+
+## Module split refactor (2026-06-23) — pure code movement, no behaviour change
+
+To let multiple agents edit features without colliding in the monolith files,
+trim / join / fillet-chamfer-offset / pedit were extracted into their own files.
+
+**Kernel** (`cad_kernel/src/`):
+- `geom.rs` (was 4402 lines) now holds ONLY type defs (Geom, Line, Arc, …) and
+  their core methods (bbox, distance_to_point, endpoints, transforms, grips).
+- `join.rs` — `join_geoms` + chain/collinear/concentric helpers + bulge math
+  (`bulge_arc`, `bulge_from_arc`, `polyline_segments`) + `JOIN_EPS`/`CHAIN_EPS`.
+- `trim.rs` — `Geom::trim_at`, `join_trim_survivors`, `circular_union`, `same_ellipse`.
+- `modify.rs` — `Geom::offset`, `fillet_lines`, `chamfer_lines`, offset helpers.
+- `lib.rs` re-exports unchanged at the crate root (`cad_kernel::join_geoms`, etc.)
+  so external callers are unaffected. `JOIN_EPS` is `pub(crate)` (shared join+trim).
+- Tests stayed in geom.rs (the 3 `#[cfg(test)]` modules) with added
+  `use crate::{join,trim,modify}::*;`. 170 tests pass. (Could relocate tests into
+  each module later — optional follow-up.)
+
+**App** (`cad_app/src/`):
+- `app/pedit.rs` — all `pedit_*` methods (child module of `app`, so it reaches
+  CadApp's private fields/helpers via `use super::*`; methods are `pub(crate)`).
+  `app.rs` declares `mod pedit;` near the top. `explode_polyline` + `idx_of_handle`
+  stayed in app.rs (shared with non-pedit code).
+
+Rule for future splits: child-module-of-app for app-layer features (keeps private
+access); separate top-level module + `pub use` re-export for kernel features.

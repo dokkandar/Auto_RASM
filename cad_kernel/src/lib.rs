@@ -23,6 +23,9 @@
 
 pub mod math;
 pub mod geom;
+pub mod join;
+pub mod trim;
+pub mod modify;
 pub mod color;
 pub mod lineweight;
 pub mod linetype;
@@ -50,9 +53,12 @@ pub use dim::{Dim, DimKind, DimStyle, DimStyleTable, LinearOrtho};
 pub use wallstyle::{WallStyle, WallStyleTable};
 pub use block::{Block, BlockParam, BlockRef, BlockTable, ParamVector, MAX_BLOCK_PARAMS};
 pub use blockdiff::{diff_blocks, BlockDiff, ParamCluster};
-pub use geom::{bulge_arc, bulge_from_arc};
+pub use join::{bulge_arc, bulge_from_arc};
 pub mod patterns;
-pub use geom::{ChamferOut, FilletOut, GripRole, JoinOut, chamfer_lines, fillet_lines, join_geoms, join_trim_survivors};
+pub use geom::GripRole;
+pub use join::{join_geoms, JoinOut};
+pub use trim::join_trim_survivors;
+pub use modify::{chamfer_lines, fillet_lines, ChamferOut, FilletOut};
 pub use color::{aci_palette, resolve_color, Color, TrueColorTable};
 pub use lineweight::{resolve_lineweight, Lineweight, DEFAULT_LINEWEIGHT_MM};
 pub use linetype::{Linetype, LinetypeTable};
