@@ -14435,6 +14435,32 @@ impl CadApp {
     /// pline state. `closed` selects whether the last bulge slot
     /// (segment from final vertex back to first) is set; it stays 0 in
     /// the MVP since `c`/close was a Line-mode action.
+    /// Empty-Enter while entering a PLINE width: accept the default. In
+    /// AwaitingStart it keeps the current start and moves to the ending-width
+    /// prompt; in AwaitingEnd it sets end = start. Called from the empty-Enter
+    /// handler so accepting a default width does NOT finish the polyline.
+    fn pline_width_accept_default(&mut self) {
+        match self.pline_width_cap {
+            PlineWidthCap::AwaitingStart { half } => {
+                let start = self.pline_next_width.0;
+                self.pline_width_cap = PlineWidthCap::AwaitingEnd { half, start };
+                self.set_prompt(format!(
+                    "pline {}: ending width <{:.4}>  [Enter = same]",
+                    if half { "halfwidth" } else { "width" },
+                    if half { start * 0.5 } else { start }));
+                self.refocus_cmd = true;
+            }
+            PlineWidthCap::AwaitingEnd { start, .. } => {
+                self.pline_next_width = (start, start);
+                self.pline_width_cap = PlineWidthCap::None;
+                self.history.push(format!(
+                    "  pline: width start={:.4} end={:.4}", start, start));
+                self.update_pline_prompt();
+            }
+            PlineWidthCap::None => {}
+        }
+    }
+
     fn drain_pline_pending(&mut self, closed: bool) -> (Vec<PolyVertex>, Vec<(f64, f64)>) {
         let n = self.pending.len();
         // Per-segment widths (parallel to bulges). seg_count = n-1 open, n
@@ -17455,6 +17481,26 @@ impl eframe::App for CadApp {
             match self.pedit_state {
                 PeditState::Width(h) => { self.pedit_state = PeditState::Menu(h); self.pedit_reprompt(h); }
                 _ => self.pedit_exit(),
+            }
+            return;
+        }
+        // PLINE width / arc sub-flow: an empty Enter belongs to the sub-flow
+        // (accept the default width, or cancel an arc sub-flow) — it must NOT
+        // fall through and FINISH the polyline. Without this, pressing Enter to
+        // accept a default width committed the whole polyline and dropped the
+        // width entry.
+        if trigger && cmd_is_empty && self.tool == Tool::Polyline
+            && (self.pline_width_cap != PlineWidthCap::None
+                || self.pline_arc_sub != PlineArcSub::Normal)
+        {
+            if space_now { self.cmd.clear(); }
+            if self.pline_width_cap != PlineWidthCap::None {
+                self.pline_width_accept_default();
+            } else {
+                self.pline_arc_sub = PlineArcSub::Normal;
+                self.pline_dir_override = None;
+                self.history.push("  pline: cancelled arc sub-flow".into());
+                self.update_pline_prompt();
             }
             return;
         }
