@@ -358,6 +358,25 @@ pub fn current_rms(s: &Sketch) -> f64 {
     if r.is_empty() { 0.0 } else { (sum_sq(&r) / r.len() as f64).sqrt() }
 }
 
+/// Per-constraint residual MAGNITUDE at the sketch's current positions, aligned
+/// 1:1 with `sketch.constraints`. Lets the recorder show exactly which equation
+/// is satisfied (≈0) and which is fighting.
+pub fn residual_breakdown(s: &Sketch) -> Vec<f64> {
+    let (x, _) = pack(s);
+    let r = residuals(s, &x);
+    let mut out = Vec::with_capacity(s.constraints.len());
+    let mut k = 0;
+    for c in &s.constraints {
+        let n = c.residual_count();
+        let mut ss = 0.0;
+        for _ in 0..n {
+            if k < r.len() { ss += r[k] * r[k]; k += 1; }
+        }
+        out.push(ss.sqrt());
+    }
+    out
+}
+
 /// Diagnose degrees of freedom by the RANK of the constraint Jacobian at the
 /// sketch's current configuration. `dof = free_params − rank`. Also reports which
 /// individual parameters remain free (non-pivot columns) so the UI can colour

@@ -10701,10 +10701,17 @@ impl CadApp {
                     // ===== Solver diagnostics (the math recorder) =====
                     ui.add_space(6.0);
                     ui.separator();
-                    let hdr = if self.parametric.show_trace { "🔬 Solver diagnostics ▼" } else { "🔬 Solver diagnostics ▶" };
-                    if ui.selectable_label(false, hdr).clicked() {
-                        self.parametric.show_trace = !self.parametric.show_trace;
-                    }
+                    ui.horizontal(|ui| {
+                        let hdr = if self.parametric.show_trace { "🔬 Solver diagnostics ▼" } else { "🔬 Solver diagnostics ▶" };
+                        if ui.selectable_label(false, hdr).clicked() {
+                            self.parametric.show_trace = !self.parametric.show_trace;
+                        }
+                        if !self.parametric.last_trace.lines.is_empty()
+                            && ui.small_button("📋 copy log").clicked() {
+                            ui.ctx().copy_text(self.parametric.last_trace.lines.join("\n"));
+                            self.parametric.status = "solve log copied to clipboard".into();
+                        }
+                    });
                     if self.parametric.show_trace {
                         if self.parametric.last_trace.lines.is_empty() {
                             ui.small("(apply or re-solve a constraint to record a trace)");
@@ -10787,26 +10794,28 @@ impl CadApp {
             let before = self.doc.clone();
             self.snapshot_doc();
             let out = crate::param_editor::solve_doc(&mut self.doc, &self.parametric);
+            let full_trace = out.trace.lines.join("\n");
+            let converged = out.converged;
+            let msg = out.msg;
+            let trace = out.trace;
 
-            if let (Some(lbl), false) = (just_added_label.as_ref(), out.converged) {
+            if let (Some(lbl), false) = (just_added_label.as_ref(), converged) {
                 // The just-added constraint conflicts / over-defines the sketch.
                 // Restore geometry, drop the constraint, and undo the snapshot so
                 // history stays clean (SolidWorks: "would over-define the sketch").
                 self.doc = before;
                 self.undo_stack.pop();
                 self.parametric.constraints.pop();
-                let msg = format!("⚠ '{lbl}' conflicts / over-defines — NOT applied (use ✖ to free up constraints first)");
-                crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::Note {
-                    message: format!("param solve: rejected {lbl} (rms NOT converged)") });
-                self.parametric.status = msg;
-                self.parametric.last_trace = out.trace;
+                self.parametric.status =
+                    format!("⚠ '{lbl}' conflicts / over-defines — NOT applied (use ✖ to free up constraints first)");
             } else {
-                crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::Note {
-                    message: format!("param solve: {}", out.msg) });
-                self.history.push(format!("  parametric: {}", out.msg));
-                self.parametric.status = out.msg;
-                self.parametric.last_trace = out.trace;
+                self.history.push(format!("  parametric: {}", msg));
+                self.parametric.status = msg;
             }
+            self.parametric.last_trace = trace;
+            // Record the FULL math trace (geometry + sketch + residuals in/out)
+            // into the session recorder so a Start/Stop dump captures everything.
+            crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::Note { message: full_trace });
             self.index_dirty = true;
             self.gpu_dirty = true;
             // record the post-solve geometry so keep-link doesn't re-fire on it

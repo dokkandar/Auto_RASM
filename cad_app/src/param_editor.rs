@@ -496,6 +496,23 @@ fn cref_report(doc: &Document, c: &CRef) -> String {
     }
 }
 
+/// One line per constrainable dobject — handle + geometry. Used to record the
+/// INPUT and OUTPUT geometry in the solve trace.
+fn doc_geom_lines(doc: &Document) -> Vec<String> {
+    let fv = |p: Vec2| format!("({:.3}, {:.3})", p.x, p.y);
+    let mut out = Vec::new();
+    for d in &doc.dobjects {
+        match &d.geom {
+            Geom::Line(l) => out.push(format!("  h={:?} line   {} → {}  len={:.3}", d.handle, fv(l.a), fv(l.b), (l.b - l.a).len())),
+            Geom::Circle(c) => out.push(format!("  h={:?} circle c={} r={:.3}", d.handle, fv(c.center), c.radius)),
+            _ => if let Some((s, e)) = straight_wall(&d.geom) {
+                out.push(format!("  h={:?} wall   {} → {}  len={:.3}", d.handle, fv(s), fv(e), (e - s).len()));
+            },
+        }
+    }
+    out
+}
+
 /// Build the sketch, apply constraints, solve, and write solved geometry back
 /// into the drawing (lines AND circles). Returns the outcome (message +
 /// convergence) so the caller can roll a conflicting constraint back.
@@ -549,10 +566,30 @@ pub fn solve_doc_driven(
         map.sk.add(Constraint::Fixed { p: i, x: p.x, y: p.y });
     }
 
+    // ---- record MATH INPUT (the exact cad_param sketch the solver sees) ----
+    let fmt_v = |p: Vec2| format!("({:.3}, {:.3})", p.x, p.y);
+    let input_geom = doc_geom_lines(doc); // doc still original until write-back
+    let mut math_in: Vec<String> = Vec::new();
+    math_in.push(format!("points ({}):", map.sk.points.len()));
+    for (i, p) in map.sk.points.iter().enumerate() {
+        math_in.push(format!("  p{i} = {}", fmt_v(*p)));
+    }
+    if !map.sk.scalars.is_empty() {
+        math_in.push(format!("scalars ({}): {:?}", map.sk.scalars.len(), map.sk.scalars));
+    }
+    for (i, l) in map.sk.lines.iter().enumerate() {
+        math_in.push(format!("  L{i} = p{}→p{}", l.a, l.b));
+    }
+    for (i, c) in map.sk.circles.iter().enumerate() {
+        math_in.push(format!("  C{i} = centre p{} radius s{}", c.center, c.radius));
+    }
+    let res_in = cad_param::residual_breakdown(&map.sk);
+
     // ---- solve (record before/after for the diagnostics trace) ----
     let init_pts = map.sk.points.clone();
     let init_rms = cad_param::current_rms(&map.sk);
     let rep = solve(&mut map.sk);
+    let res_out = cad_param::residual_breakdown(&map.sk);
     let max_disp = init_pts.iter().zip(&map.sk.points)
         .map(|(a, b)| (*b - *a).len())
         .fold(0.0_f64, f64::max);
@@ -597,31 +634,46 @@ pub fn solve_doc_driven(
         if rep.converged { "" } else { "  (NOT converged)" }
     );
 
-    // ---- assemble the diagnostic trace (the "math procedure" recorder) ----
-    let mut trace = SolveTrace::default();
-    trace.lines.push(format!(
-        "geometry: {} line/wall + {} circle ({} sketch points)",
-        map.lines.len() + map.walls.len(), map.circles.len(), map.sk.points.len()
-    ));
-    if !drivers.is_empty() {
-        trace.lines.push(format!("driver entities pinned: {}", drivers.len()));
+    let output_geom = doc_geom_lines(doc); // doc now holds solved geometry
+
+    // ---- assemble the full solve recorder (geometry + math, in & out) ----
+    let mut t: Vec<String> = Vec::new();
+    t.push("════════ PARAMETRIC SOLVE ════════".into());
+    let drv: Vec<String> = drivers.iter().map(|h| format!("{h:?}")).collect();
+    t.push(format!("drivers (pinned as moved): [{}]", drv.join(", ")));
+    t.push(format!("user constraints: {} ({} resolved)", total, resolved));
+    t.push("── INPUT geometry ──".into());
+    t.extend(input_geom);
+    t.push("── MATH INPUT (cad_param sketch) ──".into());
+    t.extend(math_in);
+    t.push(format!("── CONSTRAINTS (sketch, {} eqs) · residual in → out ──", map.sk.constraints.len()));
+    let mut nfixed = 0usize;
+    for (i, c) in map.sk.constraints.iter().enumerate() {
+        if matches!(c, Constraint::Fixed { .. }) { nfixed += 1; continue; }
+        t.push(format!(
+            "  {:?}   r {:.2e} → {:.2e}",
+            c, res_in.get(i).copied().unwrap_or(0.0), res_out.get(i).copied().unwrap_or(0.0)
+        ));
     }
-    trace.lines.push(format!("unrelated points pinned: {}", pinned));
-    trace.lines.push(format!("constraints resolved: {}/{}", resolved, total));
-    trace.lines.push(format!(
-        "rms {:.3e} → {:.3e} · {} iters · {}",
+    t.push(format!("  (+ {nfixed} Fixed anchors/pins)"));
+    t.push("── SOLVE ──".into());
+    t.push(format!(
+        "  rms {:.3e} → {:.3e}   {} iters   {}",
         init_rms, rep.residual, rep.iterations,
-        if rep.converged { "✓ converged" } else { "✗ DIVERGED / not converged" }
+        if rep.converged { "✓ CONVERGED" } else { "✗ DIVERGED / not converged" }
     ));
-    trace.lines.push(format!("largest point move: {:.3}", max_disp));
+    t.push(format!("  unrelated points pinned: {pinned}   largest point move: {max_disp:.3}"));
+    t.push("── OUTPUT geometry ──".into());
+    t.extend(output_geom);
     if !session.constraints.is_empty() {
-        trace.lines.push("per-constraint error (on solved geometry):".into());
+        t.push("── per-constraint geometric error (solved) ──".into());
         for c in &session.constraints {
-            trace.lines.push(format!("  • {}", cref_report(doc, c)));
+            t.push(format!("  • {}", cref_report(doc, c)));
         }
     }
+    t.push("══════════════════════════════════".into());
 
-    SolveOutcome { msg, converged: rep.converged, trace }
+    SolveOutcome { msg, converged: rep.converged, trace: SolveTrace { lines: t } }
 }
 
 /// Compute the degrees-of-freedom diagnosis WITHOUT moving geometry, plus a
