@@ -601,7 +601,7 @@ fn parse_polyline(args: &[&str]) -> Result<Command, String> {
     for tok in vert_args {
         vertices.push(PolyVertex { pos: parse_pt(tok)?, bulge: 0.0 });
     }
-    Ok(Command::Add(Geom::Polyline(Polyline { vertices, closed })))
+    Ok(Command::Add(Geom::Polyline(Polyline { vertices, closed, widths: Vec::new() })))
 }
 
 fn parse_circle(args: &[&str]) -> Result<Command, String> {

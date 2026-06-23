@@ -333,7 +333,7 @@ fn build_entity(kind: &str, fields: &[(i32, String)], doc: &Document) -> Option<
                 vertices.push(PolyVertex { pos: p, bulge: cur_bulge });
             }
             if vertices.is_empty() { return None; }
-            Geom::Polyline(Polyline { vertices, closed })
+            Geom::Polyline(Polyline { vertices, closed, widths: Vec::new() })
         }
         _ => return None,   // unknown entity type — silently skip
     };
@@ -700,6 +700,7 @@ mod tests {
                 PolyVertex { pos: Vec2::new(5.0, 5.0), bulge: 0.0 },
             ],
             closed: false,
+            widths: Vec::new(),
         }.into());
         let back = round_trip(&doc);
         if let Geom::Polyline(p) = &back.dobjects[0].geom {
@@ -719,6 +720,7 @@ mod tests {
                 PolyVertex { pos: Vec2::new(0.0, 5.0), bulge: 0.0 },
             ],
             closed: true,
+            widths: Vec::new(),
         }.into());
         let back = round_trip(&doc);
         if let Geom::Polyline(p) = &back.dobjects[0].geom {

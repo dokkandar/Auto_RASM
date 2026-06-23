@@ -209,6 +209,12 @@ pub struct PolyVertex {
 pub struct Polyline {
     pub vertices: Vec<PolyVertex>,
     pub closed:   bool,
+    /// Per-segment (start_width, end_width) in drawing units, linear taper
+    /// within each segment. EMPTY = no width (render as a thin stroke — current
+    /// behaviour). When non-empty, length == segment count (vertices.len()-1
+    /// for open, vertices.len() for closed); index i is the segment FROM
+    /// vertex i.
+    pub widths: Vec<(f64, f64)>,
 }
 
 impl Polyline {
@@ -234,6 +240,10 @@ impl Polyline {
             let (smin, smax) = seg.bbox();
             min.x = min.x.min(smin.x); min.y = min.y.min(smin.y);
             max.x = max.x.max(smax.x); max.y = max.y.max(smax.y);
+        }
+        let hw = self.widths.iter().flat_map(|&(a,b)| [a,b]).fold(0.0_f64, f64::max) * 0.5;
+        if hw > 0.0 {
+            min.x -= hw; min.y -= hw; max.x += hw; max.y += hw;
         }
         (min, max)
     }
@@ -531,6 +541,7 @@ impl Geom {
                     .map(|v| PolyVertex { pos: rot(v.pos), bulge: v.bulge })
                     .collect(),
                 closed: p.closed,
+                widths: p.widths.clone(),
             }),
             // Hatch transforms are NO-OPS — the hatch follows its
             // boundary dobjects (which transform on their own) via the
@@ -615,6 +626,7 @@ impl Geom {
                     .map(|v| PolyVertex { pos: sc(v.pos), bulge: v.bulge })
                     .collect(),
                 closed: p.closed,
+                widths: p.widths.iter().map(|&(a,b)| (a * f_abs, b * f_abs)).collect(),
             }),
             // No-op for the same reason as `rotated`.
             Geom::Hatch(h) => Geom::Hatch(h.clone()),
@@ -711,6 +723,7 @@ impl Geom {
                     .map(|v| PolyVertex { pos: mirror(v.pos), bulge: v.bulge })
                     .collect(),
                 closed: p.closed,
+                widths: p.widths.clone(),
             }),
             // No-op for the same reason as `rotated`.
             Geom::Hatch(h) => Geom::Hatch(h.clone()),
@@ -920,7 +933,11 @@ impl Geom {
                     };
                     new_verts[i].bulge = -p.vertices[old_seg].bulge;
                 }
-                Geom::Polyline(Polyline { vertices: new_verts, closed: p.closed })
+                Geom::Polyline(Polyline {
+                    vertices: new_verts,
+                    closed: p.closed,
+                    widths: { let mut w: Vec<(f64,f64)> = p.widths.iter().rev().map(|&(s,e)| (e,s)).collect(); w },
+                })
             }
             // Direction-agnostic — return a deep copy.
             // Spline: reversing a NURBS curve = reverse control points
@@ -989,6 +1006,7 @@ impl Geom {
                     .map(|v| PolyVertex { pos: v.pos + off, bulge: v.bulge })
                     .collect(),
                 closed:   p.closed,
+                widths:   p.widths.clone(),
             }),
             // No-op for the same reason as `rotated`.
             Geom::Hatch(h) => Geom::Hatch(h.clone()),
@@ -1365,6 +1383,7 @@ mod transform_tests {
                 PolyVertex { pos: Vec2::new(1.0, 1.0), bulge: 0.0 },
             ],
             closed: false,
+            widths: Vec::new(),
         });
         if let Geom::Polyline(p) = g.reversed() {
             assert_eq!(p.vertices[0].pos, Vec2::new(1.0, 1.0));
@@ -1412,6 +1431,7 @@ mod transform_tests {
                 PolyVertex { pos: Vec2::new(0.0, 6.0), bulge: 0.0 },
             ],
             closed: true,
+            widths: Vec::new(),
         });
         let out = g.offset(1.0, Vec2::new(5.0, 3.0)).expect("offset ok");
         let Geom::Polyline(pl) = out else { panic!("not a polyline") };
@@ -1439,6 +1459,7 @@ mod transform_tests {
                 PolyVertex { pos: Vec2::new(0.0, 6.0), bulge: 0.0 },
             ],
             closed: true,
+            widths: Vec::new(),
         });
         // Click OUTSIDE (below the bottom edge) → grow.
         let out = g.offset(1.0, Vec2::new(5.0, -3.0)).expect("offset ok");
@@ -1466,6 +1487,7 @@ mod transform_tests {
                 PolyVertex { pos: Vec2::new(0.0, 1.0), bulge: 0.0 },
             ],
             closed: false,
+            widths: Vec::new(),
         });
         let out = g.offset(1.0, Vec2::new(1.0, 1.0)).expect("offset ok");
         let Geom::Polyline(pl) = out else { panic!("not a polyline") };
@@ -1487,6 +1509,7 @@ mod transform_tests {
                 PolyVertex { pos: Vec2::new(10.0, 10.0), bulge: 0.0 },
             ],
             closed: false,
+            widths: Vec::new(),
         });
         let out = g.offset(1.0, Vec2::new(5.0, 1.0)).expect("offset ok");
         let Geom::Polyline(pl) = out else { panic!("not a polyline") };
@@ -2215,7 +2238,7 @@ impl Geom {
             (Geom::Polyline(p), GripRole::PolyVertex(i)) => {
                 let mut new_verts = p.vertices.clone();
                 if let Some(v) = new_verts.get_mut(i) { v.pos = new_pos; }
-                Geom::Polyline(Polyline { vertices: new_verts, closed: p.closed })
+                Geom::Polyline(Polyline { vertices: new_verts, closed: p.closed, widths: p.widths.clone() })
             }
             // ---- Spline (control-point edit) ---------------------------
             (Geom::Spline(s), GripRole::SplineCtrlPt(i)) => {
@@ -2516,6 +2539,7 @@ mod fillet_chamfer_join_tests {
                 PolyVertex { pos: Vec2::new(2.0, 0.0), bulge: 0.0 },
             ],
             closed: false,
+            widths: Vec::new(),
         };
         let (min, max) = pl.bbox();
         assert!(min.y <= -0.99, "bbox must include the arc apex, got min.y={}", min.y);
@@ -2733,6 +2757,7 @@ mod fillet_chamfer_join_tests {
                 PolyVertex { pos: Vec2::new(4.0, 4.0), bulge: 0.0 },
             ],
             closed: false,
+            widths: Vec::new(),
         };
         let g = Geom::Polyline(pl);
         let out = g.with_grip_moved(GripRole::PolyVertex(1), Vec2::new(4.0, -2.0));
@@ -2755,6 +2780,7 @@ mod fillet_chamfer_join_tests {
                 PolyVertex { pos: Vec2::new(4.0, 4.0), bulge: 0.0 },
             ],
             closed: false,
+            widths: Vec::new(),
         };
         let g = Geom::Polyline(pl);
         let cutter = Geom::Line(Line {
@@ -2776,6 +2802,7 @@ mod fillet_chamfer_join_tests {
                 PolyVertex { pos: Vec2::new(4.0, 4.0), bulge: 0.0 },
             ],
             closed: false,
+            widths: Vec::new(),
         };
         let g = Geom::Polyline(pl);
         // Diagonal line crosses both segments.

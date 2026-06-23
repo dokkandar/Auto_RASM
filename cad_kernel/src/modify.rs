@@ -62,6 +62,7 @@ impl Geom {
                         .map(|p| PolyVertex { pos: p, bulge: 0.0 })
                         .collect(),
                     closed: true,
+                    widths: Vec::new(),
                 }))
             }
             Geom::EllipseArc(ea) => {
@@ -75,6 +76,7 @@ impl Geom {
                         .map(|p| PolyVertex { pos: p, bulge: 0.0 })
                         .collect(),
                     closed: false,
+                    widths: Vec::new(),
                 }))
             }
             Geom::Polyline(p) => offset_polyline(p, dist, side),
@@ -219,7 +221,7 @@ fn offset_polyline(p: &Polyline, dist: f64, side: Vec2) -> Result<Geom, &'static
         }
         out.push(PolyVertex { pos: segs[seg_count - 1].b, bulge: 0.0 });
     }
-    Ok(Geom::Polyline(Polyline { vertices: out, closed: p.closed }))
+    Ok(Geom::Polyline(Polyline { vertices: out, closed: p.closed, widths: Vec::new() }))
 }
 
 fn offset_ellipse_samples(

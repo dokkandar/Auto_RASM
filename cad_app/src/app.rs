@@ -60,6 +60,17 @@ enum PlineArcSub {
     AwaitingDirection,           // user typed `d`; next click/angle = start tangent
 }
 
+/// PLINE Width capture flow (AutoCAD `W`/`H`): after typing `w`, the user
+/// enters a starting width then an ending width (Enter on the second repeats
+/// the first). `H`/halfwidth doubles the entered values. The captured
+/// (start, end) becomes `pline_next_width`, applied to subsequent segments.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PlineWidthCap {
+    None,
+    AwaitingStart { half: bool },
+    AwaitingEnd { half: bool, start: f64 },
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ArcMethod {
     ThreePoints,
@@ -145,6 +156,7 @@ fn rect_polyline(a: Vec2, b: Vec2) -> Geom {
             v(a.x, b.y),
         ],
         closed: true,
+        widths: Vec::new(),
     })
 }
 
@@ -206,6 +218,7 @@ fn stretch_one(g: &Geom, win_min: Vec2, win_max: Vec2, v: Vec2) -> Geom {
                 PolyVertex { pos: vt.pos + v, bulge: vt.bulge }
             } else { *vt }).collect(),
             closed: p.closed,
+            widths: p.widths.clone(),
         }),
         Geom::Circle(c) if inside(c.center) =>
             Geom::Circle(Circle { center: c.center + v, radius: c.radius }),
@@ -740,6 +753,15 @@ pub struct CadApp {
     /// exit tangent). Captured by the click/angle after `d`, consumed (cleared)
     /// once that arc segment commits.
     pline_dir_override: Option<Vec2>,
+    /// PLINE Width: the (start, end) width applied to the NEXT committed
+    /// segment. After a segment commits, the end width carries as the next
+    /// start (AutoCAD behaviour). (0,0) = thin.
+    pline_next_width: (f64, f64),
+    /// In-progress `w`/`h` width-entry flow.
+    pline_width_cap: PlineWidthCap,
+    /// Per-segment (start,end) widths captured so far, parallel to
+    /// `pending_bulges`. Drained into `Polyline.widths` on commit.
+    pending_widths: Vec<(f64, f64)>,
 
     scale:        f32,
     world_offset: egui::Vec2,
@@ -2151,6 +2173,9 @@ impl Default for CadApp {
             pline_mode:    PlineMode::Line,
             pline_arc_sub: PlineArcSub::Normal,
             pline_dir_override: None,
+            pline_next_width: (0.0, 0.0),
+            pline_width_cap: PlineWidthCap::None,
+            pending_widths: Vec::new(),
             scale:         6.0,
             world_offset:  egui::Vec2::ZERO,
             zoom_state:    ZoomState::Off,
@@ -2336,6 +2361,7 @@ impl Default for CadApp {
                 PolyVertex { pos: Vec2::new(55.0,  25.0), bulge: 0.0 },
             ],
             closed: true,
+            widths: Vec::new(),
         }.into());
         s.recompute();
         s.history.push("RUST_CAD math workbench — three demo dobjects loaded.".into());
@@ -2940,6 +2966,50 @@ impl CadApp {
         // queued. The prompt mentions all of them.
         if self.tool == Tool::Polyline {
             let lc = trimmed.to_ascii_lowercase();
+            // PLINE Width entry: capture starting then ending width. `h`
+            // (halfwidth) doubles the entered values. Empty ending = same as
+            // start (uniform). Takes priority over the letter match below.
+            match self.pline_width_cap {
+                PlineWidthCap::AwaitingStart { half } => {
+                    if let Ok(v) = trimmed.parse::<f64>() {
+                        if v < 0.0 {
+                            self.history.push("  ! pline width: must be ≥ 0".into());
+                            return;
+                        }
+                        let start = if half { v * 2.0 } else { v };
+                        self.pline_width_cap = PlineWidthCap::AwaitingEnd { half, start };
+                        self.set_prompt(format!(
+                            "pline {}: ending width <{:.4}>  [Enter = same]",
+                            if half { "halfwidth" } else { "width" },
+                            if half { start * 0.5 } else { start }));
+                        self.refocus_cmd = true;
+                        return;
+                    }
+                    // non-numeric → cancel width entry, fall through
+                    self.pline_width_cap = PlineWidthCap::None;
+                }
+                PlineWidthCap::AwaitingEnd { half, start } => {
+                    let end = if trimmed.is_empty() {
+                        start
+                    } else if let Ok(v) = trimmed.parse::<f64>() {
+                        if v < 0.0 {
+                            self.history.push("  ! pline width: must be ≥ 0".into());
+                            return;
+                        }
+                        if half { v * 2.0 } else { v }
+                    } else {
+                        self.pline_width_cap = PlineWidthCap::None;
+                        start
+                    };
+                    self.pline_next_width = (start, end);
+                    self.pline_width_cap = PlineWidthCap::None;
+                    self.history.push(format!(
+                        "  pline: width start={:.4} end={:.4}", start, end));
+                    self.update_pline_prompt();
+                    return;
+                }
+                PlineWidthCap::None => {}
+            }
             // PLINE Arc Direction: a typed angle (degrees) while awaiting the
             // start tangent sets it directly (alternative to clicking a point).
             if self.pline_arc_sub == PlineArcSub::AwaitingDirection {
@@ -2966,9 +3036,9 @@ impl CadApp {
                 // to the global Copy command.
                 "c" | "close" => {
                     if self.pending.len() >= 2 {
-                        let verts = self.drain_pline_pending(true);
+                        let (verts, widths) = self.drain_pline_pending(true);
                         self.add_dobject(Geom::Polyline(Polyline {
-                            vertices: verts, closed: true,
+                            vertices: verts, closed: true, widths,
                         }), "canvas");
                         self.update_pline_prompt();
                     } else {
@@ -2995,6 +3065,7 @@ impl CadApp {
                     }
                     if let Some(last) = self.pending.pop() {
                         self.pending_bulges.pop();
+                        self.pending_widths.pop();
                         self.history.push(format!(
                             "  pline: removed vertex ({:.3},{:.3})",
                             last.x, last.y));
@@ -3030,12 +3101,25 @@ impl CadApp {
                     self.update_pline_prompt();
                     return;
                 }
+                // Width / Halfwidth — start the (start, end) width entry flow.
+                "w" | "width" | "h" | "halfwidth" => {
+                    let half = lc == "h" || lc == "halfwidth";
+                    self.pline_width_cap = PlineWidthCap::AwaitingStart { half };
+                    let cur = if half {
+                        self.pline_next_width.0 * 0.5
+                    } else {
+                        self.pline_next_width.0
+                    };
+                    self.set_prompt(format!(
+                        "pline {}: starting width <{:.4}>",
+                        if half { "halfwidth" } else { "width" }, cur));
+                    self.refocus_cmd = true;
+                    return;
+                }
                 // Recognised-but-not-wired sub-options: tell the user
                 // they're known so they don't keep retyping. Wire-up
                 // lands in the Phase 2 slice.
-                "w" | "width"
-                | "h" | "halfwidth"
-                | "len" | "length"
+                "len" | "length"
                 | "ce" | "center"
                 | "r" | "radius"
                 | "ang" | "angle" => {
@@ -5597,7 +5681,7 @@ impl CadApp {
                         }
                     }
                     if verts.len() < 3 { continue; }
-                    let pl = cad_kernel::Polyline { vertices: verts, closed: true };
+                    let pl = cad_kernel::Polyline { vertices: verts, closed: true, widths: Vec::new() };
                     let mut d = cad_kernel::DObject::from(pl);
                     d.style = cad_kernel::Style::on_layer(worker.active_layer);
                     // Synthetic auxiliary boundary — exists only so the
@@ -14316,7 +14400,7 @@ impl CadApp {
             } else { 0.0 };
             PolyVertex { pos: self.pending[i], bulge }
         }).collect();
-        Some(Polyline { vertices: verts, closed: false }.into())
+        Some(Polyline { vertices: verts, closed: false, widths: Vec::new() }.into())
     }
 
     /// PLINE arc-mode helper: the exit tangent of the most recently
@@ -14351,8 +14435,18 @@ impl CadApp {
     /// pline state. `closed` selects whether the last bulge slot
     /// (segment from final vertex back to first) is set; it stays 0 in
     /// the MVP since `c`/close was a Line-mode action.
-    fn drain_pline_pending(&mut self, closed: bool) -> Vec<PolyVertex> {
+    fn drain_pline_pending(&mut self, closed: bool) -> (Vec<PolyVertex>, Vec<(f64, f64)>) {
         let n = self.pending.len();
+        // Per-segment widths (parallel to bulges). seg_count = n-1 open, n
+        // closed. Empty result when every segment is thin, so plain polylines
+        // stay width-free.
+        let seg_count = if closed { n } else { n.saturating_sub(1) };
+        let mut widths: Vec<(f64, f64)> = (0..seg_count)
+            .map(|i| self.pending_widths.get(i).copied().unwrap_or((0.0, 0.0)))
+            .collect();
+        if widths.iter().all(|&(s, e)| s.abs() < 1e-9 && e.abs() < 1e-9) {
+            widths.clear();
+        }
         let mut verts = Vec::with_capacity(n);
         for (i, p) in self.pending.drain(..).enumerate() {
             // bulge[i] is the segment from vertex i to vertex i+1. For
@@ -14368,10 +14462,13 @@ impl CadApp {
             verts.push(PolyVertex { pos: p, bulge });
         }
         self.pending_bulges.clear();
+        self.pending_widths.clear();
         self.pline_mode = PlineMode::Line;
         self.pline_arc_sub = PlineArcSub::Normal;
         self.pline_dir_override = None;
-        verts
+        self.pline_width_cap = PlineWidthCap::None;
+        self.pline_next_width = (0.0, 0.0);
+        (verts, widths)
     }
 
     /// Tessellate one polyline-preview segment from `a` to `b` with the
@@ -17023,8 +17120,12 @@ impl eframe::App for CadApp {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.pending.clear();
             self.pending_bulges.clear();
+            self.pending_widths.clear();
             self.pline_mode = PlineMode::Line;
             self.pline_arc_sub = PlineArcSub::Normal;
+            self.pline_dir_override = None;
+            self.pline_width_cap = PlineWidthCap::None;
+            self.pline_next_width = (0.0, 0.0);
             self.wall_waiting_thickness = false;
             if self.block_def_state != BlockDefState::Off {
                 self.block_def_state = BlockDefState::Off;
@@ -17396,9 +17497,9 @@ impl eframe::App for CadApp {
                 self.extend_state = ExtendState::Off;
                 self.clear_prompt();
             } else if self.tool == Tool::Polyline && self.pending.len() >= 2 {
-                let verts = self.drain_pline_pending(false);
+                let (verts, widths) = self.drain_pline_pending(false);
                 self.add_dobject(Geom::Polyline(Polyline {
-                    vertices: verts, closed: false,
+                    vertices: verts, closed: false, widths,
                 }), "canvas");
             } else if self.tool == Tool::Spline && self.pending.len() >= 3 {
                 // SPLINE commit — degree-3 (cubic) clamped/open uniform
@@ -17533,16 +17634,19 @@ impl eframe::App for CadApp {
             let trimmed = self.cmd.trim().to_ascii_lowercase();
             if trimmed == "c" || trimmed == "close" || trimmed == "closed" {
                 if self.pending.len() >= 2 {
-                    let verts = self.drain_pline_pending(true);
+                    let (verts, widths) = self.drain_pline_pending(true);
                     self.add_dobject(Geom::Polyline(Polyline {
-                        vertices: verts, closed: true,
+                        vertices: verts, closed: true, widths,
                     }), "canvas (closed)");
                     self.cmd.clear();
                 } else {
                     self.history.push("  ! polyline needs at least 2 vertices".into());
                     self.pending.clear();
                     self.pending_bulges.clear();
+                    self.pending_widths.clear();
                     self.pline_mode = PlineMode::Line;
+                    self.pline_width_cap = PlineWidthCap::None;
+                    self.pline_next_width = (0.0, 0.0);
                 }
             }
         }
@@ -20676,6 +20780,9 @@ impl eframe::App for CadApp {
                                         let bulge = bulge_from_three_points(
                                             start, mid, click_world);
                                         self.pending_bulges.push(bulge);
+                                        self.pending_widths.push(self.pline_next_width);
+                                        self.pline_next_width =
+                                            (self.pline_next_width.1, self.pline_next_width.1);
                                         self.pending.push(click_world);
                                     }
                                     self.pline_arc_sub = PlineArcSub::Normal;
@@ -20721,9 +20828,9 @@ impl eframe::App for CadApp {
                                     (click_world - first).len() < world_tol
                                 };
                             if auto_closed {
-                                let verts = self.drain_pline_pending(true);
+                                let (verts, widths) = self.drain_pline_pending(true);
                                 self.add_dobject(Geom::Polyline(Polyline {
-                                    vertices: verts, closed: true,
+                                    vertices: verts, closed: true, widths,
                                 }), "canvas (auto-closed on first vertex)");
                                 self.update_pline_prompt();
                             } else {
@@ -20734,6 +20841,11 @@ impl eframe::App for CadApp {
                                         0.0
                                     };
                                     self.pending_bulges.push(new_bulge);
+                                    // Width for this segment; the end width
+                                    // carries as the next segment's start.
+                                    self.pending_widths.push(self.pline_next_width);
+                                    self.pline_next_width =
+                                        (self.pline_next_width.1, self.pline_next_width.1);
                                     // The Direction override applies to ONE arc
                                     // segment only — consume it now.
                                     self.pline_dir_override = None;
@@ -23230,6 +23342,59 @@ fn draw_dobject(
     draw_dobject_thick(painter, rect, app, g, color, 1.6);
 }
 
+/// Render a polyline with per-segment widths as FILLED tapered strips.
+/// Each segment's centerline is tessellated (arcs become real arcs via
+/// `append_arc_world_samples`); the width is linearly interpolated start→end
+/// and each sub-span is filled as a convex quad offset ±half-width along the
+/// local normal. Zero-width segments fall back to a thin stroke. Widths are in
+/// world units, so the fill scales with zoom (like real geometry).
+fn draw_polyline_widths(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    app: &CadApp,
+    p: &Polyline,
+    color: egui::Color32,
+) {
+    let n = p.vertices.len();
+    if n < 2 { return; }
+    let seg_count = if p.closed { n } else { n - 1 };
+    for i in 0..seg_count {
+        let a = p.vertices[i].pos;
+        let b = p.vertices[(i + 1) % n].pos;
+        let bulge = p.vertices[i].bulge;
+        let (sw, ew) = p.widths.get(i).copied().unwrap_or((0.0, 0.0));
+        // Centerline samples in world (a + intermediate arc points + b).
+        let mut cl = vec![a];
+        append_arc_world_samples(a, b, bulge, &mut cl);
+        let m = cl.len();
+        if m < 2 { continue; }
+        if sw.abs() < 1e-9 && ew.abs() < 1e-9 {
+            let pts: Vec<egui::Pos2> = cl.iter().map(|w| app.w2s(*w, rect)).collect();
+            painter.add(egui::Shape::line(pts, egui::Stroke::new(1.6, color)));
+            continue;
+        }
+        for k in 0..m - 1 {
+            let p0 = cl[k];
+            let p1 = cl[k + 1];
+            let dir = p1 - p0;
+            let dl = dir.len();
+            if dl < EPS { continue; }
+            let nrm = Vec2::new(-dir.y, dir.x) / dl;     // left normal (CCW)
+            let t0 = k as f64 / (m - 1) as f64;
+            let t1 = (k + 1) as f64 / (m - 1) as f64;
+            let h0 = (sw + (ew - sw) * t0) * 0.5;
+            let h1 = (sw + (ew - sw) * t1) * 0.5;
+            let quad = vec![
+                app.w2s(p0 + nrm * h0, rect),
+                app.w2s(p1 + nrm * h1, rect),
+                app.w2s(p1 - nrm * h1, rect),
+                app.w2s(p0 - nrm * h0, rect),
+            ];
+            painter.add(egui::Shape::convex_polygon(quad, color, egui::Stroke::NONE));
+        }
+    }
+}
+
 /// Render a DObject honouring its style.linetype (resolved through
 /// ByLayer when the dobject's linetype is `Continuous`/0). Falls back
 /// to a solid draw via `draw_dobject_thick` for Continuous patterns —
@@ -23561,11 +23726,17 @@ fn draw_dobject_thick(
                 [egui::pos2(sp.x, sp.y - s), egui::pos2(sp.x, sp.y + s)], stroke);
         }
         Geom::Polyline(p) => {
-            // Bulge-aware tessellation so arc segments inside a polyline
-            // render as actual arcs, not chords.
-            let pts = polyline_tessellated_screen_pts(p, app, rect);
-            if !pts.is_empty() {
-                painter.add(egui::Shape::line(pts, stroke));
+            // Tapered-width polyline → filled strips per segment. Otherwise the
+            // normal bulge-aware stroke (arc segments render as real arcs).
+            let has_width = p.widths.iter()
+                .any(|&(s, e)| s.abs() > 1e-9 || e.abs() > 1e-9);
+            if has_width {
+                draw_polyline_widths(painter, rect, app, p, color);
+            } else {
+                let pts = polyline_tessellated_screen_pts(p, app, rect);
+                if !pts.is_empty() {
+                    painter.add(egui::Shape::line(pts, stroke));
+                }
             }
         }
         Geom::Hatch(_) => {

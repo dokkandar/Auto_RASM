@@ -55,6 +55,7 @@ impl CadApp {
                     PolyVertex { pos: l.a, bulge: 0.0 },
                     PolyVertex { pos: l.b, bulge: 0.0 }],
                 closed: false,
+                widths: Vec::new(),
             })),
             Geom::Arc(a) => {
                 let s = Vec2::new(a.center.x + a.radius * a.start_angle.cos(),
@@ -70,6 +71,7 @@ impl CadApp {
                         PolyVertex { pos: s, bulge },
                         PolyVertex { pos: e, bulge: 0.0 }],
                     closed: false,
+                    widths: Vec::new(),
                 }))
             }
             // Elliptical arc / spline can't be a polyline exactly (bulges are
@@ -349,12 +351,13 @@ fn tessellated_polyline(g: &Geom) -> Option<Polyline> {
                 let t = ea.start_param + ea.sweep_param * (i as f64 / n as f64);
                 PolyVertex { pos: ea.ellipse.point_at(t), bulge: 0.0 }
             }).collect();
-            Some(Polyline { vertices, closed: false })
+            Some(Polyline { vertices, closed: false, widths: Vec::new() })
         }
         Geom::Spline(s) => Some(Polyline {
             vertices: s.tessellate(64).into_iter()
                 .map(|p| PolyVertex { pos: p, bulge: 0.0 }).collect(),
             closed: false,
+            widths: Vec::new(),
         }),
         _ => None,
     }

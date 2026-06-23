@@ -408,5 +408,5 @@ fn chain_to_polyline(geoms: &[Geom]) -> Option<Polyline> {
         current = next;
     }
 
-    Some(Polyline { vertices: verts, closed: chain_closed })
+    Some(Polyline { vertices: verts, closed: chain_closed, widths: Vec::new() })
 }

@@ -784,7 +784,7 @@ fn read_geom(r: &mut R, ver: u16) -> Result<Geom, String> {
             for _ in 0..n {
                 vertices.push(PolyVertex { pos: r.vec2()?, bulge: r.f64()? });
             }
-            Geom::Polyline(Polyline { vertices, closed })
+            Geom::Polyline(Polyline { vertices, closed, widths: Vec::new() })
         }
         7 => {
             let pattern = match r.u8()? {
@@ -1082,6 +1082,7 @@ mod tests {
                 PolyVertex { pos: Vec2::new(1.0, 1.0), bulge: 0.0 },
             ],
             closed: true,
+            widths: Vec::new(),
         }.into());
         let back = round_trip(&doc);
         assert_eq!(back.dobjects.len(), 7);

@@ -475,8 +475,8 @@ impl Geom {
                         second.push(v.clone());
                     }
                 }
-                Ok((Geom::Polyline(Polyline { vertices: first,  closed: false }),
-                    Geom::Polyline(Polyline { vertices: second, closed: false })))
+                Ok((Geom::Polyline(Polyline { vertices: first,  closed: false, widths: Vec::new() }),
+                    Geom::Polyline(Polyline { vertices: second, closed: false, widths: Vec::new() })))
             }
             Geom::Circle(_) =>
                 Err("split: circle needs TWO break points (1-click break not allowed)"),
