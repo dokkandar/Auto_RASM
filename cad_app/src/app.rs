@@ -10524,6 +10524,30 @@ impl CadApp {
                 egui::ScrollArea::vertical().max_height(440.0).id_salt("param_scroll").show(ui, |ui| {
                     ui.label(format!("selected: {} line/wall(s), {} circle(s)", lines.len(), circles.len()));
 
+                    // ===== Per-entity math inspector =====
+                    ui.horizontal(|ui| {
+                        let hdr = if self.parametric.show_inspect { "🔍 Inspect selected ▼" } else { "🔍 Inspect selected ▶" };
+                        if ui.selectable_label(false, hdr).clicked() {
+                            self.parametric.show_inspect = !self.parametric.show_inspect;
+                        }
+                    });
+                    if self.parametric.show_inspect {
+                        let target = if lines.len() == 1 && circles.is_empty() {
+                            Some(lines[0])
+                        } else if circles.len() == 1 && lines.is_empty() {
+                            Some(circles[0])
+                        } else {
+                            None
+                        };
+                        match target {
+                            Some(h) => match crate::param_editor::inspect_handle(&self.doc, &self.parametric, h) {
+                                Some(ls) => for ln in &ls { ui.small(egui::RichText::new(ln).monospace()); },
+                                None => { ui.small("(selected entity is not a constrainable line/wall/circle)"); }
+                            },
+                            None => { ui.small("select exactly ONE line/wall or circle to inspect its math"); }
+                        }
+                    }
+
                     // ===== Geometric relations (lines & straight walls) =====
                     // Binary relations work two ways: select BOTH then click, OR
                     // select ONE, click, then pick the target ("reference→target").

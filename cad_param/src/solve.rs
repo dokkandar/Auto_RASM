@@ -409,6 +409,12 @@ pub fn dof_analysis(s: &Sketch) -> DofReport {
     let mut a = jac.clone();
     let maxabs = a.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
     let tol = 1e-9_f64.max(maxabs * 1e-9);
+    // Count rows that actually depend on a FREE param. Rows that are all-zero
+    // (e.g. a Fixed/anchor whose coords are locked out) must NOT count toward
+    // "redundant", or an anchored-but-unconstrained sketch falsely warns.
+    let active_rows = (0..m)
+        .filter(|&i| (0..nf).any(|k| jac[i * nf + k].abs() > tol))
+        .count();
     let mut pivot_col = vec![false; nf];
     let mut row = 0usize;
     for col in 0..nf {
@@ -460,7 +466,7 @@ pub fn dof_analysis(s: &Sketch) -> DofReport {
         dof,
         rank,
         free_params: nf,
-        redundant: rank < m,
+        redundant: rank < active_rows,
         fully_defined: dof <= 0,
         param_free,
     }
@@ -706,6 +712,29 @@ mod tests {
         assert_eq!(d.dof, 0);
         assert!(d.fully_defined);
         assert!(d.param_free.iter().all(|&f| !f));
+    }
+
+    #[test]
+    fn anchor_alone_is_not_redundant() {
+        // a single anchor on an otherwise-free line must NOT report "redundant"
+        let mut s = Sketch::new();
+        let a = s.add_point(0.0, 0.0);
+        let b = s.add_point(10.0, 2.0);
+        let _l = s.add_line(a, b);
+        s.add(Constraint::Fixed { p: a, x: 0.0, y: 0.0 });
+        assert!(!dof_analysis(&s).redundant);
+    }
+
+    #[test]
+    fn duplicate_constraint_is_redundant() {
+        let mut s = Sketch::new();
+        let a = s.add_point(0.0, 0.0);
+        let b = s.add_point(10.0, 2.0);
+        let l = s.add_line(a, b);
+        s.add(Constraint::Fixed { p: a, x: 0.0, y: 0.0 });
+        s.add(Constraint::Horizontal { line: l });
+        s.add(Constraint::Horizontal { line: l }); // duplicate ⇒ redundant
+        assert!(dof_analysis(&s).redundant);
     }
 
     #[test]

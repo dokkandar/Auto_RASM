@@ -178,6 +178,8 @@ pub struct ParamSession {
     pub last_trace: SolveTrace,
     /// Whether the diagnostics section is expanded.
     pub show_trace: bool,
+    /// Whether the per-entity math inspector is expanded.
+    pub show_inspect: bool,
 }
 
 impl ParamSession {
@@ -202,6 +204,7 @@ impl ParamSession {
             redundant: false,
             last_trace: SolveTrace::default(),
             show_trace: false,
+            show_inspect: false,
         }
     }
 
@@ -691,6 +694,62 @@ pub fn analyze_doc(doc: &Document, session: &ParamSession) -> (DofReport, HashMa
     (rep, defined)
 }
 
+/// Per-entity math inspection — "deeply rooted in the math library". For one
+/// drawing handle it reports the cad_param sketch ids it maps to, each
+/// parameter's value and whether the solver considers it FREE or locked (from
+/// the Jacobian-rank DOF analysis), the entity's local degrees of freedom, and
+/// every constraint that references it with its current geometric error.
+pub fn inspect_handle(doc: &Document, session: &ParamSession, h: Handle) -> Option<Vec<String>> {
+    let mut map = build_doc_map(doc);
+    let _ = apply_constraints(&mut map, doc, session, &HashSet::new());
+    let rep = dof_analysis(&map.sk);
+    let np = map.sk.points.len();
+    let free = |i: usize| rep.param_free.get(i).copied().unwrap_or(true);
+    let yn = |b: bool| if b { "FREE" } else { "locked" };
+
+    let mut out: Vec<String> = Vec::new();
+    let mut local_free = 0usize;
+    let mut local_total = 0usize;
+
+    if let Some(&lid) = map.line_id.get(&h) {
+        let ln = map.sk.lines[lid];
+        let is_wall = matches!(doc.dobjects.iter().find(|d| d.handle == h).map(|d| &d.geom), Some(Geom::Wall(_)));
+        out.push(format!("handle {:?}  ({}, sketch L{lid})", h, if is_wall { "wall" } else { "line" }));
+        for pid in [ln.a, ln.b] {
+            let (fx, fy) = (free(2 * pid), free(2 * pid + 1));
+            let p = map.sk.points[pid];
+            out.push(format!("  p{pid} = ({:.3}, {:.3})    x:{}  y:{}", p.x, p.y, yn(fx), yn(fy)));
+            local_total += 2;
+            local_free += fx as usize + fy as usize;
+        }
+    } else if let Some(&cid) = map.circle_id.get(&h) {
+        let c = map.sk.circles[cid];
+        out.push(format!("handle {:?}  (circle, sketch C{cid})", h));
+        let (fx, fy) = (free(2 * c.center), free(2 * c.center + 1));
+        let p = map.sk.points[c.center];
+        out.push(format!("  centre p{} = ({:.3}, {:.3})    x:{}  y:{}", c.center, p.x, p.y, yn(fx), yn(fy)));
+        let sidx = 2 * np + c.radius;
+        let fr = free(sidx);
+        out.push(format!("  radius s{} = {:.3}    {}", c.radius, map.sk.scalars[c.radius], yn(fr)));
+        local_total += 3;
+        local_free += fx as usize + fy as usize + fr as usize;
+    } else {
+        return None;
+    }
+
+    out.push(format!("  local DOF: {local_free}/{local_total} params free  ·  sketch total {} DOF", rep.dof));
+    let touching: Vec<&CRef> = session.constraints.iter().filter(|c| c.handles().contains(&h)).collect();
+    if touching.is_empty() {
+        out.push("  ⚠ no constraint references this entity".into());
+    } else {
+        out.push(format!("  constraints touching it ({}):", touching.len()));
+        for c in touching {
+            out.push(format!("    • {}", cref_report(doc, c)));
+        }
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -897,6 +956,20 @@ mod tests {
         // B followed — now parallel to A
         let (u, v) = (a.b - a.a, b.b - b.a);
         assert!((u.x * v.y - u.y * v.x).abs() < 1e-5, "B not parallel after drag");
+    }
+
+    #[test]
+    fn inspect_handle_reports_free_and_locked_params() {
+        let mut doc = Document::default();
+        let h = add_line(&mut doc, Vec2::new(0.0, 0.0), Vec2::new(10.0, 3.0));
+        let mut sess = ParamSession::new();
+        sess.constraints.push(CRef::Horizontal(h));
+        let report = inspect_handle(&doc, &sess, h).expect("inspect");
+        // mentions the constraint touching it and the cad_param sketch line id
+        assert!(report.iter().any(|l| l.contains("horizontal")));
+        assert!(report.iter().any(|l| l.contains("L0") || l.contains("line")));
+        // a non-existent handle returns None
+        assert!(inspect_handle(&doc, &sess, add_circle(&mut Document::default(), Vec2::new(0.0,0.0), 1.0)).is_none());
     }
 
     #[test]
