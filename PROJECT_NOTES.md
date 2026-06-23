@@ -242,3 +242,61 @@ trim / join / fillet-chamfer-offset / pedit were extracted into their own files.
 
 Rule for future splits: child-module-of-app for app-layer features (keeps private
 access); separate top-level module + `pub use` re-export for kernel features.
+
+---
+
+## 2026-06-23 session — module split, pedit, arc/pline tools, tapered width
+
+All on branch `windows-ui-session-2026-06-20` (16 commits, 0a0e460 → 76f2704). NOT pushed.
+
+### Done & verified
+- **Module split refactor** (`0a0e460`): `geom.rs` split into `join.rs` / `trim.rs`
+  / `modify.rs`; PEDIT moved to `cad_app/src/app/pedit.rs` (child module). Crate-
+  root re-exports unchanged. 170 kernel tests pass. (See "Module split refactor".)
+- **PEDIT**: join elliptical arcs (tessellated) + Enter-repeats-pedit (`831998f`);
+  accept ellipse-arc/spline as the pedit TARGET (`54fba67`); AutoCAD-style
+  "select object" entry when nothing pre-selected (`5ba29e2`).
+- **parser**: bare `arc` / `pl`/`pline` now start the interactive tool (`db6af5b`).
+- **PLINE sub-commands**: Close wired (was leaking to global Copy) (`b191cb8`);
+  Arc Direction `d` wired (`e0a2275`).
+- **Tapered width** (the big one): per-segment `(start,end)` width on `Polyline`
+  (model stage 1, subagent-assisted ripple). Tool `w`/`h` entry, live preview,
+  sticky forward-only width, empty-Enter-accepts-default fix, trim preserves
+  width (wrap_with_width). Commits b6cd8b5, 679453d, 0cb318b, cbf71d6, 467cde6.
+
+### Width RENDERING — iterated a lot, STILL not perfect (resume here)
+Rendering a variable-width polyline as filled strips went through several attempts
+(all in `fill_width_strip`, cad_app/src/app.rs):
+1. per-segment quads + round discs → round corners (user wanted sharp).
+2. miter triangles → black notches at corners.
+3. mitered shared offset points → SPIKES on sharp/reflex/self-intersecting.
+4. independent rects + convex-hull joints → no spikes but FACETED outer edge.
+5. **current (`76f2704`)**: per-vertex miter decision — within 8× half-width
+   limit, adjacent quads share the miter apex (smooth seam); beyond it, each
+   segment uses its own normal + convex-hull bevel fill (no spike).
+**STATUS:** user's latest screenshot still shows some edge imperfection on a
+self-intersecting wide scribble (slight overlap/jagged in places). Acceptable for
+normal polylines; pathological scribbles still rough. Revisit if needed — consider
+building proper left/right offset polylines with bevel-insertion (two points at
+clamped corners) and filling as a single triangle strip.
+
+### KNOWN WIDTH ISSUES / TODO
+- **Width-change boundary taper bug:** `polyline_width_centerline` assigns each
+  vertex ONE width (the incoming segment's END width). At a width change (e.g.
+  2→10) the first new-width segment tapers from the old end-width to the new end-
+  width instead of being uniform. Fix: store start/end widths per segment in the
+  centerline rather than one width per point.
+- **Trim splits into separate 1-segment polylines** → joints BETWEEN pieces
+  butt-cap (no miter across separate dobjects). To keep sharp corners after trim,
+  rework polyline trim to emit CONNECTED multi-segment runs (split only at the
+  removed part) retaining widths. (Width itself IS preserved per piece.)
+- **Stage 4 NOT done — DXF/RSM persistence of widths.** Save/reload currently
+  DROPS width (read paths default `widths: Vec::new()`). Need DXF LWPOLYLINE
+  group codes 40/41 (start/end width) + 43 (const width), and RSM serialization.
+
+### Notes
+- A running `rust_cad.exe` locks the release exe — kill before `cargo build
+  --release`. cargo not on PATH in PowerShell: prefix `$env:Path +=
+  ";$env:USERPROFILE\.cargo\bin"`.
+- OPEN from earlier: circular-arc "curves wrong after pe+j" — diagnostic in
+  pedit_join_selected prints `src arc:` / `pl v[i]`; still need a dump to close.
