@@ -23461,10 +23461,10 @@ fn polyline_width_centerline(p: &Polyline) -> Vec<(Vec2, f64)> {
 }
 
 /// Fill a width strip along a `(point, full_width)` centerline. Each span is
-/// filled as its OWN convex quad using that span's normal (so a span always
-/// keeps its full width — no collapse at sharp corners), and a round join
-/// (filled disc) at each interior point closes the gap between adjacent spans.
-/// Widths are world units (scale with zoom). Endpoints get butt caps.
+/// filled as its OWN convex quad using that span's normal (full width, no
+/// collapse), and a SHARP miter triangle (bevel fallback past the miter limit)
+/// at each interior point closes the corner. Widths are world units (scale with
+/// zoom). Endpoints get butt caps.
 fn fill_width_strip(
     painter: &egui::Painter,
     rect: egui::Rect,
@@ -23474,13 +23474,28 @@ fn fill_width_strip(
 ) {
     let m = cl.len();
     if m < 2 { return; }
+    let unit = |v: Vec2| { let l = v.len(); if l > EPS { v / l } else { Vec2::new(0.0, 0.0) } };
+    let perp = |v: Vec2| Vec2::new(-v.y, v.x);
+    // Intersection of infinite lines (p0,d0) & (p1,d1); None if ~parallel.
+    let isect = |p0: Vec2, d0: Vec2, p1: Vec2, d1: Vec2| -> Option<Vec2> {
+        let den = d0.x * d1.y - d0.y * d1.x;
+        if den.abs() < 1e-9 { return None; }
+        let dp = p1 - p0;
+        Some(p0 + d0 * ((dp.x * d1.y - dp.y * d1.x) / den))
+    };
+    let tri = |a: Vec2, b: Vec2, c: Vec2| {
+        painter.add(egui::Shape::convex_polygon(
+            vec![app.w2s(a, rect), app.w2s(b, rect), app.w2s(c, rect)],
+            color, egui::Stroke::NONE));
+    };
+    // 1) per-span full-width quads
     for k in 0..m - 1 {
         let p0 = cl[k].0;
         let p1 = cl[k + 1].0;
         let dir = p1 - p0;
         let dl = dir.len();
         if dl < EPS { continue; }
-        let n = Vec2::new(-dir.y, dir.x) / dl;
+        let n = perp(dir / dl);
         let h0 = cl[k].1 * 0.5;
         let h1 = cl[k + 1].1 * 0.5;
         painter.add(egui::Shape::convex_polygon(
@@ -23492,11 +23507,23 @@ fn fill_width_strip(
             ],
             color, egui::Stroke::NONE));
     }
-    // Round joins at interior points fill the wedge gaps between spans.
+    // 2) sharp miter (or bevel) joins at interior points
     for k in 1..m - 1 {
-        let r = (cl[k].1 * 0.5) as f32 * app.scale;
-        if r > 0.5 {
-            painter.circle_filled(app.w2s(cl[k].0, rect), r, color);
+        let p = cl[k].0;
+        let h = cl[k].1 * 0.5;
+        if h <= 1e-9 { continue; }
+        let d_in = unit(p - cl[k - 1].0);
+        let d_out = unit(cl[k + 1].0 - p);
+        if d_in.len() < 0.5 || d_out.len() < 0.5 { continue; }
+        let n_in = perp(d_in);
+        let n_out = perp(d_out);
+        for s in [1.0_f64, -1.0] {
+            let a = p + n_in * (h * s);
+            let b = p + n_out * (h * s);
+            match isect(a, d_in, b, d_out) {
+                Some(mp) if (mp - p).len() <= h * 8.0 => tri(a, mp, b), // sharp miter
+                _ => tri(a, b, p),                                       // bevel / spike-clamp
+            }
         }
     }
 }

@@ -7,7 +7,35 @@
 
 use crate::math::{Vec2, EPS};
 use crate::geom::{Arc, Circle, Ellipse, EllipseArc, Geom, Line, PolyVertex, Polyline, Wall};
-use crate::join::{polyline_segments, JOIN_EPS};
+use crate::join::{bulge_from_arc, polyline_segments, JOIN_EPS};
+
+/// Wrap a single trimmed Line/Arc segment back into a 1-segment Polyline that
+/// carries the segment's `(start,end)` width — so trimming a WIDE polyline
+/// keeps its width (bare Line/Arc have no width field). Other geoms pass
+/// through unchanged.
+fn wrap_with_width(g: Geom, w: (f64, f64)) -> Geom {
+    match g {
+        Geom::Line(l) => Geom::Polyline(Polyline {
+            vertices: vec![
+                PolyVertex { pos: l.a, bulge: 0.0 },
+                PolyVertex { pos: l.b, bulge: 0.0 }],
+            closed: false,
+            widths: vec![w],
+        }),
+        Geom::Arc(a) => {
+            let (s, e) = a.endpoints();
+            let bulge = bulge_from_arc(s, e, a.center, a.sweep_angle);
+            Geom::Polyline(Polyline {
+                vertices: vec![
+                    PolyVertex { pos: s, bulge },
+                    PolyVertex { pos: e, bulge: 0.0 }],
+                closed: false,
+                widths: vec![w],
+            })
+        }
+        other => other,
+    }
+}
 
 impl Geom {
     /// Trim this geometry by the given cutting edges.
@@ -253,15 +281,24 @@ impl Geom {
                     let d = s.distance_to_point(pick);
                     if d < best_d { best_d = d; best_i = i; }
                 }
+                // If the polyline carries WIDTHS, keep each surviving piece as a
+                // 1-segment polyline that retains its segment's width — bare
+                // Line/Arc can't store width, so exploding would drop it.
+                let has_w = !p.widths.is_empty();
                 let mut out = Vec::new();
                 for (i, s) in segs.into_iter().enumerate() {
+                    let w = p.widths.get(i).copied().unwrap_or((0.0, 0.0));
                     if i == best_i {
                         match s.trim_at(cutters, pick, edge_mode) {
-                            Ok(pieces) => out.extend(pieces),
-                            Err(_) => out.push(s),
+                            Ok(pieces) => {
+                                for piece in pieces {
+                                    out.push(if has_w { wrap_with_width(piece, w) } else { piece });
+                                }
+                            }
+                            Err(_) => out.push(if has_w { wrap_with_width(s, w) } else { s }),
                         }
                     } else {
-                        out.push(s);
+                        out.push(if has_w { wrap_with_width(s, w) } else { s });
                     }
                 }
                 Ok(out)
