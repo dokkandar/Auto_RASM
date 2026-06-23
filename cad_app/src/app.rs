@@ -23460,11 +23460,13 @@ fn polyline_width_centerline(p: &Polyline) -> Vec<(Vec2, f64)> {
     cl
 }
 
-/// Fill a width strip along a `(point, full_width)` centerline. Builds MITERED
-/// left/right offset points (each interior vertex's offset = intersection of
-/// the two adjacent offset edges) so consecutive segment fills SHARE their edge
-/// — gap-free, sharp corners. Each segment is emitted as two triangles (robust
-/// for any quad). Widths are world units (scale with zoom); endpoints butt-cap.
+/// Fill a width strip along a `(point, full_width)` centerline. ROBUST against
+/// any geometry (sharp / reflex / self-intersecting): each segment is filled as
+/// its OWN independent rectangle (using that segment's normal — never skewed,
+/// never spikes), and each interior vertex gets a JOINT fill = the convex hull
+/// of the four segment-end corners plus the clamped miter apex (sharp corner
+/// when within the miter limit, clean bevel beyond it). Widths are world units
+/// (scale with zoom); endpoints butt-cap.
 fn fill_width_strip(
     painter: &egui::Painter,
     rect: egui::Rect,
@@ -23482,29 +23484,55 @@ fn fill_width_strip(
         let dp = p1 - p0;
         Some(p0 + d0 * ((dp.x * d1.y - dp.y * d1.x) / den))
     };
-    // Mitered offset point on side `sgn` (+1 left / -1 right) at vertex k.
-    let offset = |k: usize, sgn: f64| -> Vec2 {
-        let p = cl[k].0;
-        let h = cl[k].1 * 0.5;
-        let d0 = if k > 0 { unit(p - cl[k - 1].0) } else { Vec2::new(0.0, 0.0) };
-        let d1 = if k + 1 < m { unit(cl[k + 1].0 - p) } else { Vec2::new(0.0, 0.0) };
-        if d0.len() < 0.5 { return p + perp(d1) * (h * sgn); }   // start cap
-        if d1.len() < 0.5 { return p + perp(d0) * (h * sgn); }   // end cap
-        let a = p + perp(d0) * (h * sgn);
-        let b = p + perp(d1) * (h * sgn);
-        match isect(a, d0, b, d1) {
-            Some(mp) if (mp - p).len() <= h * 8.0 => mp,          // sharp miter
-            _ => a,                                               // spike-clamp → bevel-ish
+    // Fill the convex hull of `pts` (angle-sorted around their centroid) as a
+    // triangle fan — order-independent, so callers needn't pre-sort.
+    let fill_hull = |pts: &[Vec2]| {
+        if pts.len() < 3 { return; }
+        let n = pts.len() as f64;
+        let c = pts.iter().fold(Vec2::new(0.0, 0.0), |a, &p| a + p) / n;
+        let mut s: Vec<Vec2> = pts.to_vec();
+        s.sort_by(|a, b| {
+            (a.y - c.y).atan2(a.x - c.x)
+                .partial_cmp(&(b.y - c.y).atan2(b.x - c.x))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let scr: Vec<egui::Pos2> = s.iter().map(|p| app.w2s(*p, rect)).collect();
+        for i in 1..scr.len() - 1 {
+            painter.add(egui::Shape::convex_polygon(
+                vec![scr[0], scr[i], scr[i + 1]], color, egui::Stroke::NONE));
         }
     };
+    // 1) independent per-segment rectangles (own normal — full width, no skew).
     for k in 0..m - 1 {
-        let l0 = app.w2s(offset(k, 1.0), rect);
-        let l1 = app.w2s(offset(k + 1, 1.0), rect);
-        let r1 = app.w2s(offset(k + 1, -1.0), rect);
-        let r0 = app.w2s(offset(k, -1.0), rect);
-        // Two triangles — robust even if the quad is slightly non-convex.
-        painter.add(egui::Shape::convex_polygon(vec![l0, l1, r1], color, egui::Stroke::NONE));
-        painter.add(egui::Shape::convex_polygon(vec![l0, r1, r0], color, egui::Stroke::NONE));
+        let p0 = cl[k].0;
+        let p1 = cl[k + 1].0;
+        let dir = p1 - p0;
+        let dl = dir.len();
+        if dl < EPS { continue; }
+        let nrm = perp(dir / dl);
+        let h0 = cl[k].1 * 0.5;
+        let h1 = cl[k + 1].1 * 0.5;
+        fill_hull(&[p0 + nrm * h0, p1 + nrm * h1, p1 - nrm * h1, p0 - nrm * h0]);
+    }
+    // 2) joint fill at each interior vertex (corners + clamped miter apexes).
+    for k in 1..m - 1 {
+        let p = cl[k].0;
+        let h = cl[k].1 * 0.5;
+        if h <= 1e-9 { continue; }
+        let da = unit(p - cl[k - 1].0);
+        let db = unit(cl[k + 1].0 - p);
+        if da.len() < 0.5 || db.len() < 0.5 { continue; }
+        let na = perp(da);
+        let nb = perp(db);
+        let mut pts = vec![p + na * h, p - na * h, p + nb * h, p - nb * h];
+        for s in [1.0_f64, -1.0] {
+            let a = p + na * (h * s);
+            let b = p + nb * (h * s);
+            if let Some(mp) = isect(a, da, b, db) {
+                if (mp - p).len() <= h * 8.0 { pts.push(mp); }   // sharp miter, spike-clamped
+            }
+        }
+        fill_hull(&pts);
     }
 }
 
