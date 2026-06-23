@@ -23502,37 +23502,55 @@ fn fill_width_strip(
                 vec![scr[0], scr[i], scr[i + 1]], color, egui::Stroke::NONE));
         }
     };
-    // 1) independent per-segment rectangles (own normal — full width, no skew).
-    for k in 0..m - 1 {
-        let p0 = cl[k].0;
-        let p1 = cl[k + 1].0;
-        let dir = p1 - p0;
-        let dl = dir.len();
-        if dl < EPS { continue; }
-        let nrm = perp(dir / dl);
-        let h0 = cl[k].1 * 0.5;
-        let h1 = cl[k + 1].1 * 0.5;
-        fill_hull(&[p0 + nrm * h0, p1 + nrm * h1, p1 - nrm * h1, p0 - nrm * h0]);
-    }
-    // 2) joint fill at each interior vertex (corners + clamped miter apexes).
+    const MITER_LIMIT: f64 = 8.0;
+    // Per-segment unit direction.
+    let seg_dir: Vec<Vec2> = (0..m - 1).map(|k| unit(cl[k + 1].0 - cl[k].0)).collect();
+    // Per-vertex miter decision + shared left/right miter points. A vertex
+    // MITERS (smooth shared seam) when the apex stays within the limit;
+    // otherwise it BEVELS (each segment keeps its own normal; a hull fills the
+    // gap) — so sharp/reflex corners can't spike.
+    let mut mitered = vec![false; m];
+    let mut ml = vec![Vec2::new(0.0, 0.0); m];
+    let mut mr = vec![Vec2::new(0.0, 0.0); m];
     for k in 1..m - 1 {
-        let p = cl[k].0;
-        let h = cl[k].1 * 0.5;
-        if h <= 1e-9 { continue; }
-        let da = unit(p - cl[k - 1].0);
-        let db = unit(cl[k + 1].0 - p);
+        let (da, db) = (seg_dir[k - 1], seg_dir[k]);
         if da.len() < 0.5 || db.len() < 0.5 { continue; }
-        let na = perp(da);
-        let nb = perp(db);
-        let mut pts = vec![p + na * h, p - na * h, p + nb * h, p - nb * h];
-        for s in [1.0_f64, -1.0] {
-            let a = p + na * (h * s);
-            let b = p + nb * (h * s);
-            if let Some(mp) = isect(a, da, b, db) {
-                if (mp - p).len() <= h * 8.0 { pts.push(mp); }   // sharp miter, spike-clamped
+        let h = cl[k].1 * 0.5;
+        let (na, nb) = (perp(da), perp(db));
+        let l = isect(cl[k].0 + na * h, da, cl[k].0 + nb * h, db);
+        let r = isect(cl[k].0 - na * h, da, cl[k].0 - nb * h, db);
+        if let (Some(lp), Some(rp)) = (l, r) {
+            let dmax = (lp - cl[k].0).len().max((rp - cl[k].0).len());
+            if dmax <= MITER_LIMIT * h {
+                mitered[k] = true; ml[k] = lp; mr[k] = rp;
             }
         }
-        fill_hull(&pts);
+    }
+    // Segment quads — mitered corners reuse the SHARED apex (seamless edge);
+    // non-mitered corners use the segment's own normal (bevel).
+    for k in 0..m - 1 {
+        let dseg = seg_dir[k];
+        if dseg.len() < 0.5 { continue; }
+        let n = perp(dseg);
+        let h0 = cl[k].1 * 0.5;
+        let h1 = cl[k + 1].1 * 0.5;
+        let (l0, r0) = if mitered[k] { (ml[k], mr[k]) }
+                       else { (cl[k].0 + n * h0, cl[k].0 - n * h0) };
+        let (l1, r1) = if mitered[k + 1] { (ml[k + 1], mr[k + 1]) }
+                       else { (cl[k + 1].0 + n * h1, cl[k + 1].0 - n * h1) };
+        fill_hull(&[l0, l1, r1, r0]);
+    }
+    // Bevel fill at sharp (non-mitered) interior vertices.
+    for k in 1..m - 1 {
+        if mitered[k] { continue; }
+        let (da, db) = (seg_dir[k - 1], seg_dir[k]);
+        if da.len() < 0.5 || db.len() < 0.5 { continue; }
+        let h = cl[k].1 * 0.5;
+        let (na, nb) = (perp(da), perp(db));
+        fill_hull(&[
+            cl[k].0 + na * h, cl[k].0 - na * h,
+            cl[k].0 + nb * h, cl[k].0 - nb * h, cl[k].0,
+        ]);
     }
 }
 
