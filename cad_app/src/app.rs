@@ -4162,7 +4162,7 @@ impl CadApp {
                     self.begin_selection(SelectMode::ForSelect);
                     self.queued_op = QueuedOp::Explode;
                     self.set_prompt(
-                        "explode: select block instances, Enter to apply  [Esc=cancel]");
+                        "explode: select blocks / walls, Enter to apply  [Esc=cancel]");
                 } else {
                     self.apply_explode();
                 }
@@ -13644,7 +13644,8 @@ impl CadApp {
     /// its contents (ONE level — nested blockrefs stay instances, like
     /// AutoCAD). `Color::ByBlock` contents take the instance's color.
     /// Fresh handles via `DObject::with_style` (clones must not reuse the
-    /// definition's handles).
+    /// definition's handles). A selected WALL explodes into its boundary
+    /// particles: the two faces + two end caps.
     fn apply_explode(&mut self) {
         if self.selection.is_empty() {
             self.history.push("  ! explode: empty selection".into());
@@ -13675,8 +13676,37 @@ impl CadApp {
                 } else {
                     skipped += 1;   // dangling reference
                 }
+            } else if let Geom::Wall(w) = &d.geom {
+                // Explode a wall into its boundary "particles": the two faces
+                // (lines for a straight wall, arc-sampled polylines for a curved
+                // one) plus the two end caps — a closed outline. New dobjects
+                // inherit the wall's style (layer / colour / lineweight).
+                let style = d.style;
+                let mk_face = |pts: &Vec<Vec2>| -> Geom {
+                    if pts.len() == 2 {
+                        Geom::Line(Line { a: pts[0], b: pts[1] })
+                    } else {
+                        Geom::Polyline(cad_kernel::Polyline {
+                            vertices: pts.iter().map(|p| cad_kernel::PolyVertex { pos: *p, bulge: 0.0 }).collect(),
+                            closed: false,
+                        })
+                    }
+                };
+                if let Some((left, right)) = w.face_polylines(48) {
+                    to_add.push(DObject::with_style(mk_face(&left), style));
+                    to_add.push(DObject::with_style(mk_face(&right), style));
+                    if let (Some(&l0), Some(&r0), Some(&l1), Some(&r1)) =
+                        (left.first(), right.first(), left.last(), right.last())
+                    {
+                        to_add.push(DObject::with_style(Geom::Line(Line { a: l0, b: r0 }), style)); // start cap
+                        to_add.push(DObject::with_style(Geom::Line(Line { a: l1, b: r1 }), style)); // end cap
+                    }
+                    to_remove.push(i);
+                } else {
+                    skipped += 1;   // degenerate wall (start ≈ end)
+                }
             } else {
-                skipped += 1;       // not a block instance
+                skipped += 1;       // not a block or wall
             }
         }
         let exploded = to_remove.len();

@@ -1989,6 +1989,36 @@ impl Ellipse {
 }
 
 #[cfg(test)]
+mod wall_explode_tests {
+    use super::*;
+
+    #[test]
+    fn straight_wall_faces_are_offset_by_half_thickness() {
+        // A horizontal wall of thickness 4 → two faces at y = ±2, both 2-point
+        // (lines), which is exactly what `explode` turns into face Lines + caps.
+        let w = Wall { start: Vec2::new(0.0, 0.0), end: Vec2::new(10.0, 0.0),
+                       thickness: 4.0, style: 0, bulge: 0.0 };
+        let (left, right) = w.face_polylines(48).expect("faces");
+        assert_eq!(left.len(), 2);
+        assert_eq!(right.len(), 2);
+        // faces sit ±2 off the centerline
+        assert!((left[0].y.abs() - 2.0).abs() < 1e-9 && (right[0].y.abs() - 2.0).abs() < 1e-9);
+        assert!((left[0].y * right[0].y) < 0.0, "faces must be on opposite sides");
+        // end caps span the full thickness (4)
+        let start_cap = (left[0] - right[0]).len();
+        assert!((start_cap - 4.0).abs() < 1e-9, "cap width {start_cap}");
+    }
+
+    #[test]
+    fn curved_wall_faces_are_sampled_polylines() {
+        let w = Wall { start: Vec2::new(0.0, 0.0), end: Vec2::new(10.0, 0.0),
+                       thickness: 2.0, style: 0, bulge: 0.5 };
+        let (left, right) = w.face_polylines(16).expect("faces");
+        assert!(left.len() > 2 && right.len() > 2, "curved faces should sample many points");
+    }
+}
+
+#[cfg(test)]
 mod transform_tests {
     use super::*;
     use crate::math::approx_eq;
