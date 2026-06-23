@@ -10427,7 +10427,8 @@ impl CadApp {
         let drivers: std::collections::HashSet<Handle> = self.selection.iter()
             .filter_map(|&i| self.doc.dobjects.get(i).map(|d| d.handle))
             .collect();
-        let _ = crate::param_editor::solve_doc_driven(&mut self.doc, &self.parametric, &drivers);
+        let out = crate::param_editor::solve_doc_driven(&mut self.doc, &self.parametric, &drivers);
+        self.parametric.last_trace = out.trace;
         self.parametric.last_solved_sig = crate::param_editor::geom_signature(&self.doc);
         self.index_dirty = true;
         self.gpu_dirty = true;
@@ -10696,6 +10697,23 @@ impl CadApp {
                             ui.small(format!("{}. {}", i + 1, c.label()));
                         });
                     }
+
+                    // ===== Solver diagnostics (the math recorder) =====
+                    ui.add_space(6.0);
+                    ui.separator();
+                    let hdr = if self.parametric.show_trace { "🔬 Solver diagnostics ▼" } else { "🔬 Solver diagnostics ▶" };
+                    if ui.selectable_label(false, hdr).clicked() {
+                        self.parametric.show_trace = !self.parametric.show_trace;
+                    }
+                    if self.parametric.show_trace {
+                        if self.parametric.last_trace.lines.is_empty() {
+                            ui.small("(apply or re-solve a constraint to record a trace)");
+                        } else {
+                            for ln in &self.parametric.last_trace.lines {
+                                ui.small(egui::RichText::new(ln).monospace());
+                            }
+                        }
+                    }
                 });
 
                 ui.separator();
@@ -10781,11 +10799,13 @@ impl CadApp {
                 crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::Note {
                     message: format!("param solve: rejected {lbl} (rms NOT converged)") });
                 self.parametric.status = msg;
+                self.parametric.last_trace = out.trace;
             } else {
                 crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::Note {
                     message: format!("param solve: {}", out.msg) });
                 self.history.push(format!("  parametric: {}", out.msg));
                 self.parametric.status = out.msg;
+                self.parametric.last_trace = out.trace;
             }
             self.index_dirty = true;
             self.gpu_dirty = true;

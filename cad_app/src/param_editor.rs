@@ -73,11 +73,21 @@ impl CRef {
     }
 }
 
-/// Outcome of [`solve_doc`] — message plus whether the solve converged (the UI
-/// rolls a just-added constraint back when it does not).
+/// A human-readable trace of one solve — the "session recorder inside the
+/// parametric window": the selected geometry, the math (per-constraint residual,
+/// rms before/after, iterations), and where it went. Shown in the diagnostics
+/// panel and logged to the global recorder.
+#[derive(Clone, Default)]
+pub struct SolveTrace {
+    pub lines: Vec<String>,
+}
+
+/// Outcome of [`solve_doc`] — message, convergence (the UI rolls a just-added
+/// constraint back when it does not), and the diagnostic trace.
 pub struct SolveOutcome {
     pub msg: String,
     pub converged: bool,
+    pub trace: SolveTrace,
 }
 
 /// Remove constraints that reference geometry no longer in the drawing (handles
@@ -164,6 +174,10 @@ pub struct ParamSession {
     pub dof: i64,
     pub fully_defined: bool,
     pub redundant: bool,
+    /// Last solve's diagnostic trace (shown in the "Solver diagnostics" section).
+    pub last_trace: SolveTrace,
+    /// Whether the diagnostics section is expanded.
+    pub show_trace: bool,
 }
 
 impl ParamSession {
@@ -186,6 +200,8 @@ impl ParamSession {
             dof: 0,
             fully_defined: false,
             redundant: false,
+            last_trace: SolveTrace::default(),
+            show_trace: false,
         }
     }
 
@@ -407,6 +423,79 @@ pub fn geom_signature(doc: &Document) -> u64 {
     acc
 }
 
+fn handle_line_ends(doc: &Document, h: Handle) -> Option<(Vec2, Vec2)> {
+    doc.dobjects.iter().find(|d| d.handle == h).and_then(|d| match &d.geom {
+        Geom::Line(l) => Some((l.a, l.b)),
+        Geom::Wall(w) => Some((w.start, w.end)),
+        _ => None,
+    })
+}
+fn handle_circle(doc: &Document, h: Handle) -> Option<(Vec2, f64)> {
+    doc.dobjects.iter().find(|d| d.handle == h).and_then(|d| match &d.geom {
+        Geom::Circle(c) => Some((c.center, c.radius)),
+        _ => None,
+    })
+}
+
+/// Geometric error of one constraint on the CURRENT doc geometry — the "math"
+/// readout for the diagnostics panel (so you can see which constraint is off).
+fn cref_report(doc: &Document, c: &CRef) -> String {
+    // signed angle a→b vs c→d in degrees
+    let ang = |h1: Handle, h2: Handle| -> Option<f64> {
+        let (a, b) = handle_line_ends(doc, h1)?;
+        let (p, q) = handle_line_ends(doc, h2)?;
+        let (u, v) = (b - a, q - p);
+        Some((u.x * v.y - u.y * v.x).atan2(u.x * v.x + u.y * v.y).to_degrees())
+    };
+    match *c {
+        CRef::Horizontal(h) => match handle_line_ends(doc, h) {
+            Some((a, b)) => format!("horizontal: Δy = {:.4}", (a.y - b.y).abs()),
+            None => "horizontal: (geometry gone)".into(),
+        },
+        CRef::Vertical(h) => match handle_line_ends(doc, h) {
+            Some((a, b)) => format!("vertical: Δx = {:.4}", (a.x - b.x).abs()),
+            None => "vertical: (geometry gone)".into(),
+        },
+        CRef::Parallel(a, b) => match ang(a, b) {
+            Some(d) => { let dev = { let x = d.abs(); x.min(180.0 - x) }; format!("parallel: {:.4}° off", dev) }
+            None => "parallel: (geometry gone)".into(),
+        },
+        CRef::Perpendicular(a, b) => match ang(a, b) {
+            Some(d) => format!("perpendicular: {:.4}° off", (d.abs() - 90.0).abs()),
+            None => "perpendicular: (geometry gone)".into(),
+        },
+        CRef::Collinear(a, b) => match ang(a, b) {
+            Some(d) => { let dev = { let x = d.abs(); x.min(180.0 - x) }; format!("collinear: {:.4}° off", dev) }
+            None => "collinear: (geometry gone)".into(),
+        },
+        CRef::Equal(a, b) => match (handle_line_ends(doc, a), handle_line_ends(doc, b)) {
+            (Some((a0, a1)), Some((b0, b1))) => format!("equal len: Δ = {:.4}", ((a1 - a0).len() - (b1 - b0).len()).abs()),
+            _ => "equal len: (geometry gone)".into(),
+        },
+        CRef::Angle(a, b, want) => match ang(a, b) {
+            Some(d) => format!("angle: {:.4}° (want {:.2}°)", d, want.to_degrees()),
+            None => "angle: (geometry gone)".into(),
+        },
+        CRef::Length(h, want) => match handle_line_ends(doc, h) {
+            Some((a, b)) => format!("length: {:.3} (want {:.3})", (b - a).len(), want),
+            None => "length: (geometry gone)".into(),
+        },
+        CRef::Radius(h, want) => match handle_circle(doc, h) {
+            Some((_, r)) => format!("radius: {:.3} (want {:.3})", r, want),
+            None => "radius: (geometry gone)".into(),
+        },
+        CRef::Concentric(a, b) => match (handle_circle(doc, a), handle_circle(doc, b)) {
+            (Some((ca, _)), Some((cb, _))) => format!("concentric: centres {:.4} apart", (ca - cb).len()),
+            _ => "concentric: (geometry gone)".into(),
+        },
+        CRef::EqualRadius(a, b) => match (handle_circle(doc, a), handle_circle(doc, b)) {
+            (Some((_, ra)), Some((_, rb))) => format!("equal radius: Δ = {:.4}", (ra - rb).abs()),
+            _ => "equal radius: (geometry gone)".into(),
+        },
+        CRef::Tangent(..) => "tangent".into(),
+    }
+}
+
 /// Build the sketch, apply constraints, solve, and write solved geometry back
 /// into the drawing (lines AND circles). Returns the outcome (message +
 /// convergence) so the caller can roll a conflicting constraint back.
@@ -428,10 +517,45 @@ pub fn solve_doc_driven(
         return SolveOutcome {
             msg: "parametric: no line/circle geometry to solve".into(),
             converged: true,
+            trace: SolveTrace::default(),
         };
     }
     let resolved = apply_constraints(&mut map, doc, session, drivers);
+
+    // Pin every point that NO constraint touches, so a solve can't drift
+    // unrelated geometry (this is why an isolated edit stays local). Driver and
+    // constrained points are "involved" and stay free.
+    let mut involved: HashSet<usize> = HashSet::new();
+    let note_involved = |map: &DocMap, h: Handle, set: &mut HashSet<usize>| {
+        if let Some(&l) = map.line_id.get(&h) {
+            let ln = map.sk.lines[l];
+            set.insert(ln.a);
+            set.insert(ln.b);
+        }
+        if let Some(&ci) = map.circle_id.get(&h) {
+            set.insert(map.sk.circles[ci].center);
+        }
+    };
+    for c in &session.constraints {
+        for h in c.handles() { note_involved(&map, h, &mut involved); }
+    }
+    for h in drivers { note_involved(&map, *h, &mut involved); }
+    let to_pin: Vec<(usize, Vec2)> = map.sk.points.iter().enumerate()
+        .filter(|(i, _)| !involved.contains(i))
+        .map(|(i, p)| (i, *p))
+        .collect();
+    let pinned = to_pin.len();
+    for (i, p) in to_pin {
+        map.sk.add(Constraint::Fixed { p: i, x: p.x, y: p.y });
+    }
+
+    // ---- solve (record before/after for the diagnostics trace) ----
+    let init_pts = map.sk.points.clone();
+    let init_rms = cad_param::current_rms(&map.sk);
     let rep = solve(&mut map.sk);
+    let max_disp = init_pts.iter().zip(&map.sk.points)
+        .map(|(a, b)| (*b - *a).len())
+        .fold(0.0_f64, f64::max);
 
     // write back lines
     for &(idx, pa, pb) in &map.lines {
@@ -472,7 +596,32 @@ pub fn solve_doc_driven(
         rep.residual,
         if rep.converged { "" } else { "  (NOT converged)" }
     );
-    SolveOutcome { msg, converged: rep.converged }
+
+    // ---- assemble the diagnostic trace (the "math procedure" recorder) ----
+    let mut trace = SolveTrace::default();
+    trace.lines.push(format!(
+        "geometry: {} line/wall + {} circle ({} sketch points)",
+        map.lines.len() + map.walls.len(), map.circles.len(), map.sk.points.len()
+    ));
+    if !drivers.is_empty() {
+        trace.lines.push(format!("driver entities pinned: {}", drivers.len()));
+    }
+    trace.lines.push(format!("unrelated points pinned: {}", pinned));
+    trace.lines.push(format!("constraints resolved: {}/{}", resolved, total));
+    trace.lines.push(format!(
+        "rms {:.3e} → {:.3e} · {} iters · {}",
+        init_rms, rep.residual, rep.iterations,
+        if rep.converged { "✓ converged" } else { "✗ DIVERGED / not converged" }
+    ));
+    trace.lines.push(format!("largest point move: {:.3}", max_disp));
+    if !session.constraints.is_empty() {
+        trace.lines.push("per-constraint error (on solved geometry):".into());
+        for c in &session.constraints {
+            trace.lines.push(format!("  • {}", cref_report(doc, c)));
+        }
+    }
+
+    SolveOutcome { msg, converged: rep.converged, trace }
 }
 
 /// Compute the degrees-of-freedom diagnosis WITHOUT moving geometry, plus a
@@ -633,6 +782,46 @@ mod tests {
         // anchored first point removes 2 DOF; a free line still has DOF left
         assert!(rep.dof > 0, "expected under-defined, dof={}", rep.dof);
         assert_eq!(defined.get(&h0), Some(&false));
+    }
+
+    #[test]
+    fn pentagon_parallel_does_not_explode() {
+        // The reported bug: a closed pentagon at real coordinates (~thousands),
+        // select two adjacent edges, apply Parallel → geometry exploded to
+        // ±15000. With normalized residuals + pinning untouched points it must
+        // stay bounded, make those two edges parallel, and leave the FAR edge
+        // (#6, touched by no constraint) exactly where it was.
+        let mut doc = Document::default();
+        let a = Vec2::new(3248.7959, 4004.4858);
+        let b = Vec2::new(5316.1538, 5652.0);
+        let c = Vec2::new(7888.0684, 3823.5750);
+        let d = Vec2::new(6548.9917, 1475.9070);
+        let e = Vec2::new(3653.9062, 2058.4360);
+        let h3 = add_line(&mut doc, a, b);
+        let h4 = add_line(&mut doc, b, c);
+        let _h5 = add_line(&mut doc, c, d);
+        let h6 = add_line(&mut doc, d, e);
+        let _h7 = add_line(&mut doc, e, a);
+        let mut sess = ParamSession::new();
+        sess.constraints.push(CRef::Parallel(h3, h4));
+        let out = solve_doc(&mut doc, &sess);
+        assert!(out.converged, "did not converge: {}", out.msg);
+        // nothing flew off
+        for dobj in &doc.dobjects {
+            if let Geom::Line(l) = &dobj.geom {
+                for p in [l.a, l.b] {
+                    assert!(p.x.abs() < 20_000.0 && p.y.abs() < 20_000.0, "exploded: {:?}", p);
+                }
+            }
+        }
+        // #6 (untouched by any constraint) stayed put
+        let Geom::Line(l6) = &doc.dobjects[3].geom else { panic!() };
+        assert!((l6.a - d).len() < 1e-6 && (l6.b - e).len() < 1e-6, "untouched edge moved");
+        // #3 ∥ #4
+        let Geom::Line(l3) = &doc.dobjects[0].geom else { panic!() };
+        let Geom::Line(l4) = &doc.dobjects[1].geom else { panic!() };
+        let (u, v) = (l3.b - l3.a, l4.b - l4.a);
+        assert!((u.x * v.y - u.y * v.x).abs() / (u.len() * v.len()) < 1e-5, "not parallel");
     }
 
     #[test]

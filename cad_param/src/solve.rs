@@ -85,18 +85,22 @@ pub fn residuals(s: &Sketch, x: &[f64]) -> Vec<f64> {
             Constraint::PointOnLine { p, line } => {
                 let (px, py) = pt(x, p);
                 let ((ax, ay), (bx, by)) = line_pts(s.lines[line]);
-                r.push((bx - ax) * (py - ay) - (by - ay) * (px - ax));
+                let len = ((bx - ax).powi(2) + (by - ay).powi(2)).sqrt().max(1e-9);
+                // perpendicular distance of p from the infinite line (length units,
+                // NOT area — so it scales linearly and stays well-conditioned)
+                r.push(((bx - ax) * (py - ay) - (by - ay) * (px - ax)) / len);
             }
             Constraint::Symmetric { p, q, line } => {
                 let (px, py) = pt(x, p);
                 let (qx, qy) = pt(x, q);
                 let ((ax, ay), (bx, by)) = line_pts(s.lines[line]);
                 let (dx, dy) = (bx - ax, by - ay);
-                // midpoint lies on the line
+                let len = (dx * dx + dy * dy).sqrt().max(1e-9);
+                // midpoint lies on the line (distance, normalized)
                 let (mx, my) = ((px + qx) * 0.5, (py + qy) * 0.5);
-                r.push(dx * (my - ay) - dy * (mx - ax));
-                // p→q is perpendicular to the line direction
-                r.push(dx * (qx - px) + dy * (qy - py));
+                r.push((dx * (my - ay) - dy * (mx - ax)) / len);
+                // p→q is perpendicular to the line direction (projection, normalized)
+                r.push((dx * (qx - px) + dy * (qy - py)) / len);
             }
             Constraint::Horizontal { line } => {
                 let ((_, ay), (_, by)) = line_pts(s.lines[line]);
@@ -109,20 +113,33 @@ pub fn residuals(s: &Sketch, x: &[f64]) -> Vec<f64> {
             Constraint::Parallel { a, b } => {
                 let ((ax, ay), (bx, by)) = line_pts(s.lines[a]);
                 let ((cx, cy), (dx, dy)) = line_pts(s.lines[b]);
-                r.push((bx - ax) * (dy - cy) - (by - ay) * (dx - cx));
+                let (ux, uy) = (bx - ax, by - ay);
+                let (vx, vy) = (dx - cx, dy - cy);
+                let nrm = (ux * ux + uy * uy).sqrt().max(1e-9) * (vx * vx + vy * vy).sqrt().max(1e-9);
+                // sin(angle) — dimensionless, so it stays well-scaled at any
+                // coordinate magnitude (the raw cross product is area-scale and
+                // makes the solver diverge on large drawings).
+                r.push((ux * vy - uy * vx) / nrm);
             }
             Constraint::Perpendicular { a, b } => {
                 let ((ax, ay), (bx, by)) = line_pts(s.lines[a]);
                 let ((cx, cy), (dx, dy)) = line_pts(s.lines[b]);
-                r.push((bx - ax) * (dx - cx) + (by - ay) * (dy - cy));
+                let (ux, uy) = (bx - ax, by - ay);
+                let (vx, vy) = (dx - cx, dy - cy);
+                let nrm = (ux * ux + uy * uy).sqrt().max(1e-9) * (vx * vx + vy * vy).sqrt().max(1e-9);
+                r.push((ux * vx + uy * vy) / nrm); // cos(angle), dimensionless
             }
             Constraint::Collinear { a, b } => {
                 let ((ax, ay), (bx, by)) = line_pts(s.lines[a]);
                 let ((cx, cy), (dx, dy)) = line_pts(s.lines[b]);
-                // parallel …
-                r.push((bx - ax) * (dy - cy) - (by - ay) * (dx - cx));
-                // … and b's first endpoint lies on infinite line a
-                r.push((bx - ax) * (cy - ay) - (by - ay) * (cx - ax));
+                let (ux, uy) = (bx - ax, by - ay);
+                let (vx, vy) = (dx - cx, dy - cy);
+                let lu = (ux * ux + uy * uy).sqrt().max(1e-9);
+                let lv = (vx * vx + vy * vy).sqrt().max(1e-9);
+                // parallel (sin) …
+                r.push((ux * vy - uy * vx) / (lu * lv));
+                // … and b's first endpoint lies on infinite line a (distance)
+                r.push((ux * (cy - ay) - uy * (cx - ax)) / lu);
             }
             Constraint::EqualLength { a, b } => {
                 let ((ax, ay), (bx, by)) = line_pts(s.lines[a]);
@@ -333,6 +350,14 @@ pub fn solve(s: &mut Sketch) -> SolveReport {
     SolveReport { converged: rms < 1e-6, iterations: iters, residual: rms, dof }
 }
 
+/// RMS of all constraint residuals at the sketch's CURRENT positions (no solve).
+/// Used by the diagnostics panel to show how far the sketch is from satisfied.
+pub fn current_rms(s: &Sketch) -> f64 {
+    let (x, _) = pack(s);
+    let r = residuals(s, &x);
+    if r.is_empty() { 0.0 } else { (sum_sq(&r) / r.len() as f64).sqrt() }
+}
+
 /// Diagnose degrees of freedom by the RANK of the constraint Jacobian at the
 /// sketch's current configuration. `dof = free_params − rank`. Also reports which
 /// individual parameters remain free (non-pivot columns) so the UI can colour
@@ -538,6 +563,34 @@ mod tests {
         let d = dof_analysis(&s);
         assert_eq!(d.dof, 0, "{:?}", d);
         assert!(d.fully_defined);
+    }
+
+    #[test]
+    fn parallel_stays_bounded_at_large_coordinates() {
+        // Regression: real drawings use coordinates in the thousands. With an
+        // UNNORMALIZED (area-scale) parallel residual the solver diverged and
+        // points flew to ±15000. The normalized sin(angle) residual must keep
+        // the solve bounded and actually parallel.
+        let mut s = Sketch::new();
+        let a = s.add_point(3248.0, 4004.0);
+        let b = s.add_point(5316.0, 5652.0);
+        let c = s.add_point(7888.0, 3823.0);
+        let d = s.add_point(6548.0, 1475.0);
+        let l0 = s.add_line(a, b);
+        let l1 = s.add_line(c, d);
+        s.add(Constraint::Fixed { p: a, x: 3248.0, y: 4004.0 });
+        s.add(Constraint::Fixed { p: b, x: 5316.0, y: 5652.0 });
+        s.add(Constraint::Parallel { a: l0, b: l1 });
+        let rep = solve(&mut s);
+        assert!(rep.converged, "rms={}", rep.residual);
+        // nothing flew off — every point stays within the original bbox + margin
+        for p in &s.points {
+            assert!(p.x.abs() < 20_000.0 && p.y.abs() < 20_000.0, "exploded: {:?}", p);
+        }
+        let u = s.points[b] - s.points[a];
+        let v = s.points[d] - s.points[c];
+        let cross = u.x * v.y - u.y * v.x;
+        assert!((cross / (u.len() * v.len())).abs() < 1e-6, "not parallel: sin={}", cross / (u.len() * v.len()));
     }
 
     #[test]
