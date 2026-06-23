@@ -959,6 +959,24 @@ mod tests {
     }
 
     #[test]
+    fn chained_equal_length_makes_all_selected_equal() {
+        // Mirrors what the UI now does for a multi-selection: chain Equal from
+        // the first edge to every other → ALL become equal length.
+        let mut doc = Document::default();
+        let h0 = add_line(&mut doc, Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0)); // 10
+        let h1 = add_line(&mut doc, Vec2::new(0.0, 5.0), Vec2::new(30.0, 5.0)); // 30
+        let h2 = add_line(&mut doc, Vec2::new(0.0, 9.0), Vec2::new(20.0, 9.0)); // 20
+        let mut sess = ParamSession::new();
+        sess.constraints.push(CRef::Equal(h0, h1));
+        sess.constraints.push(CRef::Equal(h0, h2));
+        let out = solve_doc(&mut doc, &sess);
+        assert!(out.converged, "{}", out.msg);
+        let len = |i: usize| { let Geom::Line(l) = &doc.dobjects[i].geom else { panic!() }; (l.b - l.a).len() };
+        let (a, b, c) = (len(0), len(1), len(2));
+        assert!((a - b).abs() < 1e-5 && (a - c).abs() < 1e-5, "not all equal: {a}, {b}, {c}");
+    }
+
+    #[test]
     fn inspect_handle_reports_free_and_locked_params() {
         let mut doc = Document::default();
         let h = add_line(&mut doc, Vec2::new(0.0, 0.0), Vec2::new(10.0, 3.0));

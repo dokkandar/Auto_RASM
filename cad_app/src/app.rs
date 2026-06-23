@@ -10462,7 +10462,7 @@ impl CadApp {
         // resolve variables once for value display + field evaluation
         let var_env = self.parametric.vars.resolve();
 
-        let mut add: Option<CRef> = None;
+        let mut to_add: Vec<CRef> = Vec::new();
         let mut arm: Option<(PendingKind, Handle)> = None;
         let mut cancel_pending = false;
         let mut remove_var: Option<String> = None;
@@ -10481,7 +10481,7 @@ impl CadApp {
                 lines.iter().copied().find(|&h| h != first)
             };
             if let Some(t) = target {
-                add = Some(kind.to_cref(first, t));
+                to_add.push(kind.to_cref(first, t));
                 self.parametric.pending = None;
             }
         }
@@ -10554,24 +10554,30 @@ impl CadApp {
                     ui.add_space(2.0);
                     ui.strong("Lines & walls");
                     ui.horizontal_wrapped(|ui| {
-                        if ui.add_enabled(lines.len() == 1, egui::Button::new("Horizontal")).clicked() {
-                            add = Some(CRef::Horizontal(lines[0]));
+                        // Horizontal/Vertical apply to EVERY selected line.
+                        if ui.add_enabled(!lines.is_empty(), egui::Button::new("Horizontal")).clicked() {
+                            for &h in &lines { to_add.push(CRef::Horizontal(h)); }
                         }
-                        if ui.add_enabled(lines.len() == 1, egui::Button::new("Vertical")).clicked() {
-                            add = Some(CRef::Vertical(lines[0]));
+                        if ui.add_enabled(!lines.is_empty(), egui::Button::new("Vertical")).clicked() {
+                            for &h in &lines { to_add.push(CRef::Vertical(h)); }
                         }
-                        // (kind, label) for the line/wall binary relations
-                        for (kind, lbl) in [
-                            (PendingKind::Parallel, "Parallel"),
-                            (PendingKind::Perpendicular, "Perpendicular"),
-                            (PendingKind::Collinear, "Collinear"),
-                            (PendingKind::Equal, "Equal len"),
+                        // Binary relations: select 2 then click, OR select 1 then
+                        // pick a target. Parallel/Collinear/Equal CHAIN across the
+                        // whole selection (all become equal/parallel/collinear);
+                        // Perpendicular is pairwise (>2 has no meaning in 2D).
+                        for (kind, lbl, chain) in [
+                            (PendingKind::Parallel, "Parallel", true),
+                            (PendingKind::Perpendicular, "Perpendicular", false),
+                            (PendingKind::Collinear, "Collinear", true),
+                            (PendingKind::Equal, "Equal len", true),
                         ] {
-                            if ui.add_enabled(lines.len() >= 1, egui::Button::new(lbl)).clicked() {
-                                if lines.len() >= 2 {
-                                    add = Some(kind.to_cref(lines[0], lines[1]));
-                                } else {
+                            if ui.add_enabled(!lines.is_empty(), egui::Button::new(lbl)).clicked() {
+                                if lines.len() == 1 {
                                     arm = Some((kind, lines[0]));
+                                } else if chain {
+                                    for i in 1..lines.len() { to_add.push(kind.to_cref(lines[0], lines[i])); }
+                                } else {
+                                    to_add.push(kind.to_cref(lines[0], lines[1]));
                                 }
                             }
                         }
@@ -10584,7 +10590,7 @@ impl CadApp {
                         let ok = lines.len() == 1;
                         if ui.add_enabled(ok, egui::Button::new("set")).clicked() {
                             if let Ok(d) = self.parametric.eval_field(&self.parametric.length_input) {
-                                add = Some(CRef::Length(lines[0], d));
+                                to_add.push(CRef::Length(lines[0], d));
                             }
                         }
                     });
@@ -10596,7 +10602,7 @@ impl CadApp {
                         let ok = lines.len() == 2;
                         if ui.add_enabled(ok, egui::Button::new("set")).clicked() {
                             if let Ok(deg) = self.parametric.eval_field(&self.parametric.angle_input) {
-                                add = Some(CRef::Angle(lines[0], lines[1], deg.to_radians()));
+                                to_add.push(CRef::Angle(lines[0], lines[1], deg.to_radians()));
                             }
                         }
                     });
@@ -10605,15 +10611,16 @@ impl CadApp {
                     ui.add_space(4.0);
                     ui.strong("Circles");
                     ui.horizontal_wrapped(|ui| {
+                        // Concentric / Equal radius CHAIN across all selected circles.
                         for (kind, lbl) in [
                             (PendingKind::Concentric, "Concentric"),
                             (PendingKind::EqualRadius, "Equal radius"),
                         ] {
-                            if ui.add_enabled(circles.len() >= 1, egui::Button::new(lbl)).clicked() {
-                                if circles.len() >= 2 {
-                                    add = Some(kind.to_cref(circles[0], circles[1]));
-                                } else {
+                            if ui.add_enabled(!circles.is_empty(), egui::Button::new(lbl)).clicked() {
+                                if circles.len() == 1 {
                                     arm = Some((kind, circles[0]));
+                                } else {
+                                    for i in 1..circles.len() { to_add.push(kind.to_cref(circles[0], circles[i])); }
                                 }
                             }
                         }
@@ -10622,15 +10629,16 @@ impl CadApp {
                         ui.label("Value");
                         ui.add(egui::TextEdit::singleline(&mut self.parametric.value_input)
                             .desired_width(70.0).hint_text("50 or =R"));
-                        let ok = circles.len() == 1;
+                        // Radius/Diameter apply to EVERY selected circle.
+                        let ok = !circles.is_empty();
                         if ui.add_enabled(ok, egui::Button::new("Radius")).clicked() {
                             if let Ok(r) = self.parametric.eval_field(&self.parametric.value_input) {
-                                add = Some(CRef::Radius(circles[0], r));
+                                for &h in &circles { to_add.push(CRef::Radius(h, r)); }
                             }
                         }
                         if ui.add_enabled(ok, egui::Button::new("Diameter")).clicked() {
                             if let Ok(d) = self.parametric.eval_field(&self.parametric.value_input) {
-                                add = Some(CRef::Radius(circles[0], d * 0.5));
+                                for &h in &circles { to_add.push(CRef::Radius(h, d * 0.5)); }
                             }
                         }
                     });
@@ -10645,9 +10653,9 @@ impl CadApp {
                         || (circles.len() == 1 && lines.is_empty());
                     if ui.add_enabled(tan_lc || tan_cc || tan_one, egui::Button::new("Tangent")).clicked() {
                         if tan_lc {
-                            add = Some(CRef::Tangent(lines[0], circles[0]));
+                            to_add.push(CRef::Tangent(lines[0], circles[0]));
                         } else if tan_cc {
-                            add = Some(CRef::Tangent(circles[0], circles[1]));
+                            to_add.push(CRef::Tangent(circles[0], circles[1]));
                         } else if tan_one {
                             let first = if lines.len() == 1 { lines[0] } else { circles[0] };
                             arm = Some((PendingKind::Tangent, first));
@@ -10795,16 +10803,23 @@ impl CadApp {
             }
         }
 
-        // `just_added` tracks whether THIS frame added a constraint — only then
-        // do we roll back on non-convergence (a fresh constraint that conflicts).
+        // `just_added` tracks how many constraints THIS frame added — only those
+        // get rolled back on non-convergence (a fresh constraint that conflicts).
+        let mut just_added: usize = 0;
         let mut just_added_label: Option<String> = None;
-        if let Some(c) = add {
-            let lbl = c.label();
-            crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::Note {
-                message: format!("param: + {} (lines={}, circles={})", lbl, lines.len(), circles.len()) });
-            self.parametric.constraints.push(c);
+        if !to_add.is_empty() {
+            just_added = to_add.len();
+            just_added_label = Some(if to_add.len() == 1 {
+                to_add[0].label()
+            } else {
+                format!("{} ×{}", to_add[0].label(), to_add.len())
+            });
+            for c in to_add {
+                crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::Note {
+                    message: format!("param: + {} (lines={}, circles={})", c.label(), lines.len(), circles.len()) });
+                self.parametric.constraints.push(c);
+            }
             self.parametric.pending = None; // the pair is complete
-            just_added_label = Some(lbl);
             do_solve = true;   // auto-solve so the constraint takes effect immediately
         }
         if clear_c {
@@ -10824,12 +10839,15 @@ impl CadApp {
             let trace = out.trace;
 
             if let (Some(lbl), false) = (just_added_label.as_ref(), converged) {
-                // The just-added constraint conflicts / over-defines the sketch.
-                // Restore geometry, drop the constraint, and undo the snapshot so
-                // history stays clean (SolidWorks: "would over-define the sketch").
-                self.doc = before;
-                self.undo_stack.pop();
-                self.parametric.constraints.pop();
+                if just_added > 0 {
+                    // The just-added constraint(s) conflict / over-define the
+                    // sketch. Restore geometry, drop them, and undo the snapshot
+                    // (SolidWorks: "would over-define the sketch").
+                    self.doc = before;
+                    self.undo_stack.pop();
+                    let keep = self.parametric.constraints.len().saturating_sub(just_added);
+                    self.parametric.constraints.truncate(keep);
+                }
                 self.parametric.status =
                     format!("⚠ '{lbl}' conflicts / over-defines — NOT applied (use ✖ to free up constraints first)");
             } else {
