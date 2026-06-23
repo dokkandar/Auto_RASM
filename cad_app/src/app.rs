@@ -1188,6 +1188,10 @@ pub enum QueuedOp {
     /// to merge into the target polyline; on Enter they're joined. Carries the
     /// target polyline's handle.
     PeditJoin(u64),
+    /// PEDIT start — `pedit` was typed with nothing selected, so a selection
+    /// session is open to pick the ONE object to edit (AutoCAD's "Select
+    /// polyline" prompt). On Enter `pedit_start` runs again with the pick.
+    PeditStart,
 }
 
 /// State machine for the interactive copy tool — same shape as MoveState.
@@ -4340,6 +4344,10 @@ impl CadApp {
             }
             QueuedOp::PeditJoin(h) => {
                 self.pedit_join_selected(h);
+            }
+            QueuedOp::PeditStart => {
+                // The user picked the object to edit — run pedit on it.
+                self.pedit_start();
             }
             QueuedOp::Hatch => {
                 self.apply_hatch();

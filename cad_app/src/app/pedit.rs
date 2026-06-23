@@ -32,7 +32,19 @@ impl CadApp {
             None
         };
         let Some(i) = target.filter(|&i| i < self.doc.dobjects.len()) else {
-            self.history.push("  ! pedit: select ONE polyline (or line/arc) first".into());
+            // Nothing chosen yet — AutoCAD-style "Select polyline": open a
+            // one-object selection session and re-run pedit on Enter. Keeps the
+            // command ACTIVE (the green prompt stays up) instead of aborting to
+            // a fresh "command:" line. Picking nothing + Enter is caught by the
+            // queued-op "nothing selected" guard and cancels cleanly.
+            if self.selection.len() > 1 {
+                self.history.push("  ! pedit: select only ONE object".into());
+            }
+            self.begin_selection(SelectMode::ForSelect);
+            self.queued_op = QueuedOp::PeditStart;
+            self.set_prompt(
+                "pedit: select ONE polyline / line / arc / ellipse-arc / spline, then Enter  [Esc=cancel]");
+            self.refocus_cmd = true;
             return;
         };
         // Convert Line / Arc → polyline in place.
