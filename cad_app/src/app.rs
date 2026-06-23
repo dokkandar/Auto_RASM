@@ -23460,9 +23460,11 @@ fn polyline_width_centerline(p: &Polyline) -> Vec<(Vec2, f64)> {
     cl
 }
 
-/// Fill a width strip along a `(point, full_width)` centerline. Each point gets
-/// an AVERAGED-tangent normal so consecutive quads share their offset points —
-/// no gaps, mitred-ish corners. Widths are world units (scale with zoom).
+/// Fill a width strip along a `(point, full_width)` centerline. Each span is
+/// filled as its OWN convex quad using that span's normal (so a span always
+/// keeps its full width — no collapse at sharp corners), and a round join
+/// (filled disc) at each interior point closes the gap between adjacent spans.
+/// Widths are world units (scale with zoom). Endpoints get butt caps.
 fn fill_width_strip(
     painter: &egui::Painter,
     rect: egui::Rect,
@@ -23472,27 +23474,30 @@ fn fill_width_strip(
 ) {
     let m = cl.len();
     if m < 2 { return; }
-    let unit = |v: Vec2| { let l = v.len(); if l > EPS { v / l } else { Vec2::new(0.0, 0.0) } };
-    let mut left = Vec::with_capacity(m);
-    let mut right = Vec::with_capacity(m);
-    for k in 0..m {
-        let p = cl[k].0;
-        let tan = if k == 0 {
-            cl[1].0 - cl[0].0
-        } else if k == m - 1 {
-            cl[m - 1].0 - cl[m - 2].0
-        } else {
-            unit(cl[k].0 - cl[k - 1].0) + unit(cl[k + 1].0 - cl[k].0)
-        };
-        let n = unit(Vec2::new(-tan.y, tan.x));
-        let h = cl[k].1 * 0.5;
-        left.push(app.w2s(p + n * h, rect));
-        right.push(app.w2s(p - n * h, rect));
-    }
     for k in 0..m - 1 {
+        let p0 = cl[k].0;
+        let p1 = cl[k + 1].0;
+        let dir = p1 - p0;
+        let dl = dir.len();
+        if dl < EPS { continue; }
+        let n = Vec2::new(-dir.y, dir.x) / dl;
+        let h0 = cl[k].1 * 0.5;
+        let h1 = cl[k + 1].1 * 0.5;
         painter.add(egui::Shape::convex_polygon(
-            vec![left[k], left[k + 1], right[k + 1], right[k]],
+            vec![
+                app.w2s(p0 + n * h0, rect),
+                app.w2s(p1 + n * h1, rect),
+                app.w2s(p1 - n * h1, rect),
+                app.w2s(p0 - n * h0, rect),
+            ],
             color, egui::Stroke::NONE));
+    }
+    // Round joins at interior points fill the wedge gaps between spans.
+    for k in 1..m - 1 {
+        let r = (cl[k].1 * 0.5) as f32 * app.scale;
+        if r > 0.5 {
+            painter.circle_filled(app.w2s(cl[k].0, rect), r, color);
+        }
     }
 }
 
