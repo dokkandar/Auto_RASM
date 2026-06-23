@@ -151,6 +151,12 @@ pub struct ParamSession {
     pub new_var_expr: String,
     /// Show the blue/black under-defined overlay on the canvas.
     pub show_dof: bool,
+    /// When true, edits auto-re-solve so constraint links are always kept live
+    /// ("rotate one → the linked one follows"). See `geom_signature`.
+    pub keep_link: bool,
+    /// Geometry signature at the last solve — an edit that changes it triggers a
+    /// driven re-solve.
+    pub last_solved_sig: u64,
     /// Cached per-handle "fully defined" flags (true = black/locked). Recomputed
     /// by [`analyze_doc`] each frame the panel runs; the canvas overlay reads it.
     pub defined: HashMap<Handle, bool>,
@@ -174,6 +180,8 @@ impl ParamSession {
             new_var_name: String::new(),
             new_var_expr: String::new(),
             show_dof: true,
+            keep_link: true,
+            last_solved_sig: 0,
             defined: HashMap::new(),
             dof: 0,
             fully_defined: false,
@@ -309,10 +317,31 @@ fn build_doc_map(doc: &Document) -> DocMap {
 
 /// Translate the session's handle-based constraints into the sketch. Returns how
 /// many resolved (an unresolved one means its geometry is gone). Anchors the
-/// first point so the sketch can't float.
-fn apply_constraints(map: &mut DocMap, doc: &Document, session: &ParamSession) -> usize {
+/// first point so the sketch can't float, and HARD-PINS every `driver` entity at
+/// its current position so an edited/dragged entity stays put while the linked
+/// geometry moves to satisfy the constraints ("keep the link").
+fn apply_constraints(
+    map: &mut DocMap,
+    doc: &Document,
+    session: &ParamSession,
+    drivers: &HashSet<Handle>,
+) -> usize {
     if let Some(p0) = map.sk.points.first().copied() {
         map.sk.add(Constraint::Fixed { p: 0, x: p0.x, y: p0.y });
+    }
+    // Pin driver entities (the ones the user just moved) — their points become
+    // hard-fixed at their current spots, so the solver adjusts everything else.
+    for h in drivers {
+        if let Some(&l) = map.line_id.get(h) {
+            let ln = map.sk.lines[l];
+            let (pa, pb) = (map.sk.points[ln.a], map.sk.points[ln.b]);
+            map.sk.add(Constraint::Fixed { p: ln.a, x: pa.x, y: pa.y });
+            map.sk.add(Constraint::Fixed { p: ln.b, x: pb.x, y: pb.y });
+        } else if let Some(&c) = map.circle_id.get(h) {
+            let circ = map.sk.circles[c];
+            let cen = map.sk.points[circ.center];
+            map.sk.add(Constraint::Fixed { p: circ.center, x: cen.x, y: cen.y });
+        }
     }
     let _ = doc; // doc kept for future kind lookups beyond the maps
     let mut resolved = 0usize;
@@ -358,10 +387,42 @@ fn pair(m: &HashMap<Handle, usize>, a: Handle, b: Handle) -> Option<(usize, usiz
     }
 }
 
+/// A stable hash of all constrainable geometry's coordinates — used to detect
+/// when the user has edited the drawing (so the link can be re-enforced).
+pub fn geom_signature(doc: &Document) -> u64 {
+    fn mix(acc: &mut u64, x: f64) {
+        *acc ^= x.to_bits();
+        *acc = acc.wrapping_mul(0x100000001b3);
+    }
+    let mut acc: u64 = 0xcbf29ce484222325;
+    for d in &doc.dobjects {
+        match &d.geom {
+            Geom::Line(l) => { mix(&mut acc, l.a.x); mix(&mut acc, l.a.y); mix(&mut acc, l.b.x); mix(&mut acc, l.b.y); }
+            Geom::Circle(c) => { mix(&mut acc, c.center.x); mix(&mut acc, c.center.y); mix(&mut acc, c.radius); }
+            _ => if let Some((s, e)) = straight_wall(&d.geom) {
+                mix(&mut acc, s.x); mix(&mut acc, s.y); mix(&mut acc, e.x); mix(&mut acc, e.y);
+            },
+        }
+    }
+    acc
+}
+
 /// Build the sketch, apply constraints, solve, and write solved geometry back
 /// into the drawing (lines AND circles). Returns the outcome (message +
 /// convergence) so the caller can roll a conflicting constraint back.
 pub fn solve_doc(doc: &mut Document, session: &ParamSession) -> SolveOutcome {
+    solve_doc_driven(doc, session, &HashSet::new())
+}
+
+/// Like [`solve_doc`], but hard-pins the `drivers` entities at their current
+/// positions (the ones the user just moved/dragged), so the constraint link is
+/// kept by moving everything ELSE. This is what makes "rotate one → the linked
+/// one follows" work.
+pub fn solve_doc_driven(
+    doc: &mut Document,
+    session: &ParamSession,
+    drivers: &HashSet<Handle>,
+) -> SolveOutcome {
     let mut map = build_doc_map(doc);
     if map.sk.lines.is_empty() && map.sk.circles.is_empty() {
         return SolveOutcome {
@@ -369,7 +430,7 @@ pub fn solve_doc(doc: &mut Document, session: &ParamSession) -> SolveOutcome {
             converged: true,
         };
     }
-    let resolved = apply_constraints(&mut map, doc, session);
+    let resolved = apply_constraints(&mut map, doc, session, drivers);
     let rep = solve(&mut map.sk);
 
     // write back lines
@@ -419,7 +480,7 @@ pub fn solve_doc(doc: &mut Document, session: &ParamSession) -> SolveOutcome {
 /// sketches parametric mode targets.
 pub fn analyze_doc(doc: &Document, session: &ParamSession) -> (DofReport, HashMap<Handle, bool>) {
     let mut map = build_doc_map(doc);
-    let _ = apply_constraints(&mut map, doc, session);
+    let _ = apply_constraints(&mut map, doc, session, &HashSet::new());
     let rep = dof_analysis(&map.sk);
     let mut defined = HashMap::new();
     for (h, params) in &map.handle_params {
@@ -572,6 +633,29 @@ mod tests {
         // anchored first point removes 2 DOF; a free line still has DOF left
         assert!(rep.dof > 0, "expected under-defined, dof={}", rep.dof);
         assert_eq!(defined.get(&h0), Some(&false));
+    }
+
+    #[test]
+    fn driven_solve_keeps_link_other_follows() {
+        // two parallel lines; the user tilts line A; a driven re-solve with A
+        // pinned must keep A put and rotate B to stay parallel ("keep the link").
+        let mut doc = Document::default();
+        let ha = add_line(&mut doc, Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0));
+        let hb = add_line(&mut doc, Vec2::new(0.0, 5.0), Vec2::new(10.0, 5.0));
+        let mut sess = ParamSession::new();
+        sess.constraints.push(CRef::Parallel(ha, hb));
+        let _ = solve_doc(&mut doc, &sess);
+        // user tilts A's far endpoint
+        if let Geom::Line(l) = &mut doc.dobjects[0].geom { l.b = Vec2::new(10.0, 4.0); }
+        let drivers: HashSet<Handle> = [ha].into_iter().collect();
+        let _ = solve_doc_driven(&mut doc, &sess, &drivers);
+        let Geom::Line(a) = &doc.dobjects[0].geom else { panic!() };
+        let Geom::Line(b) = &doc.dobjects[1].geom else { panic!() };
+        // A stayed where the user put it
+        assert!((a.b - Vec2::new(10.0, 4.0)).len() < 1e-6, "driver moved: {:?}", a.b);
+        // B followed — now parallel to A
+        let (u, v) = (a.b - a.a, b.b - b.a);
+        assert!((u.x * v.y - u.y * v.x).abs() < 1e-5, "B not parallel after drag");
     }
 
     #[test]

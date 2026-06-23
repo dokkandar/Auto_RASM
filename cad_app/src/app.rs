@@ -10412,6 +10412,27 @@ impl CadApp {
         }).collect()
     }
 
+    /// Keep the constraint LINK live: if the drawing's geometry changed since the
+    /// last solve (the user moved/rotated/stretched/grip-edited something), re-run
+    /// the solver with the current SELECTION pinned as the driver — so the edited
+    /// entity stays where the user put it and every linked entity follows. Runs
+    /// each frame while parametric mode is active (skipped while a drawing tool is
+    /// mid-stroke, to not perturb new geometry being placed).
+    fn param_auto_resolve(&mut self) {
+        if !self.parametric.active || !self.parametric.keep_link { return; }
+        if self.parametric.constraints.is_empty() { return; }
+        if self.tool != Tool::None { return; } // don't tug geometry while drawing
+        let sig = crate::param_editor::geom_signature(&self.doc);
+        if sig == self.parametric.last_solved_sig { return; } // nothing edited
+        let drivers: std::collections::HashSet<Handle> = self.selection.iter()
+            .filter_map(|&i| self.doc.dobjects.get(i).map(|d| d.handle))
+            .collect();
+        let _ = crate::param_editor::solve_doc_driven(&mut self.doc, &self.parametric, &drivers);
+        self.parametric.last_solved_sig = crate::param_editor::geom_signature(&self.doc);
+        self.index_dirty = true;
+        self.gpu_dirty = true;
+    }
+
     /// Parametric MODE panel — add geometric/dimensional/variable constraints to
     /// the selected geometry, see the degrees-of-freedom diagnosis, and Solve.
     /// The drawing is built with the NORMAL tools; this only adds the constraint
@@ -10419,6 +10440,9 @@ impl CadApp {
     fn render_param_panel(&mut self, ctx: &egui::Context) {
         if !self.parametric.active { return; }
         use crate::param_editor::{CRef, PendingKind};
+
+        // Keep the link live: re-solve if the user edited geometry this frame.
+        self.param_auto_resolve();
 
         // Drop constraints whose geometry has been deleted (handles gone) so old
         // edits don't linger and make every solve "apply to everything".
@@ -10490,6 +10514,8 @@ impl CadApp {
                     });
                 }
                 ui.checkbox(&mut self.parametric.show_dof, "colour geometry by DOF (blue=free, green=locked)");
+                ui.checkbox(&mut self.parametric.keep_link,
+                    "keep link live (move one → linked geometry follows)");
                 ui.separator();
                 ui.small("Draw with the normal tools (Line, Circle, snaps…), select \
                           geometry, then add constraints. Adding auto-solves.");
@@ -10763,6 +10789,8 @@ impl CadApp {
             }
             self.index_dirty = true;
             self.gpu_dirty = true;
+            // record the post-solve geometry so keep-link doesn't re-fire on it
+            self.parametric.last_solved_sig = crate::param_editor::geom_signature(&self.doc);
         }
         if close {
             self.parametric.active = false;
