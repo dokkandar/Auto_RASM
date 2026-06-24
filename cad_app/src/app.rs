@@ -669,8 +669,8 @@ fn draw_editor_arrow(p: &egui::Painter, from: egui::Pos2, to: egui::Pos2, col: e
 fn current_hint(tool: Tool, arc_method: ArcMethod, n: usize) -> &'static str {
     match (tool, n) {
         (Tool::None,   _) => "select a tool above, or type a command below",
-        (Tool::Line,   0) => "line: click first endpoint",
-        (Tool::Line,   _) => "line: click second endpoint    [Esc cancels]",
+        (Tool::Line,   0) => "line: click first point",
+        (Tool::Line,   _) => "line: click next point — connected segments    [Esc ends]",
         (Tool::Wall,   0) => "wall: click first point of the run   (t = thickness)  [Esc exits]",
         (Tool::Wall,   _) => "wall: click next point; corners auto-join.  t = thickness · Enter ends run  [Esc cancels]",
         (Tool::Text,   _) => "text: click anchor position    [Esc cancels]",
@@ -1114,6 +1114,17 @@ pub struct CadApp {
     /// covers import, detach, file-open, and undo/redo in one place.
     underlay_tex: Vec<egui::TextureHandle>,
     underlay_sig: u64,
+    /// Parsed preview of the file currently selected in the Open dialog (teammate
+    /// preview system; used by their auto-merged open-navigation hooks).
+    file_preview: Option<FilePreview>,
+    /// Path of the currently open/saved drawing — set on successful open/save.
+    /// `Save` writes here directly; `None` falls back to Save As.
+    current_file: Option<std::path::PathBuf>,
+    /// Clipboard for Copy / Paste — clones of the copied dobjects. Paste
+    /// re-adds them with fresh handles (via `DObject::with_style`).
+    clipboard_dobjects: Vec<DObject>,
+    /// Active PASTE placement flow (base → destination); `Off` when idle.
+    paste_state: PasteState,
 
     // ---- Slice L: medium editing actions ----
     offset_state:   OffsetState,
@@ -1379,6 +1390,15 @@ pub enum QueuedOp {
 /// State machine for the interactive copy tool — same shape as MoveState.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum CopyState {
+    Off,
+    WaitingForBase,
+    WaitingForDest(Vec2),
+}
+
+/// State machine for PASTE (Edit ▸ Paste) — places the dobject clipboard via a
+/// base→destination pick with a live ghost preview, exactly like COPY.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum PasteState {
     Off,
     WaitingForBase,
     WaitingForDest(Vec2),
@@ -1752,7 +1772,12 @@ pub struct FileDialog {
     pub mode:     FileDialogMode,
     pub dir:      std::path::PathBuf,
     pub filename: String,
-    /// Save format extension, ".dxf" or ".rsm". Ignored in Open mode.
+    /// Editable text for the path bar. Decoupled from `dir` so typing doesn't
+    /// re-navigate on every keystroke — committed via Enter / "Go" only. Kept
+    /// in sync with `dir` whenever navigation happens (folder click, `..`).
+    pub path_buf: String,
+    /// Active file-type filter AND (in Save mode) the format extension —
+    /// ".dxf" or ".rsm". The directory list shows only files matching it.
     pub ext:      String,
     pub error:    Option<String>,
     /// Cached preview of the currently-selected file + which file it's for
@@ -1763,7 +1788,8 @@ pub struct FileDialog {
 
 impl FileDialog {
     fn new(mode: FileDialogMode, dir: std::path::PathBuf, ext: &str) -> Self {
-        FileDialog { mode, dir, filename: String::new(),
+        let path_buf = dir.to_string_lossy().to_string();
+        FileDialog { mode, dir, filename: String::new(), path_buf,
                      ext: ext.to_string(), error: None,
                      preview: PreviewState::None, preview_path: None }
     }
@@ -1948,6 +1974,33 @@ pub enum PreviewState {
     /// Drawing wireframe — world-space polylines, fitted into the preview box,
     /// plus the object count for the metadata line.
     Drawing { polys: Vec<Vec<Vec2>>, count: usize },
+}
+
+/// Cached, parsed preview of the file selected in the Open dialog (teammate
+/// preview system; feeds `update_file_preview` / `render_file_preview`).
+struct FilePreview {
+    path: std::path::PathBuf,
+    doc:  Option<Document>,
+    bbox: Option<(Vec2, Vec2)>,
+    info: String,
+}
+
+/// Drive/root paths for the path-bar dropdown. On Windows, probe A:..Z: and
+/// keep the roots that exist; on other platforms just the filesystem root.
+fn list_drive_roots() -> Vec<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        let mut v = Vec::new();
+        for c in b'A'..=b'Z' {
+            let root = format!("{}:\\", c as char);
+            let p = std::path::PathBuf::from(&root);
+            if p.exists() { v.push(p); }
+        }
+        if v.is_empty() { v.push(std::path::PathBuf::from("C:\\")); }
+        v
+    }
+    #[cfg(not(windows))]
+    { vec![std::path::PathBuf::from("/")] }
 }
 
 /// State machines for the Slice-L click-driven actions.
@@ -2536,6 +2589,10 @@ impl Default for CadApp {
             raster_editor: None,
             underlay_tex: Vec::new(),
             underlay_sig: 0,
+            file_preview: None,
+            current_file: None,
+            clipboard_dobjects: Vec::new(),
+            paste_state: PasteState::Off,
             insert_state:    InsertState::Off,
             block_dialog:    None,
             offset_state:   OffsetState::Off,
@@ -8906,11 +8963,17 @@ impl CadApp {
                                             resp.request_focus();
                                             self.layer_rename_focus_pending = false;
                                         }
-                                        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                                            rename_commit = Some((id, self.layer_rename_buf.clone()));
-                                        }
-                                        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                                            rename_cancel = true;
+                                        // Commit on ANY focus loss (Enter, or
+                                        // clicking Add / another layer), not just
+                                        // Enter — otherwise a typed name is
+                                        // silently discarded and the layer falls
+                                        // back to its default name. Escape cancels.
+                                        if resp.lost_focus() {
+                                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                                rename_cancel = true;
+                                            } else {
+                                                rename_commit = Some((id, self.layer_rename_buf.clone()));
+                                            }
                                         }
                                     } else {
                                         let mut label = layer.name.clone();
@@ -8964,8 +9027,13 @@ impl CadApp {
                             "  ! rename failed (empty or duplicate)"
                         ));
                     }
-                    self.layer_rename = None;
-                    self.layer_rename_buf.clear();
+                    // Only close the editor if we're still editing THIS layer —
+                    // the user may have clicked straight onto another layer's
+                    // name in the same frame, which already armed its rename.
+                    if self.layer_rename == Some(id) {
+                        self.layer_rename = None;
+                        self.layer_rename_buf.clear();
+                    }
                 }
                 if rename_cancel {
                     self.layer_rename = None;
@@ -10021,6 +10089,7 @@ impl CadApp {
                 self.gpu_dirty = true;
                 // Jump straight to the drawing — no manual ZOOM needed.
                 self.fit_view_to_drawing();
+                self.current_file = Some(std::path::PathBuf::from(path));
                 self.history.push(format!(
                     "  opened '{}'  ({} dobject(s), {} layer(s))", path, n, l
                 ));
@@ -10042,15 +10111,163 @@ impl CadApp {
             return;
         };
         match std::fs::write(path, &bytes) {
-            Ok(()) => self.history.push(format!(
-                "  saved '{}'  ({} bytes)", path, bytes.len()
-            )),
+            Ok(()) => {
+                self.current_file = Some(std::path::PathBuf::from(path));
+                self.history.push(format!(
+                    "  saved '{}'  ({} bytes)", path, bytes.len()));
+            }
             Err(e) => self.history.push(format!("  ! save '{}': {}", path, e)),
+        }
+    }
+
+    /// Ctrl+C — copy the current selection into the dobject clipboard.
+    fn copy_selection(&mut self) {
+        if self.selection.is_empty() {
+            self.history.push("  copy: nothing selected".into());
+            return;
+        }
+        self.clipboard_dobjects = self.selection.iter()
+            .filter_map(|&i| self.doc.dobjects.get(i).cloned())
+            .collect();
+        self.history.push(format!(
+            "  ⎘ copied {} dobject(s)", self.clipboard_dobjects.len()));
+    }
+
+    /// Edit ▸ Paste — start the placement flow: pick a BASE point, then a
+    /// DESTINATION, with a live ghost preview (like COPY). Nothing is added
+    /// until the destination click commits.
+    fn start_paste(&mut self) {
+        if self.clipboard_dobjects.is_empty() {
+            self.history.push("  paste: clipboard is empty".into());
+            return;
+        }
+        self.paste_state = PasteState::WaitingForBase;
+        self.set_prompt(format!(
+            "paste: click BASE point for {} dobject(s)   [Esc=cancel]",
+            self.clipboard_dobjects.len()));
+        self.refocus_cmd = true;
+    }
+
+    /// Commit the paste: add the clipboard clones translated by `dest - base`
+    /// (fresh handles), select them, and end the flow.
+    fn commit_paste(&mut self, base: Vec2, dest: Vec2) {
+        let v = dest - base;
+        self.snapshot_doc();
+        let start = self.doc.dobjects.len();
+        let clones: Vec<DObject> = self.clipboard_dobjects.iter()
+            .map(|d| DObject::with_style(d.geom.translated(v), d.style))
+            .collect();
+        let n = clones.len();
+        for nd in clones {
+            self.doc.push(nd);
+        }
+        self.selection = (start..self.doc.dobjects.len()).collect();
+        self.selected = None;
+        self.paste_state = PasteState::Off;
+        self.clear_prompt();
+        self.index_dirty = true;
+        self.gpu_dirty = true;
+        self.history.push(format!("  ⎗ pasted {} dobject(s) (selected)", n));
+    }
+
+    /// `Save` — write to the current file if known, else fall back to Save As.
+    fn do_save_current(&mut self) {
+        if let Some(p) = self.current_file.clone() {
+            self.do_save(&p.to_string_lossy());
+        } else {
+            // No current file yet — open Save As (default to native .rsm).
+            self.open_file_dialog(FileDialogMode::Save, ".rsm");
         }
     }
 
     /// Open the in-app file browser. Starting directory = last-used, else
     /// the current working dir, else `/`.
+    /// (Re)build the Open-dialog preview for `path` if the selection changed.
+    /// Parses the .dxf/.rsm into a Document and computes its bbox + a one-line
+    /// summary. No-op when `path` is already the cached preview.
+    fn update_file_preview(&mut self, path: &std::path::Path) {
+        if self.file_preview.as_ref().map(|p| p.path.as_path()) == Some(path) {
+            return;
+        }
+        let lower = path.to_string_lossy().to_ascii_lowercase();
+        let parsed: Result<Document, String> = if lower.ends_with(".dxf") {
+            std::fs::read_to_string(path).map_err(|e| e.to_string())
+                .and_then(|t| cad_io::dxf::read_dxf(&t))
+        } else if lower.ends_with(".rsm") {
+            std::fs::read(path).map_err(|e| e.to_string())
+                .and_then(|b| cad_io::rsm::read_rsm(&b))
+        } else {
+            Err("unsupported file type".into())
+        };
+        self.file_preview = Some(match parsed {
+            Ok(doc) => {
+                let mut bb: Option<(Vec2, Vec2)> = None;
+                for d in &doc.dobjects {
+                    let (a, b) = d.bbox();
+                    bb = Some(match bb {
+                        None => (a, b),
+                        Some((mn, mx)) => (
+                            Vec2::new(mn.x.min(a.x), mn.y.min(a.y)),
+                            Vec2::new(mx.x.max(b.x), mx.y.max(b.y)),
+                        ),
+                    });
+                }
+                let info = format!("{} object(s) · {} layer(s)",
+                    doc.dobjects.len(), doc.layers.len());
+                FilePreview { path: path.to_path_buf(), doc: Some(doc), bbox: bb, info }
+            }
+            Err(e) => FilePreview {
+                path: path.to_path_buf(), doc: None, bbox: None,
+                info: format!("cannot preview: {}", e),
+            },
+        });
+    }
+
+    /// Draw the cached preview into `prect` as a fit-to-rect wireframe. Reuses
+    /// the real renderer by temporarily swapping in the preview Document + a
+    /// fit transform (so layers/blocks resolve correctly), then restoring.
+    fn render_file_preview(&mut self, painter: &egui::Painter, prect: egui::Rect) {
+        painter.rect_filled(prect, 2.0, egui::Color32::from_rgb(24, 28, 34));
+        painter.rect_stroke(prect, 2.0,
+            egui::Stroke::new(1.0, egui::Color32::from_gray(70)));
+        let Some(mut fp) = self.file_preview.take() else { return; };
+        if let (Some(doc), Some((mn, mx))) = (fp.doc.take(), fp.bbox) {
+            let w = (mx.x - mn.x).abs();
+            let h = (mx.y - mn.y).abs();
+            let pad = 10.0_f64;
+            let aw = (prect.width()  as f64 - 2.0 * pad).max(1.0);
+            let ah = (prect.height() as f64 - 2.0 * pad).max(1.0);
+            let sx = if w > 1e-9 { aw / w } else { f64::INFINITY };
+            let sy = if h > 1e-9 { ah / h } else { f64::INFINITY };
+            let mut s = sx.min(sy);
+            if !s.is_finite() { s = 1.0; }
+            let center = (mn + mx) * 0.5;
+            // Swap transform + doc; draw; restore.
+            let (saved_scale, saved_off) = (self.scale, self.world_offset);
+            self.scale = s as f32;
+            self.world_offset = egui::vec2(-center.x as f32, -center.y as f32);
+            let mut pdoc = doc;
+            std::mem::swap(&mut self.doc, &mut pdoc);   // self.doc = preview
+            let cp = painter.with_clip_rect(prect);
+            let col = egui::Color32::from_rgb(200, 210, 220);
+            // Clone the geom list so we don't alias self while passing &self.
+            let geoms: Vec<Geom> = self.doc.dobjects.iter()
+                .map(|d| d.geom.clone()).collect();
+            for g in &geoms {
+                draw_dobject(&cp, prect, self, g, col);
+            }
+            std::mem::swap(&mut self.doc, &mut pdoc);   // restore real doc
+            self.scale = saved_scale;
+            self.world_offset = saved_off;
+            fp.doc = Some(pdoc);
+        } else {
+            painter.text(prect.center(), egui::Align2::CENTER_CENTER,
+                "no preview", egui::FontId::monospace(11.0),
+                egui::Color32::from_gray(140));
+        }
+        self.file_preview = Some(fp);
+    }
+
     fn open_file_dialog(&mut self, mode: FileDialogMode, ext: &str) {
         let dir = self.file_dialog_dir.clone()
             .or_else(|| std::env::current_dir().ok())
@@ -10898,6 +11115,9 @@ impl CadApp {
         let mut do_confirm = false;
         let mut do_cancel  = false;
         let mut navigate: Option<std::path::PathBuf> = None;
+        // When the path bar points straight at a file, navigate to its folder
+        // AND preselect the file name.
+        let mut pending_filename: Option<String> = None;
 
         // ---- list the current directory (folders + filtered files) -------
         let mut entries: Vec<EntryInfo> = Vec::new();
@@ -11182,12 +11402,21 @@ impl CadApp {
         // ---- resolve actions --------------------------------------------
         if let Some(target) = navigate {
             dlg.dir = target;
+            dlg.path_buf = dlg.dir.to_string_lossy().to_string();   // keep bar in sync
             dlg.error = None;
+            if let Some(name) = pending_filename {
+                // Path bar pointed at a file: preselect it (and its type).
+                let l = name.to_ascii_lowercase();
+                if l.ends_with(".rsm") { dlg.ext = ".rsm".into(); }
+                else if l.ends_with(".dxf") { dlg.ext = ".dxf".into(); }
+                dlg.filename = name;
+            }
             self.file_dialog = Some(dlg);
             return;
         }
         if !open || do_cancel {
             self.file_dialog_dir = Some(dlg.dir);
+            self.file_preview = None;   // drop cached preview doc
             self.history.push("  file: cancelled".into());
             return;
         }
@@ -11225,6 +11454,7 @@ impl CadApp {
                     self.do_save(&path.to_string_lossy());
                 }
             }
+            self.file_preview = None;   // drop cached preview doc
             return;   // dialog closes on success
         }
         self.file_dialog = Some(dlg);
@@ -15577,8 +15807,14 @@ impl CadApp {
         match (self.tool, self.pending.len()) {
             (Tool::Line, 2) => {
                 let g = Geom::Line(Line { a: self.pending[0], b: self.pending[1] });
+                let last = self.pending[1];
                 self.pending.clear();
                 self.add_dobject(g, "canvas");
+                // Continue the chain: the last endpoint becomes the next
+                // segment's start, so successive clicks draw CONNECTED lines
+                // (AutoCAD LINE). Esc ends the chain + exits the tool; re-run
+                // `line` (or empty Enter) for a fresh, separate line.
+                self.pending.push(last);
             }
             (Tool::Rectangle, 2) => {
                 // Two opposite corners → an axis-aligned closed polyline.
@@ -18014,6 +18250,10 @@ impl eframe::App for CadApp {
                 self.copy_state = CopyState::Off;
                 self.history.push("  copy cancelled".into());
             }
+            if self.paste_state != PasteState::Off {
+                self.paste_state = PasteState::Off;
+                self.history.push("  paste cancelled".into());
+            }
             if self.rotate_state != RotateState::Off {
                 self.rotate_state = RotateState::Off;
                 self.rotate_copy  = false;
@@ -18120,9 +18360,10 @@ impl eframe::App for CadApp {
         }
 
         // Delete key — erase the current pickfirst selection directly, without
-        // routing through the command line. Focus-independent so it works even
-        // on the frame right after a drag-select. Guarded so it never fires
-        // while editing text or running another command/flow.
+        // routing through the command line. This is focus-independent, so it
+        // works even on the frame right after a drag-select where a typed `e`
+        // could be dropped by egui's end-of-frame focus grant. Guarded so it
+        // never fires while editing text or running another command/flow.
         if ctx.input(|i| i.key_pressed(egui::Key::Delete))
             && !self.selection.is_empty()
             && self.layer_rename.is_none()
@@ -18136,6 +18377,8 @@ impl eframe::App for CadApp {
         {
             self.run_command("erase");
         }
+
+        // (Copy/Paste are Edit-menu only — no keyboard shortcuts.)
 
         // Enter (when the command line is empty) finalises an in-progress
         // selection — this is the LibreCAD / AutoCAD convention. The cmd
@@ -18469,6 +18712,18 @@ impl eframe::App for CadApp {
                         self.open_file_dialog(FileDialogMode::Open, ".dxf");
                         ui.close_menu();
                     }
+                    // Save to the current file (Save As if none yet). The label
+                    // shows the active file name so it's clear where it writes.
+                    let save_label = match &self.current_file {
+                        Some(p) => format!("Save  ({})", p.file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "current".into())),
+                        None => "Save".to_string(),
+                    };
+                    if ui.button(save_label).clicked() {
+                        self.do_save_current();
+                        ui.close_menu();
+                    }
                     ui.menu_button("Import", |ui| {
                         if ui.button("Image as raster (underlay)…").clicked() {
                             self.open_file_dialog(FileDialogMode::ImportRaster, "");
@@ -18510,6 +18765,15 @@ impl eframe::App for CadApp {
                     }
                     if ui.button("Redo").clicked() {
                         self.run_command("redo");
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Copy").clicked() {
+                        self.copy_selection();
+                        ui.close_menu();
+                    }
+                    if ui.button("Paste").clicked() {
+                        self.start_paste();
                         ui.close_menu();
                     }
                     ui.separator();
@@ -19927,8 +20191,9 @@ impl eframe::App for CadApp {
                         "command:",
                     );
                 } else {
+                    // Active-command prompt line — green #184C04.
                     ui.colored_label(
-                        egui::Color32::from_rgb(255, 220, 120),
+                        egui::Color32::from_rgb(0x18, 0x4c, 0x04),
                         &self.current_prompt,
                     );
                 }
@@ -20007,8 +20272,14 @@ impl eframe::App for CadApp {
                     } else if self.refocus_cmd && !other_focused {
                         text_resp.request_focus();
                         self.refocus_cmd = false;
+                        // Force the focus-grant frame NOW so it settles before
+                        // the user types — egui applies focus at end-of-frame,
+                        // so without this the first keystroke right after a
+                        // drag-select can be dropped (intermittent erase bug).
+                        ui.ctx().request_repaint();
                     } else if !other_focused && !text_resp.has_focus() {
                         text_resp.request_focus();
+                        ui.ctx().request_repaint();
                     }
                 });
             });
@@ -20137,6 +20408,7 @@ impl eframe::App for CadApp {
                 || self.snap_override.is_some()
                 || self.move_state       != MoveState::Off
                 || self.copy_state       != CopyState::Off
+                || self.paste_state      != PasteState::Off
                 || self.rotate_state     != RotateState::Off
                 || self.scale_state      != ScaleState::Off
                 || self.mirror_state     != MirrorState::Off
@@ -20444,6 +20716,7 @@ impl eframe::App for CadApp {
                     ExtendState::PickingTargets(_) | ExtendState::PickingTargetsAll)
                 || self.move_state       != MoveState::Off
                 || self.copy_state       != CopyState::Off
+                || self.paste_state      != PasteState::Off
                 || self.rotate_state     != RotateState::Off
                 || self.scale_state      != ScaleState::Off
                 || self.mirror_state     != MirrorState::Off
@@ -20845,6 +21118,19 @@ impl eframe::App for CadApp {
                                 self.copy_state = CopyState::Off;
                             }
                             CopyState::Off => unreachable!(),
+                        }
+                        self.refocus_cmd = true;
+                    } else if self.paste_state != PasteState::Off {
+                        match self.paste_state {
+                            PasteState::WaitingForBase => {
+                                self.paste_state = PasteState::WaitingForDest(click_world);
+                                self.set_prompt(
+                                    "paste: click DESTINATION   [Esc=cancel]");
+                            }
+                            PasteState::WaitingForDest(base) => {
+                                self.commit_paste(base, click_world);
+                            }
+                            PasteState::Off => unreachable!(),
                         }
                         self.refocus_cmd = true;
                     } else if self.rotate_state != RotateState::Off {
@@ -23262,6 +23548,47 @@ impl eframe::App for CadApp {
                 }
             }
 
+            // ---- paste tool overlay (base→dest ghost, like copy) -------
+            if self.paste_state != PasteState::Off {
+                let hint_text = match self.paste_state {
+                    PasteState::WaitingForBase =>
+                        format!("PASTE: click BASE point for {} dobject(s)   [Esc cancels]",
+                            self.clipboard_dobjects.len()),
+                    PasteState::WaitingForDest(_) =>
+                        format!("PASTE: click DESTINATION ({} dobject(s))",
+                            self.clipboard_dobjects.len()),
+                    PasteState::Off => unreachable!(),
+                };
+                painter.text(
+                    rect.left_top() + egui::vec2(10.0, 48.0),
+                    egui::Align2::LEFT_TOP,
+                    hint_text,
+                    egui::FontId::monospace(11.0),
+                    egui::Color32::from_rgb(150, 230, 170),
+                );
+                if let PasteState::WaitingForDest(base) = self.paste_state {
+                    let cur_world = self.cursor_world_constrained(
+                        resp.hover_pos(), rect, snap_hit.map(|h| h.point));
+                    if let Some(cw) = cur_world {
+                        let v = cw - base;
+                        let base_s = self.w2s(base, rect);
+                        let dest_s = self.w2s(cw, rect);
+                        let accent = egui::Color32::from_rgb(150, 230, 170);
+                        draw_base_blip(&painter, base_s, accent);
+                        let time = ctx.input(|i| i.time) as f32;
+                        let phase = time * 60.0;
+                        draw_dashed_line(&painter, base_s, dest_s,
+                            6.0, 4.0, phase, egui::Stroke::new(1.2, accent));
+                        let ghost_col = egui::Color32::from_rgba_unmultiplied(150, 230, 170, 180);
+                        // Ghost the CLIPBOARD content (not a doc selection).
+                        for d in &self.clipboard_dobjects {
+                            let g = d.geom.translated(v);
+                            draw_dobject(&painter, rect, self, &g, ghost_col);
+                        }
+                    }
+                }
+            }
+
             // ---- mirror axis overlay (preview line + ghost result) -----
             // While picking the second axis point (WaitingForB) the axis is
             // a→cursor; once fixed (AwaitingKeep) it's a→b. Either way we
@@ -23461,6 +23788,7 @@ impl eframe::App for CadApp {
                 | ExtendState::PickingTargetsAll)
             || self.move_state       != MoveState::Off
             || self.copy_state       != CopyState::Off
+            || self.paste_state      != PasteState::Off
             || self.rotate_state     != RotateState::Off
             || self.scale_state      != ScaleState::Off
             || self.mirror_state     != MirrorState::Off
