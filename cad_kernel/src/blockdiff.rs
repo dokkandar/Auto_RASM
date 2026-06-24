@@ -299,6 +299,7 @@ mod tests {
                 PolyVertex { pos: Vec2::new(0.0, 10.0), bulge: 0.0 },
             ],
             closed: true,
+            widths: Vec::new(),
         }));
         let d = diff_blocks(&[rect(100.0)], Vec2::ZERO,
                             &[rect(130.0)], Vec2::ZERO, 1e-6);

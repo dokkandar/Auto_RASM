@@ -15,6 +15,11 @@ use cad_kernel::*;
 use crate::gpu::{view_matrix, CircleInstance, GpuCircleRenderer};
 use crate::settings::UserEnv;
 
+// PEDIT (polyline edit) methods live in `src/app/pedit.rs`. Child module of
+// `app`, so it can reach CadApp's private fields/helpers; its methods are
+// `pub(crate)` so call sites in this file work unchanged.
+mod pedit;
+
 // Soft cap on candidate-set pair count. Above this an ∩ query refuses to
 // compute (with a message), to prevent multi-second / multi-minute freezes.
 // 5 million pairs is roughly half a second on this CPU.
@@ -52,6 +57,18 @@ enum PlineArcSub {
     Normal,
     AwaitingSecondPt,            // user typed `s`; next click = on-arc midpoint
     AwaitingSecondPtEnd(Vec2),   // midpoint captured; next click = endpoint
+    AwaitingDirection,           // user typed `d`; next click/angle = start tangent
+}
+
+/// PLINE Width capture flow (AutoCAD `W`/`H`): after typing `w`, the user
+/// enters a starting width then an ending width (Enter on the second repeats
+/// the first). `H`/halfwidth doubles the entered values. The captured
+/// (start, end) becomes `pline_next_width`, applied to subsequent segments.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PlineWidthCap {
+    None,
+    AwaitingStart { half: bool },
+    AwaitingEnd { half: bool, start: f64 },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -139,7 +156,35 @@ fn rect_polyline(a: Vec2, b: Vec2) -> Geom {
             v(a.x, b.y),
         ],
         closed: true,
+        widths: Vec::new(),
     })
+}
+
+/// Explode a polyline (a rectangle is just a closed polyline) into its
+/// individual segments: a `Line` per straight span and an `Arc` per bulged
+/// span. The closing segment is included when the polyline is closed.
+fn explode_polyline(p: &Polyline) -> Vec<Geom> {
+    let n = p.vertices.len();
+    if n < 2 { return Vec::new(); }
+    let pairs = if p.closed { n } else { n - 1 };
+    let mut out = Vec::with_capacity(pairs);
+    for i in 0..pairs {
+        let v0 = &p.vertices[i];
+        let a  = v0.pos;
+        let b  = p.vertices[(i + 1) % n].pos;
+        // DXF convention: the bulge on the START vertex curves segment i→i+1.
+        if v0.bulge.abs() > 1e-9 {
+            if let Some((center, radius, a0, sweep)) =
+                cad_kernel::bulge_arc(a, b, v0.bulge)
+            {
+                out.push(Geom::Arc(cad_kernel::Arc {
+                    center, radius, start_angle: a0, sweep_angle: sweep }));
+                continue;
+            }
+        }
+        out.push(Geom::Line(Line { a, b }));
+    }
+    out
 }
 
 /// The per-vertex stretch rule (used by the live ghost preview; mirrors the
@@ -173,6 +218,7 @@ fn stretch_one(g: &Geom, win_min: Vec2, win_max: Vec2, v: Vec2) -> Geom {
                 PolyVertex { pos: vt.pos + v, bulge: vt.bulge }
             } else { *vt }).collect(),
             closed: p.closed,
+            widths: p.widths.clone(),
         }),
         Geom::Circle(c) if inside(c.center) =>
             Geom::Circle(Circle { center: c.center + v, radius: c.radius }),
@@ -927,6 +973,20 @@ pub struct CadApp {
     /// `AwaitingSecondPtEnd(mid)` until the endpoint click commits a
     /// 3-point arc. Resets to `Normal` after each arc commits.
     pline_arc_sub: PlineArcSub,
+    /// PLINE Arc `d`/Direction override: when set, the NEXT arc segment uses
+    /// this unit vector as its START tangent (instead of the previous segment's
+    /// exit tangent). Captured by the click/angle after `d`, consumed (cleared)
+    /// once that arc segment commits.
+    pline_dir_override: Option<Vec2>,
+    /// PLINE Width: the (start, end) width applied to the NEXT committed
+    /// segment. After a segment commits, the end width carries as the next
+    /// start (AutoCAD behaviour). (0,0) = thin.
+    pline_next_width: (f64, f64),
+    /// In-progress `w`/`h` width-entry flow.
+    pline_width_cap: PlineWidthCap,
+    /// Per-segment (start,end) widths captured so far, parallel to
+    /// `pending_bulges`. Drained into `Polyline.widths` on commit.
+    pending_widths: Vec<(f64, f64)>,
 
     scale:        f32,
     world_offset: egui::Vec2,
@@ -1125,6 +1185,12 @@ pub struct CadApp {
     clipboard_dobjects: Vec<DObject>,
     /// Active PASTE placement flow (base → destination); `Off` when idle.
     paste_state: PasteState,
+    /// Active PEDIT (polyline edit) flow; `Off` when idle.
+    pedit_state: PeditState,
+    /// Object groups — each is a list of member dobject HANDLES (stable across
+    /// reindexing). Selecting any member selects the whole group; Ungroup
+    /// dissolves it. In-session only for now (not yet persisted to file).
+    groups: Vec<Vec<u64>>,
 
     // ---- Slice L: medium editing actions ----
     offset_state:   OffsetState,
@@ -1385,6 +1451,14 @@ pub enum QueuedOp {
     /// all work); on Enter every selected dobject takes the source's
     /// properties. Carries the source dobject index.
     MatchPropPaint(usize),
+    /// PEDIT Join — the user picked objects (lines/arcs/open-plines/splines)
+    /// to merge into the target polyline; on Enter they're joined. Carries the
+    /// target polyline's handle.
+    PeditJoin(u64),
+    /// PEDIT start — `pedit` was typed with nothing selected, so a selection
+    /// session is open to pick the ONE object to edit (AutoCAD's "Select
+    /// polyline" prompt). On Enter `pedit_start` runs again with the pick.
+    PeditStart,
 }
 
 /// State machine for the interactive copy tool — same shape as MoveState.
@@ -1402,6 +1476,17 @@ pub enum PasteState {
     Off,
     WaitingForBase,
     WaitingForDest(Vec2),
+}
+
+/// PEDIT (polyline edit) flow. The `u64` is the target polyline's HANDLE
+/// (stable across reindexing; Join replaces it with the merged result).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum PeditState {
+    Off,
+    /// Showing the [Close/Open/Join/Width/Undo/eXit] menu for this polyline.
+    Menu(u64),
+    /// Waiting for a width value to apply to the polyline.
+    Width(u64),
 }
 
 /// State machine for the interactive rotate tool — AutoCAD ROTATE flow:
@@ -2511,6 +2596,10 @@ impl Default for CadApp {
             pending_bulges: Vec::new(),
             pline_mode:    PlineMode::Line,
             pline_arc_sub: PlineArcSub::Normal,
+            pline_dir_override: None,
+            pline_next_width: (0.0, 0.0),
+            pline_width_cap: PlineWidthCap::None,
+            pending_widths: Vec::new(),
             scale:         6.0,
             world_offset:  egui::Vec2::ZERO,
             zoom_state:    ZoomState::Off,
@@ -2593,6 +2682,8 @@ impl Default for CadApp {
             current_file: None,
             clipboard_dobjects: Vec::new(),
             paste_state: PasteState::Off,
+            pedit_state: PeditState::Off,
+            groups: Vec::new(),
             insert_state:    InsertState::Off,
             block_dialog:    None,
             offset_state:   OffsetState::Off,
@@ -2699,6 +2790,7 @@ impl Default for CadApp {
                 PolyVertex { pos: Vec2::new(55.0,  25.0), bulge: 0.0 },
             ],
             closed: true,
+            widths: Vec::new(),
         }.into());
         s.recompute();
         s.history.push("RUST_CAD math workbench — three demo dobjects loaded.".into());
@@ -2793,6 +2885,19 @@ impl CadApp {
             self.zoom_input_text(trimmed);
             return;
         }
+        // PEDIT — while active, the command line drives the sub-options.
+        if self.pedit_state != PeditState::Off {
+            self.pedit_input(trimmed);
+            return;
+        }
+        if matches!(trimmed.to_ascii_lowercase().as_str(), "pedit" | "pe") {
+            // Register as the repeatable command so empty-Enter re-runs PEDIT
+            // (this intercept returns early, bypassing the parse-ok path that
+            // normally sets last_command — same pattern as circle/zoom).
+            self.last_command = Some("pedit".into());
+            self.pedit_start();
+            return;
+        }
         {
             let lc = trimmed.to_ascii_lowercase();
             if lc == "zoom" || lc == "z" {
@@ -2804,8 +2909,14 @@ impl CadApp {
                 return;
             }
         }
-        // Selection sub-command shortcuts — only while a select session is
-        // active (the command line is asking for a selection):
+        // `group` / `ungroup` — operate on the current selection.
+        match trimmed.to_ascii_lowercase().as_str() {
+            "group"   => { self.group_selection();   return; }
+            "ungroup" => { self.ungroup_selection(); return; }
+            _ => {}
+        }
+        // Selection sub-command shortcuts — only while the command line is
+        // asking for a selection (a select session is active):
         //   p = previous selection, L = last drafted dobject, D = deselect mode.
         // Single letters are ambiguous at top level (l = Line), so they only
         // mean this inside a select session.
@@ -3284,11 +3395,85 @@ impl CadApp {
         // queued. The prompt mentions all of them.
         if self.tool == Tool::Polyline {
             let lc = trimmed.to_ascii_lowercase();
+            // PLINE Width entry: capture starting then ending width. `h`
+            // (halfwidth) doubles the entered values. Empty ending = same as
+            // start (uniform). Takes priority over the letter match below.
+            match self.pline_width_cap {
+                PlineWidthCap::AwaitingStart { half } => {
+                    if let Ok(v) = trimmed.parse::<f64>() {
+                        if v < 0.0 {
+                            self.history.push("  ! pline width: must be ≥ 0".into());
+                            return;
+                        }
+                        let start = if half { v * 2.0 } else { v };
+                        self.pline_width_cap = PlineWidthCap::AwaitingEnd { half, start };
+                        self.set_prompt(format!(
+                            "pline {}: ending width <{:.4}>  [Enter = same]",
+                            if half { "halfwidth" } else { "width" },
+                            if half { start * 0.5 } else { start }));
+                        self.refocus_cmd = true;
+                        return;
+                    }
+                    // non-numeric → cancel width entry, fall through
+                    self.pline_width_cap = PlineWidthCap::None;
+                }
+                PlineWidthCap::AwaitingEnd { half, start } => {
+                    let end = if trimmed.is_empty() {
+                        start
+                    } else if let Ok(v) = trimmed.parse::<f64>() {
+                        if v < 0.0 {
+                            self.history.push("  ! pline width: must be ≥ 0".into());
+                            return;
+                        }
+                        if half { v * 2.0 } else { v }
+                    } else {
+                        self.pline_width_cap = PlineWidthCap::None;
+                        start
+                    };
+                    self.pline_next_width = (start, end);
+                    self.pline_width_cap = PlineWidthCap::None;
+                    self.history.push(format!(
+                        "  pline: width start={:.4} end={:.4}", start, end));
+                    self.update_pline_prompt();
+                    return;
+                }
+                PlineWidthCap::None => {}
+            }
+            // PLINE Arc Direction: a typed angle (degrees) while awaiting the
+            // start tangent sets it directly (alternative to clicking a point).
+            if self.pline_arc_sub == PlineArcSub::AwaitingDirection {
+                if let Ok(deg) = trimmed.parse::<f64>() {
+                    let r = deg.to_radians();
+                    self.pline_dir_override = Some(Vec2::new(r.cos(), r.sin()));
+                    self.pline_arc_sub = PlineArcSub::Normal;
+                    self.history.push(format!(
+                        "  pline·ARC direction set to {:.1}° — click ENDPOINT", deg));
+                    self.update_pline_prompt();
+                    return;
+                }
+            }
             match lc.as_str() {
                 "a" | "arc" => {
                     self.pline_mode = PlineMode::Arc;
                     self.pline_arc_sub = PlineArcSub::Normal;
                     self.update_pline_prompt();
+                    return;
+                }
+                // Close — commit the run as a CLOSED polyline (AutoCAD's `C`:
+                // closes immediately and ends the run; the tool stays active
+                // for a fresh polyline). Was previously missing, so `c` leaked
+                // to the global Copy command.
+                "c" | "close" => {
+                    if self.pending.len() >= 2 {
+                        let (verts, widths) = self.drain_pline_pending(true);
+                        self.add_dobject(Geom::Polyline(Polyline {
+                            vertices: verts, closed: true, widths,
+                        }), "canvas");
+                        self.update_pline_prompt();
+                    } else {
+                        self.history.push(
+                            "  ! pline: need at least 2 vertices before Close".into());
+                    }
                     return;
                 }
                 "l" | "line" if self.pline_mode == PlineMode::Arc => {
@@ -3302,12 +3487,14 @@ impl CadApp {
                     // first instead of yanking a committed vertex.
                     if self.pline_arc_sub != PlineArcSub::Normal {
                         self.pline_arc_sub = PlineArcSub::Normal;
-                        self.history.push("  pline: cancelled Second-pt flow".into());
+                        self.pline_dir_override = None;
+                        self.history.push("  pline: cancelled arc sub-flow".into());
                         self.update_pline_prompt();
                         return;
                     }
                     if let Some(last) = self.pending.pop() {
                         self.pending_bulges.pop();
+                        self.pending_widths.pop();
                         self.history.push(format!(
                             "  pline: removed vertex ({:.3},{:.3})",
                             last.x, last.y));
@@ -3330,14 +3517,39 @@ impl CadApp {
                     self.update_pline_prompt();
                     return;
                 }
+                // Direction: set the START tangent of the NEXT arc segment.
+                // Then click a point (tangent = last-vertex → point) or type an
+                // angle in degrees. Arc mode only; needs a starting vertex.
+                "d" | "direction" if self.pline_mode == PlineMode::Arc => {
+                    if self.pending.is_empty() {
+                        self.history.push(
+                            "  ! pline: need a starting vertex before Direction".into());
+                        return;
+                    }
+                    self.pline_arc_sub = PlineArcSub::AwaitingDirection;
+                    self.update_pline_prompt();
+                    return;
+                }
+                // Width / Halfwidth — start the (start, end) width entry flow.
+                "w" | "width" | "h" | "halfwidth" => {
+                    let half = lc == "h" || lc == "halfwidth";
+                    self.pline_width_cap = PlineWidthCap::AwaitingStart { half };
+                    let cur = if half {
+                        self.pline_next_width.0 * 0.5
+                    } else {
+                        self.pline_next_width.0
+                    };
+                    self.set_prompt(format!(
+                        "pline {}: starting width <{:.4}>",
+                        if half { "halfwidth" } else { "width" }, cur));
+                    self.refocus_cmd = true;
+                    return;
+                }
                 // Recognised-but-not-wired sub-options: tell the user
                 // they're known so they don't keep retyping. Wire-up
                 // lands in the Phase 2 slice.
-                "w" | "width"
-                | "h" | "halfwidth"
-                | "len" | "length"
+                "len" | "length"
                 | "ce" | "center"
-                | "d" | "direction"
                 | "r" | "radius"
                 | "ang" | "angle" => {
                     self.history.push(format!(
@@ -4232,7 +4444,7 @@ impl CadApp {
                     self.begin_selection(SelectMode::ForSelect);
                     self.queued_op = QueuedOp::Explode;
                     self.set_prompt(
-                        "explode: select blocks / walls, Enter to apply  [Esc=cancel]");
+                        "explode: select blocks / walls / polylines / rectangles, Enter to apply  [Esc=cancel]");
                 } else {
                     self.apply_explode();
                 }
@@ -4445,7 +4657,10 @@ impl CadApp {
                 }
                 let r = self.env.FltRad;
                 self.fillet_state = FilletState::WaitingForFirst(r);
-                self.fillet_multiple = false;       // each F starts single-mode
+                // Continuous by default: keep filleting pair after pair until
+                // Esc. `R` changes the radius mid-command (persists as the new
+                // default); `M` toggles back to single-shot.
+                self.fillet_multiple = true;
                 self.refresh_fillet_prompt();
             }
             Ok(Command::Chamfer(opt)) => {
@@ -4692,6 +4907,13 @@ impl CadApp {
             }
             QueuedOp::Join => {
                 self.apply_join();
+            }
+            QueuedOp::PeditJoin(h) => {
+                self.pedit_join_selected(h);
+            }
+            QueuedOp::PeditStart => {
+                // The user picked the object to edit — run pedit on it.
+                self.pedit_start();
             }
             QueuedOp::Hatch => {
                 self.apply_hatch();
@@ -5891,7 +6113,7 @@ impl CadApp {
                         }
                     }
                     if verts.len() < 3 { continue; }
-                    let pl = cad_kernel::Polyline { vertices: verts, closed: true };
+                    let pl = cad_kernel::Polyline { vertices: verts, closed: true, widths: Vec::new() };
                     let mut d = cad_kernel::DObject::from(pl);
                     d.style = cad_kernel::Style::on_layer(worker.active_layer);
                     // Synthetic auxiliary boundary — exists only so the
@@ -10120,6 +10342,103 @@ impl CadApp {
         }
     }
 
+    // ---- Groups ---------------------------------------------------------
+
+    /// Handles of the currently selected dobjects.
+    fn selected_handles(&self) -> std::collections::HashSet<u64> {
+        self.selection.iter()
+            .filter_map(|&i| self.doc.dobjects.get(i).map(|d| d.handle))
+            .collect()
+    }
+
+    /// Ctrl+G / `group` — make the current selection into one group.
+    fn group_selection(&mut self) {
+        let members: Vec<u64> = self.selection.iter()
+            .filter_map(|&i| self.doc.dobjects.get(i).map(|d| d.handle))
+            .collect();
+        if members.len() < 2 {
+            self.history.push("  ! group: select 2+ objects first".into());
+            return;
+        }
+        // Re-grouping: drop any existing group that shares these members, so a
+        // member never lives in two groups.
+        let set: std::collections::HashSet<u64> = members.iter().copied().collect();
+        self.groups.retain(|g| !g.iter().any(|h| set.contains(h)));
+        let n = members.len();
+        self.groups.push(members);
+        self.history.push(format!("  ⊞ grouped {} objects", n));
+    }
+
+    /// Add to Group — when the selection includes an existing group plus other
+    /// entities, merge those entities (and any other touched groups) into one
+    /// group. Needs at least one already-grouped object in the selection.
+    fn add_to_group(&mut self) {
+        let sel = self.selected_handles();
+        if sel.is_empty() {
+            self.history.push("  ! add to group: nothing selected".into());
+            return;
+        }
+        let touched: Vec<usize> = self.groups.iter().enumerate()
+            .filter(|(_, g)| g.iter().any(|h| sel.contains(h)))
+            .map(|(i, _)| i)
+            .collect();
+        if touched.is_empty() {
+            self.history.push(
+                "  ! add to group: include an existing group in the selection".into());
+            return;
+        }
+        // Merge every touched group's members + all selected handles into one.
+        let mut set: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut members: Vec<u64> = Vec::new();
+        for &gi in &touched {
+            for h in &self.groups[gi] { if set.insert(*h) { members.push(*h); } }
+        }
+        for h in &sel { if set.insert(*h) { members.push(*h); } }
+        // Drop the touched groups (descending), then push the merged group.
+        let mut t = touched.clone();
+        t.sort_unstable();
+        for &gi in t.iter().rev() { self.groups.remove(gi); }
+        let n = members.len();
+        self.groups.push(members);
+        self.history.push(format!("  ⊞ added to group ({} objects total)", n));
+    }
+
+    /// Edit ▸ Ungroup / `ungroup` — dissolve every group that any selected
+    /// object belongs to (objects themselves stay).
+    fn ungroup_selection(&mut self) {
+        let sel = self.selected_handles();
+        if sel.is_empty() {
+            self.history.push("  ! ungroup: nothing selected".into());
+            return;
+        }
+        let before = self.groups.len();
+        self.groups.retain(|g| !g.iter().any(|h| sel.contains(h)));
+        let removed = before - self.groups.len();
+        if removed == 0 {
+            self.history.push("  ungroup: selection isn't in a group".into());
+        } else {
+            self.history.push(format!("  ⊟ ungrouped {} group(s)", removed));
+        }
+    }
+
+    /// Grow the selection so that picking any group member selects the whole
+    /// group (groups select as a unit). Called after pointer-mode picks.
+    fn expand_selection_to_groups(&mut self) {
+        if self.groups.is_empty() || self.selection.is_empty() { return; }
+        let sel = self.selected_handles();
+        let mut want = sel.clone();
+        for g in &self.groups {
+            if g.iter().any(|h| sel.contains(h)) {
+                for h in g { want.insert(*h); }
+            }
+        }
+        if want.len() == sel.len() { return; }   // nothing new
+        self.selection = self.doc.dobjects.iter().enumerate()
+            .filter(|(_, d)| want.contains(&d.handle))
+            .map(|(i, _)| i)
+            .collect();
+    }
+
     /// Ctrl+C — copy the current selection into the dobject clipboard.
     fn copy_selection(&mut self) {
         if self.selection.is_empty() {
@@ -10133,17 +10452,24 @@ impl CadApp {
             "  ⎘ copied {} dobject(s)", self.clipboard_dobjects.len()));
     }
 
-    /// Edit ▸ Paste — start the placement flow: pick a BASE point, then a
-    /// DESTINATION, with a live ghost preview (like COPY). Nothing is added
-    /// until the destination click commits.
+    /// Edit ▸ Paste (Ctrl+V) — start the placement flow. The base point is
+    /// assumed automatically (the clipboard's lower-left corner), so the user
+    /// only clicks a DESTINATION; a live ghost preview follows the cursor.
     fn start_paste(&mut self) {
         if self.clipboard_dobjects.is_empty() {
             self.history.push("  paste: clipboard is empty".into());
             return;
         }
-        self.paste_state = PasteState::WaitingForBase;
+        // Auto base = lower-left of the clipboard's bounding box.
+        let mut base = self.clipboard_dobjects[0].bbox().0;
+        for d in &self.clipboard_dobjects[1..] {
+            let a = d.bbox().0;
+            if a.x < base.x { base.x = a.x; }
+            if a.y < base.y { base.y = a.y; }
+        }
+        self.paste_state = PasteState::WaitingForDest(base);
         self.set_prompt(format!(
-            "paste: click BASE point for {} dobject(s)   [Esc=cancel]",
+            "paste: click DESTINATION for {} dobject(s)   [Esc=cancel]",
             self.clipboard_dobjects.len()));
         self.refocus_cmd = true;
     }
@@ -13897,7 +14223,19 @@ impl CadApp {
     /// AutoCAD). `Color::ByBlock` contents take the instance's color.
     /// Fresh handles via `DObject::with_style` (clones must not reuse the
     /// definition's handles). A selected WALL explodes into its boundary
-    /// particles: the two faces + two end caps.
+    /// particles (two faces + two end caps); a POLYLINE / rectangle explodes
+    /// into its individual Line + Arc segments.
+    // ---- PEDIT (polyline edit) -----------------------------------------
+
+    /// Find a dobject's current index by handle.
+    fn idx_of_handle(&self, h: u64) -> Option<usize> {
+        self.doc.dobjects.iter().position(|d| d.handle == h)
+    }
+
+    // PEDIT (polyline edit) methods moved to `src/app/pedit.rs` (child module
+    // `pedit`, declared below). They remain inherent `CadApp` methods, so call
+    // sites here are unchanged.
+
     fn apply_explode(&mut self) {
         if self.selection.is_empty() {
             self.history.push("  ! explode: empty selection".into());
@@ -13911,54 +14249,70 @@ impl CadApp {
         let mut skipped = 0_usize;
         for &i in &sel {
             let Some(d) = self.doc.dobjects.get(i) else { continue };
-            if let Geom::BlockRef(br) = &d.geom {
-                if let Some(blk) = self.doc.blocks.get(br.block) {
-                    // Explode the DERIVED geometry (params applied), so a
-                    // parametric instance explodes to what's drawn.
-                    let derived = self.block_derived_geoms(blk, &br.param_values);
-                    for (cd, dg) in blk.dobjects.iter().zip(&derived) {
-                        let mut style = cd.style;
-                        if matches!(style.color, Color::ByBlock) {
-                            style.color = d.style.color;
+            let dstyle = d.style;
+            match &d.geom {
+                Geom::BlockRef(br) => {
+                    if let Some(blk) = self.doc.blocks.get(br.block) {
+                        // Explode the DERIVED geometry (params applied), so a
+                        // parametric instance explodes to what's drawn.
+                        let derived = self.block_derived_geoms(blk, &br.param_values);
+                        for (cd, dg) in blk.dobjects.iter().zip(&derived) {
+                            let mut style = cd.style;
+                            if matches!(style.color, Color::ByBlock) {
+                                style.color = dstyle.color;
+                            }
+                            to_add.push(DObject::with_style(
+                                br.transform_geom(dg, blk.base), style));
                         }
-                        to_add.push(DObject::with_style(
-                            br.transform_geom(dg, blk.base), style));
-                    }
-                    to_remove.push(i);
-                } else {
-                    skipped += 1;   // dangling reference
-                }
-            } else if let Geom::Wall(w) = &d.geom {
-                // Explode a wall into its boundary "particles": the two faces
-                // (lines for a straight wall, arc-sampled polylines for a curved
-                // one) plus the two end caps — a closed outline. New dobjects
-                // inherit the wall's style (layer / colour / lineweight).
-                let style = d.style;
-                let mk_face = |pts: &Vec<Vec2>| -> Geom {
-                    if pts.len() == 2 {
-                        Geom::Line(Line { a: pts[0], b: pts[1] })
+                        to_remove.push(i);
                     } else {
-                        Geom::Polyline(cad_kernel::Polyline {
-                            vertices: pts.iter().map(|p| cad_kernel::PolyVertex { pos: *p, bulge: 0.0 }).collect(),
-                            closed: false,
-                        })
+                        skipped += 1;   // dangling reference
                     }
-                };
-                if let Some((left, right)) = w.face_polylines(48) {
-                    to_add.push(DObject::with_style(mk_face(&left), style));
-                    to_add.push(DObject::with_style(mk_face(&right), style));
-                    if let (Some(&l0), Some(&r0), Some(&l1), Some(&r1)) =
-                        (left.first(), right.first(), left.last(), right.last())
-                    {
-                        to_add.push(DObject::with_style(Geom::Line(Line { a: l0, b: r0 }), style)); // start cap
-                        to_add.push(DObject::with_style(Geom::Line(Line { a: l1, b: r1 }), style)); // end cap
-                    }
-                    to_remove.push(i);
-                } else {
-                    skipped += 1;   // degenerate wall (start ≈ end)
                 }
-            } else {
-                skipped += 1;       // not a block or wall
+                // Wall → its boundary "particles": the two faces (lines for a
+                // straight wall, arc-sampled polylines for a curved one) plus
+                // the two end caps — a closed outline. New dobjects inherit the
+                // wall's style (layer / colour / lineweight).
+                Geom::Wall(w) => {
+                    let style = dstyle;
+                    let mk_face = |pts: &Vec<Vec2>| -> Geom {
+                        if pts.len() == 2 {
+                            Geom::Line(Line { a: pts[0], b: pts[1] })
+                        } else {
+                            Geom::Polyline(cad_kernel::Polyline {
+                                vertices: pts.iter().map(|p| cad_kernel::PolyVertex { pos: *p, bulge: 0.0 }).collect(),
+                                closed: false,
+                                widths: Vec::new(),
+                            })
+                        }
+                    };
+                    if let Some((left, right)) = w.face_polylines(48) {
+                        to_add.push(DObject::with_style(mk_face(&left), style));
+                        to_add.push(DObject::with_style(mk_face(&right), style));
+                        if let (Some(&l0), Some(&r0), Some(&l1), Some(&r1)) =
+                            (left.first(), right.first(), left.last(), right.last())
+                        {
+                            to_add.push(DObject::with_style(Geom::Line(Line { a: l0, b: r0 }), style)); // start cap
+                            to_add.push(DObject::with_style(Geom::Line(Line { a: l1, b: r1 }), style)); // end cap
+                        }
+                        to_remove.push(i);
+                    } else {
+                        skipped += 1;   // degenerate wall (start ≈ end)
+                    }
+                }
+                // Polyline / rectangle → individual Line + Arc segments.
+                Geom::Polyline(p) => {
+                    let segs = explode_polyline(p);
+                    if segs.is_empty() {
+                        skipped += 1;
+                    } else {
+                        for g in segs {
+                            to_add.push(DObject::with_style(g, dstyle));
+                        }
+                        to_remove.push(i);
+                    }
+                }
+                _ => skipped += 1,   // not explodable (line/circle/arc/…)
             }
         }
         let exploded = to_remove.len();
@@ -13971,9 +14325,9 @@ impl CadApp {
         }
         self.selection.clear();
         self.history.push(format!(
-            "  ✸ explode: {} instance(s) → {} dobject(s){}",
+            "  ✸ explode: {} object(s) → {} dobject(s){}",
             exploded, added,
-            if skipped > 0 { format!("  ({} skipped — not a block)", skipped) }
+            if skipped > 0 { format!("  ({} skipped — not explodable)", skipped) }
             else { String::new() }));
         self.intersections.clear();
         self.index_dirty = true;
@@ -15454,6 +15808,8 @@ impl CadApp {
                     "pline·ARC·SECOND: click a point ON the arc  [U=cancel sub-flow]".to_string(),
                 PlineArcSub::AwaitingSecondPtEnd(_) =>
                     "pline·ARC·SECOND: click ENDPOINT  [U=cancel sub-flow]".to_string(),
+                PlineArcSub::AwaitingDirection =>
+                    "pline·ARC·DIRECTION: click a point for the start tangent, or type an angle°  [U=cancel]".to_string(),
             },
         };
         self.set_prompt(prompt);
@@ -15475,7 +15831,7 @@ impl CadApp {
             } else { 0.0 };
             PolyVertex { pos: self.pending[i], bulge }
         }).collect();
-        Some(Polyline { vertices: verts, closed: false }.into())
+        Some(Polyline { vertices: verts, closed: false, widths: Vec::new() }.into())
     }
 
     /// PLINE arc-mode helper: the exit tangent of the most recently
@@ -15510,8 +15866,44 @@ impl CadApp {
     /// pline state. `closed` selects whether the last bulge slot
     /// (segment from final vertex back to first) is set; it stays 0 in
     /// the MVP since `c`/close was a Line-mode action.
-    fn drain_pline_pending(&mut self, closed: bool) -> Vec<PolyVertex> {
+    /// Empty-Enter while entering a PLINE width: accept the default. In
+    /// AwaitingStart it keeps the current start and moves to the ending-width
+    /// prompt; in AwaitingEnd it sets end = start. Called from the empty-Enter
+    /// handler so accepting a default width does NOT finish the polyline.
+    fn pline_width_accept_default(&mut self) {
+        match self.pline_width_cap {
+            PlineWidthCap::AwaitingStart { half } => {
+                let start = self.pline_next_width.0;
+                self.pline_width_cap = PlineWidthCap::AwaitingEnd { half, start };
+                self.set_prompt(format!(
+                    "pline {}: ending width <{:.4}>  [Enter = same]",
+                    if half { "halfwidth" } else { "width" },
+                    if half { start * 0.5 } else { start }));
+                self.refocus_cmd = true;
+            }
+            PlineWidthCap::AwaitingEnd { start, .. } => {
+                self.pline_next_width = (start, start);
+                self.pline_width_cap = PlineWidthCap::None;
+                self.history.push(format!(
+                    "  pline: width start={:.4} end={:.4}", start, start));
+                self.update_pline_prompt();
+            }
+            PlineWidthCap::None => {}
+        }
+    }
+
+    fn drain_pline_pending(&mut self, closed: bool) -> (Vec<PolyVertex>, Vec<(f64, f64)>) {
         let n = self.pending.len();
+        // Per-segment widths (parallel to bulges). seg_count = n-1 open, n
+        // closed. Empty result when every segment is thin, so plain polylines
+        // stay width-free.
+        let seg_count = if closed { n } else { n.saturating_sub(1) };
+        let mut widths: Vec<(f64, f64)> = (0..seg_count)
+            .map(|i| self.pending_widths.get(i).copied().unwrap_or((0.0, 0.0)))
+            .collect();
+        if widths.iter().all(|&(s, e)| s.abs() < 1e-9 && e.abs() < 1e-9) {
+            widths.clear();
+        }
         let mut verts = Vec::with_capacity(n);
         for (i, p) in self.pending.drain(..).enumerate() {
             // bulge[i] is the segment from vertex i to vertex i+1. For
@@ -15527,9 +15919,14 @@ impl CadApp {
             verts.push(PolyVertex { pos: p, bulge });
         }
         self.pending_bulges.clear();
+        self.pending_widths.clear();
         self.pline_mode = PlineMode::Line;
         self.pline_arc_sub = PlineArcSub::Normal;
-        verts
+        self.pline_dir_override = None;
+        self.pline_width_cap = PlineWidthCap::None;
+        // pline_next_width PERSISTS as the sticky default width for the next
+        // polyline (AutoCAD PLINEWID) — only an explicit `w` changes it.
+        (verts, widths)
     }
 
     /// Tessellate one polyline-preview segment from `a` to `b` with the
@@ -15602,9 +15999,11 @@ impl CadApp {
         let start = self.pending[n - 1];
         let chord = end - start;
         if chord.len() < EPS { return 0.0; }
-        // Default tangent: previous-segment exit; fall back to horizontal
-        // (X+) when there's only the start vertex.
-        let tangent = self.pline_previous_exit_tangent()
+        // Tangent priority: an explicit `d`/Direction override (this segment
+        // only) → the previous-segment exit tangent (G1-continuous) → X+ when
+        // there's only the start vertex.
+        let tangent = self.pline_dir_override
+            .or_else(|| self.pline_previous_exit_tangent())
             .unwrap_or(Vec2::new(1.0, 0.0));
         // Signed angle from chord to tangent, CCW positive.
         let cross = chord.x * tangent.y - chord.y * tangent.x;
@@ -18179,8 +18578,12 @@ impl eframe::App for CadApp {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.pending.clear();
             self.pending_bulges.clear();
+            self.pending_widths.clear();
             self.pline_mode = PlineMode::Line;
             self.pline_arc_sub = PlineArcSub::Normal;
+            self.pline_dir_override = None;
+            self.pline_width_cap = PlineWidthCap::None;
+            // pline_next_width persists (sticky default) across cancel too.
             self.wall_waiting_thickness = false;
             if self.block_def_state != BlockDefState::Off {
                 self.block_def_state = BlockDefState::Off;
@@ -18192,6 +18595,7 @@ impl eframe::App for CadApp {
             }
             self.flow_cancel();   // cancel an active prompt-driven flow (CIRCLE)
             self.zoom_cancel();   // cancel an active ZOOM sub-flow
+            self.pedit_exit();    // cancel an active PEDIT sub-flow
             self.tool = Tool::None;
             self.picking_source = false;
             // Set the cooperative-cancellation flag for any long-
@@ -18378,7 +18782,47 @@ impl eframe::App for CadApp {
             self.run_command("erase");
         }
 
-        // (Copy/Paste are Edit-menu only — no keyboard shortcuts.)
+        // Ctrl+C / Ctrl+V — copy / paste selected dobjects. IMPORTANT: eframe
+        // turns Ctrl+C/X/V into `Event::Copy` / `Event::Cut` / `Event::Paste`
+        // (NOT Key presses), so we must match those events — `key_pressed(C)`
+        // is never true for Ctrl+C. We run BEFORE the command-line widget and
+        // CONSUME the events so the focused (empty) command line doesn't also
+        // do a text copy/paste. Skipped while editing text so fields keep
+        // normal clipboard behavior.
+        {
+            let editing_text = self.layer_rename.is_some()
+                || !self.cmd.trim().is_empty()
+                || self.text_draft != TextDraftState::Off
+                || self.text_waiting_height;
+            if !editing_text {
+                let (copy, paste) = ctx.input_mut(|i| {
+                    // Key fallback in case the platform delivers raw keys.
+                    let mut copy  = i.modifiers.command && i.key_pressed(egui::Key::C);
+                    let mut paste = i.modifiers.command && i.key_pressed(egui::Key::V);
+                    // Primary path: eframe's clipboard events (Ctrl+C/X/V).
+                    i.events.retain(|e| match e {
+                        egui::Event::Copy | egui::Event::Cut => { copy = true; false }
+                        egui::Event::Paste(_)                => { paste = true; false }
+                        _ => true,
+                    });
+                    (copy, paste)
+                });
+                if copy {
+                    self.copy_selection();
+                    // Mirror to the OS clipboard so a later Ctrl+V reliably
+                    // emits Event::Paste (eframe may skip it for an empty clip).
+                    ctx.copy_text(format!(
+                        "RUST-AutoRASM: {} object(s) on clipboard",
+                        self.clipboard_dobjects.len()));
+                }
+                if paste { self.start_paste(); }
+                // Ctrl+G — group the current selection (G is a normal key, not
+                // a clipboard event, so plain key detection works here).
+                if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::G)) {
+                    self.group_selection();
+                }
+            }
+        }
 
         // Enter (when the command line is empty) finalises an in-progress
         // selection — this is the LibreCAD / AutoCAD convention. The cmd
@@ -18462,6 +18906,35 @@ impl eframe::App for CadApp {
             }
             return;
         }
+        // PEDIT — empty Enter exits the menu (Width step returns to the menu).
+        if trigger && cmd_is_empty && self.pedit_state != PeditState::Off {
+            if space_now { self.cmd.clear(); }
+            match self.pedit_state {
+                PeditState::Width(h) => { self.pedit_state = PeditState::Menu(h); self.pedit_reprompt(h); }
+                _ => self.pedit_exit(),
+            }
+            return;
+        }
+        // PLINE width / arc sub-flow: an empty Enter belongs to the sub-flow
+        // (accept the default width, or cancel an arc sub-flow) — it must NOT
+        // fall through and FINISH the polyline. Without this, pressing Enter to
+        // accept a default width committed the whole polyline and dropped the
+        // width entry.
+        if trigger && cmd_is_empty && self.tool == Tool::Polyline
+            && (self.pline_width_cap != PlineWidthCap::None
+                || self.pline_arc_sub != PlineArcSub::Normal)
+        {
+            if space_now { self.cmd.clear(); }
+            if self.pline_width_cap != PlineWidthCap::None {
+                self.pline_width_accept_default();
+            } else {
+                self.pline_arc_sub = PlineArcSub::Normal;
+                self.pline_dir_override = None;
+                self.history.push("  pline: cancelled arc sub-flow".into());
+                self.update_pline_prompt();
+            }
+            return;
+        }
         if trigger && cmd_is_empty {
             if self.select_mode != SelectMode::Off {
                 // Item 4 — 2-stage cancel for a select-mode wait with an
@@ -18502,9 +18975,9 @@ impl eframe::App for CadApp {
                 self.extend_state = ExtendState::Off;
                 self.clear_prompt();
             } else if self.tool == Tool::Polyline && self.pending.len() >= 2 {
-                let verts = self.drain_pline_pending(false);
+                let (verts, widths) = self.drain_pline_pending(false);
                 self.add_dobject(Geom::Polyline(Polyline {
-                    vertices: verts, closed: false,
+                    vertices: verts, closed: false, widths,
                 }), "canvas");
             } else if self.tool == Tool::Spline && self.pending.len() >= 3 {
                 // SPLINE commit — degree-3 (cubic) clamped/open uniform
@@ -18639,16 +19112,18 @@ impl eframe::App for CadApp {
             let trimmed = self.cmd.trim().to_ascii_lowercase();
             if trimmed == "c" || trimmed == "close" || trimmed == "closed" {
                 if self.pending.len() >= 2 {
-                    let verts = self.drain_pline_pending(true);
+                    let (verts, widths) = self.drain_pline_pending(true);
                     self.add_dobject(Geom::Polyline(Polyline {
-                        vertices: verts, closed: true,
+                        vertices: verts, closed: true, widths,
                     }), "canvas (closed)");
                     self.cmd.clear();
                 } else {
                     self.history.push("  ! polyline needs at least 2 vertices".into());
                     self.pending.clear();
                     self.pending_bulges.clear();
+                    self.pending_widths.clear();
                     self.pline_mode = PlineMode::Line;
+                    self.pline_width_cap = PlineWidthCap::None;
                 }
             }
         }
@@ -18768,12 +19243,28 @@ impl eframe::App for CadApp {
                         ui.close_menu();
                     }
                     ui.separator();
-                    if ui.button("Copy").clicked() {
+                    if ui.button("Copy    Ctrl+C").clicked() {
                         self.copy_selection();
+                        let n = self.clipboard_dobjects.len();
+                        ui.ctx().copy_text(format!(
+                            "RUST-AutoRASM: {} object(s) on clipboard", n));
                         ui.close_menu();
                     }
-                    if ui.button("Paste").clicked() {
+                    if ui.button("Paste   Ctrl+V").clicked() {
                         self.start_paste();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Group   Ctrl+G").clicked() {
+                        self.group_selection();
+                        ui.close_menu();
+                    }
+                    if ui.button("Add to Group").clicked() {
+                        self.add_to_group();
+                        ui.close_menu();
+                    }
+                    if ui.button("Ungroup").clicked() {
+                        self.ungroup_selection();
                         ui.close_menu();
                     }
                     ui.separator();
@@ -20304,6 +20795,50 @@ impl eframe::App for CadApp {
             // all block editing happens inside that window. Every interaction
             // gate below is AND-ed with `!canvas_locked`. See `BlockEditor`.
             let canvas_locked = self.block_editor.is_some();
+            // ---- right-click shortcut (context) menu --------------------
+            // Opens on a secondary CLICK (a right-DRAG still pans). Shown only
+            // when there's a selection or something on the clipboard.
+            if !canvas_locked
+                && (!self.selection.is_empty() || !self.clipboard_dobjects.is_empty())
+            {
+                resp.context_menu(|ui| {
+                    ui.set_min_width(150.0);
+                    // Group ▸ (flyout submenu)
+                    ui.menu_button("Group", |ui| {
+                        if ui.button("Group     Ctrl+G").clicked() {
+                            self.group_selection();
+                            ui.close_menu();
+                        }
+                        if ui.button("Add to Group").clicked() {
+                            self.add_to_group();
+                            ui.close_menu();
+                        }
+                        if ui.button("Ungroup").clicked() {
+                            self.ungroup_selection();
+                            ui.close_menu();
+                        }
+                    });
+                    // Clipboard ▸ (flyout submenu)
+                    ui.menu_button("Clipboard", |ui| {
+                        if ui.button("Copy      Ctrl+C").clicked() {
+                            self.copy_selection();
+                            let n = self.clipboard_dobjects.len();
+                            ui.ctx().copy_text(format!(
+                                "RUST-AutoRASM: {} object(s) on clipboard", n));
+                            ui.close_menu();
+                        }
+                        if ui.button("Paste     Ctrl+V").clicked() {
+                            self.start_paste();
+                            ui.close_menu();
+                        }
+                    });
+                    ui.separator();
+                    if ui.button("Properties").clicked() {
+                        self.info_window_open = true;
+                        ui.close_menu();
+                    }
+                });
+            }
             // ZOOM real-time mode: a primary drag zooms the view instead of
             // selecting / drawing. Gates the click/grip handlers below so the
             // drag is consumed only by the zoom logic. See the zoom_* methods.
@@ -20916,6 +21451,8 @@ impl eframe::App for CadApp {
                     // Shift adds, Alt removes; inside a session it accumulates.
                     self.add_window_selection(
                         press_world, release_world, shift, alt, was_off);
+                    // Window-selecting any group member selects the whole group.
+                    if was_off && !alt { self.expand_selection_to_groups(); }
                     // STRETCH: the crossing window is also the per-vertex
                     // test region — remember it (last window wins).
                     if self.queued_op == QueuedOp::Stretch {
@@ -21661,7 +22198,7 @@ impl eframe::App for CadApp {
                             let hint = match self.armed_window_inside {
                                 Some(true)  => "    window (armed INSIDE): click OPPOSITE corner".to_string(),
                                 Some(false) => "    window (armed CROSSING): click OPPOSITE corner".to_string(),
-                                None        => "    window: click opposite corner (L→R inside, R→L crossing — hold Shift to subtract)".to_string(),
+                                None        => "    window: click opposite corner (L→R inside, R→L crossing — Shift adds, Alt subtracts)".to_string(),
                             };
                             self.history.push(hint);
                         }
@@ -21685,6 +22222,8 @@ impl eframe::App for CadApp {
                         if let Some(i) = self.nearest_entity_under(world, tol_world) {
                             // Pointer-mode pick: plain = fresh selection (replace).
                             self.click_select(i, shift, alt, true);
+                            // Picking a group member selects the whole group.
+                            if !alt { self.expand_selection_to_groups(); }
                         } else if !shift && !alt {
                             self.selection.clear();
                             self.selected = None;
@@ -21757,7 +22296,29 @@ impl eframe::App for CadApp {
                                         let bulge = bulge_from_three_points(
                                             start, mid, click_world);
                                         self.pending_bulges.push(bulge);
+                                        self.pending_widths.push(self.pline_next_width);
+                                        self.pline_next_width =
+                                            (self.pline_next_width.1, self.pline_next_width.1);
                                         self.pending.push(click_world);
+                                    }
+                                    self.pline_arc_sub = PlineArcSub::Normal;
+                                    self.update_pline_prompt();
+                                    true
+                                }
+                                // Direction: this click sets the arc's START
+                                // tangent (last vertex → click). No vertex is
+                                // committed; the NEXT click places the endpoint
+                                // and the arc bulge uses this override.
+                                PlineArcSub::AwaitingDirection => {
+                                    if let Some(&start) = self.pending.last() {
+                                        let dir = click_world - start;
+                                        if dir.len() > EPS {
+                                            let u = dir / dir.len();
+                                            self.pline_dir_override = Some(u);
+                                            self.history.push(format!(
+                                                "    pline·ARC direction ({:.3},{:.3}) — click ENDPOINT",
+                                                u.x, u.y));
+                                        }
                                     }
                                     self.pline_arc_sub = PlineArcSub::Normal;
                                     self.update_pline_prompt();
@@ -21783,9 +22344,9 @@ impl eframe::App for CadApp {
                                     (click_world - first).len() < world_tol
                                 };
                             if auto_closed {
-                                let verts = self.drain_pline_pending(true);
+                                let (verts, widths) = self.drain_pline_pending(true);
                                 self.add_dobject(Geom::Polyline(Polyline {
-                                    vertices: verts, closed: true,
+                                    vertices: verts, closed: true, widths,
                                 }), "canvas (auto-closed on first vertex)");
                                 self.update_pline_prompt();
                             } else {
@@ -21796,6 +22357,14 @@ impl eframe::App for CadApp {
                                         0.0
                                     };
                                     self.pending_bulges.push(new_bulge);
+                                    // Width for this segment; the end width
+                                    // carries as the next segment's start.
+                                    self.pending_widths.push(self.pline_next_width);
+                                    self.pline_next_width =
+                                        (self.pline_next_width.1, self.pline_next_width.1);
+                                    // The Direction override applies to ONE arc
+                                    // segment only — consume it now.
+                                    self.pline_dir_override = None;
                                 }
                                 // Smart-dim flow: handle the click via
                                 // dim_draft instead of pending so the
@@ -23185,6 +23754,51 @@ impl eframe::App for CadApp {
                         // the actual arc, not its chord. Each captured
                         // vertex gets a small filled dot.
                         (Tool::Polyline, verts) if !verts.is_empty() => {
+                            // LIVE WIDTH preview: if any width is set, fill the
+                            // committed segments + the rubber-band with their
+                            // widths so the user sees the wide shape WHILE
+                            // drawing (not only after the command finishes).
+                            let any_w = self.pline_next_width.0.abs() > 1e-9
+                                || self.pline_next_width.1.abs() > 1e-9
+                                || self.pending_widths.iter()
+                                    .any(|&(s, e)| s.abs() > 1e-9 || e.abs() > 1e-9);
+                            if any_w {
+                                let push_seg = |cl: &mut Vec<(Vec2, f64)>,
+                                                a: Vec2, b: Vec2, bulge: f64,
+                                                sw: f64, ew: f64, first: bool| {
+                                    let mut pts = vec![a];
+                                    append_arc_world_samples(a, b, bulge, &mut pts);
+                                    let mm = pts.len().max(1);
+                                    for (j, pt) in pts.iter().enumerate() {
+                                        if !first && j == 0 { continue; }
+                                        let t = if mm > 1 { j as f64 / (mm - 1) as f64 } else { 0.0 };
+                                        cl.push((*pt, sw + (ew - sw) * t));
+                                    }
+                                };
+                                let mut cl: Vec<(Vec2, f64)> = Vec::new();
+                                for i in 0..verts.len().saturating_sub(1) {
+                                    let (sw, ew) = self.pending_widths
+                                        .get(i).copied().unwrap_or((0.0, 0.0));
+                                    let bulge = self.pending_bulges
+                                        .get(i).copied().unwrap_or(0.0);
+                                    push_seg(&mut cl, verts[i], verts[i + 1], bulge, sw, ew, i == 0);
+                                }
+                                // Rubber-band segment with the CURRENT width.
+                                if let Some(&last) = verts.last() {
+                                    let rb = matches!((self.pline_mode, self.pline_arc_sub),
+                                        (PlineMode::Line, _) | (PlineMode::Arc, PlineArcSub::Normal));
+                                    if rb {
+                                        let bulge = if self.pline_mode == PlineMode::Arc {
+                                            self.pline_arc_bulge_to(cw)
+                                        } else { 0.0 };
+                                        let (sw, ew) = self.pline_next_width;
+                                        let first = cl.is_empty();
+                                        push_seg(&mut cl, last, cw, bulge, sw, ew, first);
+                                    }
+                                }
+                                fill_width_strip(&painter, rect, self, &cl,
+                                    preview_col.gamma_multiply(0.40));
+                            }
                             let solid = egui::Stroke::new(
                                 1.0, preview_col.gamma_multiply(0.7));
                             for w in verts.iter() {
@@ -23228,6 +23842,13 @@ impl eframe::App for CadApp {
                                         let bulge = self.pline_arc_bulge_to(cw);
                                         self.draw_pline_preview_segment(
                                             &painter, rect, *last, cw, bulge, dash);
+                                    }
+                                    (PlineMode::Arc, PlineArcSub::AwaitingDirection) => {
+                                        // Cursor defines the start tangent — show
+                                        // it as a reference line from the last
+                                        // vertex toward the cursor.
+                                        painter.line_segment(
+                                            [self.w2s(*last, rect), cursor], dash);
                                     }
                                     (PlineMode::Line, _) => {
                                         painter.line_segment(
@@ -23570,17 +24191,10 @@ impl eframe::App for CadApp {
                     let cur_world = self.cursor_world_constrained(
                         resp.hover_pos(), rect, snap_hit.map(|h| h.point));
                     if let Some(cw) = cur_world {
+                        // Base is auto (clipboard lower-left) → no base blip /
+                        // dashed line; just ghost the content under the cursor.
                         let v = cw - base;
-                        let base_s = self.w2s(base, rect);
-                        let dest_s = self.w2s(cw, rect);
-                        let accent = egui::Color32::from_rgb(150, 230, 170);
-                        draw_base_blip(&painter, base_s, accent);
-                        let time = ctx.input(|i| i.time) as f32;
-                        let phase = time * 60.0;
-                        draw_dashed_line(&painter, base_s, dest_s,
-                            6.0, 4.0, phase, egui::Stroke::new(1.2, accent));
                         let ghost_col = egui::Color32::from_rgba_unmultiplied(150, 230, 170, 180);
-                        // Ghost the CLIPBOARD content (not a doc selection).
                         for d in &self.clipboard_dobjects {
                             let g = d.geom.translated(v);
                             draw_dobject(&painter, rect, self, &g, ghost_col);
@@ -23789,6 +24403,7 @@ impl eframe::App for CadApp {
             || self.move_state       != MoveState::Off
             || self.copy_state       != CopyState::Off
             || self.paste_state      != PasteState::Off
+            || self.pedit_state      != PeditState::Off
             || self.rotate_state     != RotateState::Off
             || self.scale_state      != ScaleState::Off
             || self.mirror_state     != MirrorState::Off
@@ -24333,6 +24948,139 @@ fn draw_dobject(
     draw_dobject_thick(painter, rect, app, g, color, 1.6);
 }
 
+/// Build the centerline of a polyline as `(point, full_width)` samples in
+/// world space. Arc segments are tessellated (real arcs); width is linearly
+/// interpolated start→end within each segment. Shared vertices appear once, so
+/// the result is a single continuous path — the input the width-strip filler
+/// needs for gap-free mitred corners.
+fn polyline_width_centerline(p: &Polyline) -> Vec<(Vec2, f64)> {
+    let n = p.vertices.len();
+    if n < 2 { return Vec::new(); }
+    let seg_count = if p.closed { n } else { n - 1 };
+    let mut cl: Vec<(Vec2, f64)> = Vec::new();
+    for i in 0..seg_count {
+        let a = p.vertices[i].pos;
+        let b = p.vertices[(i + 1) % n].pos;
+        let bulge = p.vertices[i].bulge;
+        let (sw, ew) = p.widths.get(i).copied().unwrap_or((0.0, 0.0));
+        let mut pts = vec![a];
+        append_arc_world_samples(a, b, bulge, &mut pts);   // a + interior + b
+        let mm = pts.len().max(1);
+        for (j, pt) in pts.iter().enumerate() {
+            if i > 0 && j == 0 { continue; }               // dedup shared vertex
+            let t = if mm > 1 { j as f64 / (mm - 1) as f64 } else { 0.0 };
+            cl.push((*pt, sw + (ew - sw) * t));
+        }
+    }
+    cl
+}
+
+/// Fill a width strip along a `(point, full_width)` centerline. ROBUST against
+/// any geometry (sharp / reflex / self-intersecting): each segment is filled as
+/// its OWN independent rectangle (using that segment's normal — never skewed,
+/// never spikes), and each interior vertex gets a JOINT fill = the convex hull
+/// of the four segment-end corners plus the clamped miter apex (sharp corner
+/// when within the miter limit, clean bevel beyond it). Widths are world units
+/// (scale with zoom); endpoints butt-cap.
+fn fill_width_strip(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    app: &CadApp,
+    cl: &[(Vec2, f64)],
+    color: egui::Color32,
+) {
+    let m = cl.len();
+    if m < 2 { return; }
+    let unit = |v: Vec2| { let l = v.len(); if l > EPS { v / l } else { Vec2::new(0.0, 0.0) } };
+    let perp = |v: Vec2| Vec2::new(-v.y, v.x);
+    let isect = |p0: Vec2, d0: Vec2, p1: Vec2, d1: Vec2| -> Option<Vec2> {
+        let den = d0.x * d1.y - d0.y * d1.x;
+        if den.abs() < 1e-9 { return None; }
+        let dp = p1 - p0;
+        Some(p0 + d0 * ((dp.x * d1.y - dp.y * d1.x) / den))
+    };
+    // Fill the convex hull of `pts` (angle-sorted around their centroid) as a
+    // triangle fan — order-independent, so callers needn't pre-sort.
+    let fill_hull = |pts: &[Vec2]| {
+        if pts.len() < 3 { return; }
+        let n = pts.len() as f64;
+        let c = pts.iter().fold(Vec2::new(0.0, 0.0), |a, &p| a + p) / n;
+        let mut s: Vec<Vec2> = pts.to_vec();
+        s.sort_by(|a, b| {
+            (a.y - c.y).atan2(a.x - c.x)
+                .partial_cmp(&(b.y - c.y).atan2(b.x - c.x))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let scr: Vec<egui::Pos2> = s.iter().map(|p| app.w2s(*p, rect)).collect();
+        // ONE convex polygon (not a triangle fan) so egui only anti-aliases the
+        // outer boundary — no internal hairline seams across the fill.
+        painter.add(egui::Shape::convex_polygon(scr, color, egui::Stroke::NONE));
+    };
+    const MITER_LIMIT: f64 = 8.0;
+    // Per-segment unit direction.
+    let seg_dir: Vec<Vec2> = (0..m - 1).map(|k| unit(cl[k + 1].0 - cl[k].0)).collect();
+    // Per-vertex miter decision + shared left/right miter points. A vertex
+    // MITERS (smooth shared seam) when the apex stays within the limit;
+    // otherwise it BEVELS (each segment keeps its own normal; a hull fills the
+    // gap) — so sharp/reflex corners can't spike.
+    let mut mitered = vec![false; m];
+    let mut ml = vec![Vec2::new(0.0, 0.0); m];
+    let mut mr = vec![Vec2::new(0.0, 0.0); m];
+    for k in 1..m - 1 {
+        let (da, db) = (seg_dir[k - 1], seg_dir[k]);
+        if da.len() < 0.5 || db.len() < 0.5 { continue; }
+        let h = cl[k].1 * 0.5;
+        let (na, nb) = (perp(da), perp(db));
+        let l = isect(cl[k].0 + na * h, da, cl[k].0 + nb * h, db);
+        let r = isect(cl[k].0 - na * h, da, cl[k].0 - nb * h, db);
+        if let (Some(lp), Some(rp)) = (l, r) {
+            let dmax = (lp - cl[k].0).len().max((rp - cl[k].0).len());
+            if dmax <= MITER_LIMIT * h {
+                mitered[k] = true; ml[k] = lp; mr[k] = rp;
+            }
+        }
+    }
+    // Segment quads — mitered corners reuse the SHARED apex (seamless edge);
+    // non-mitered corners use the segment's own normal (bevel).
+    for k in 0..m - 1 {
+        let dseg = seg_dir[k];
+        if dseg.len() < 0.5 { continue; }
+        let n = perp(dseg);
+        let h0 = cl[k].1 * 0.5;
+        let h1 = cl[k + 1].1 * 0.5;
+        let (l0, r0) = if mitered[k] { (ml[k], mr[k]) }
+                       else { (cl[k].0 + n * h0, cl[k].0 - n * h0) };
+        let (l1, r1) = if mitered[k + 1] { (ml[k + 1], mr[k + 1]) }
+                       else { (cl[k + 1].0 + n * h1, cl[k + 1].0 - n * h1) };
+        fill_hull(&[l0, l1, r1, r0]);
+    }
+    // Bevel fill at sharp (non-mitered) interior vertices.
+    for k in 1..m - 1 {
+        if mitered[k] { continue; }
+        let (da, db) = (seg_dir[k - 1], seg_dir[k]);
+        if da.len() < 0.5 || db.len() < 0.5 { continue; }
+        let h = cl[k].1 * 0.5;
+        let (na, nb) = (perp(da), perp(db));
+        fill_hull(&[
+            cl[k].0 + na * h, cl[k].0 - na * h,
+            cl[k].0 + nb * h, cl[k].0 - nb * h, cl[k].0,
+        ]);
+    }
+}
+
+/// Render a committed polyline with per-segment widths as one filled, mitred
+/// tapered strip.
+fn draw_polyline_widths(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    app: &CadApp,
+    p: &Polyline,
+    color: egui::Color32,
+) {
+    let cl = polyline_width_centerline(p);
+    fill_width_strip(painter, rect, app, &cl, color);
+}
+
 /// Render a DObject honouring its style.linetype (resolved through
 /// ByLayer when the dobject's linetype is `Continuous`/0). Falls back
 /// to a solid draw via `draw_dobject_thick` for Continuous patterns —
@@ -24666,11 +25414,17 @@ fn draw_dobject_thick(
                 [egui::pos2(sp.x, sp.y - s), egui::pos2(sp.x, sp.y + s)], stroke);
         }
         Geom::Polyline(p) => {
-            // Bulge-aware tessellation so arc segments inside a polyline
-            // render as actual arcs, not chords.
-            let pts = polyline_tessellated_screen_pts(p, app, rect);
-            if !pts.is_empty() {
-                painter.add(egui::Shape::line(pts, stroke));
+            // Tapered-width polyline → filled strips per segment. Otherwise the
+            // normal bulge-aware stroke (arc segments render as real arcs).
+            let has_width = p.widths.iter()
+                .any(|&(s, e)| s.abs() > 1e-9 || e.abs() > 1e-9);
+            if has_width {
+                draw_polyline_widths(painter, rect, app, p, color);
+            } else {
+                let pts = polyline_tessellated_screen_pts(p, app, rect);
+                if !pts.is_empty() {
+                    painter.add(egui::Shape::line(pts, stroke));
+                }
             }
         }
         Geom::Hatch(_) => {

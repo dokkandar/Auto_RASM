@@ -940,6 +940,7 @@ mod tests {
                     PolyVertex { pos: Vec2::new(0.0, 20.0), bulge: 0.0 },
                 ],
                 closed: true,
+                widths: Vec::new(),
             }.into(),
             // Inner circle
             Circle { center: Vec2::new(10.0, 10.0), radius: 3.0 }.into(),
@@ -966,6 +967,7 @@ mod tests {
                     PolyVertex { pos: Vec2::new(0.0, 20.0), bulge: 0.0 },
                 ],
                 closed: true,
+                widths: Vec::new(),
             }.into(),
             Circle { center: Vec2::new(10.0, 10.0), radius: 3.0 }.into(),
         ]);
