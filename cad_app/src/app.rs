@@ -2747,6 +2747,19 @@ impl CadApp {
                 return;
             }
         }
+        // Selection sub-command shortcuts — only while a select session is
+        // active (the command line is asking for a selection):
+        //   p = previous selection, L = last drafted dobject, D = deselect mode.
+        // Single letters are ambiguous at top level (l = Line), so they only
+        // mean this inside a select session.
+        if self.select_mode != SelectMode::Off {
+            match trimmed.to_ascii_lowercase().as_str() {
+                "p" => { self.run_command("previous"); return; }
+                "l" => { self.run_command("last");     return; }
+                "d" => { self.run_command("remove");   return; }
+                _ => {}
+            }
+        }
         // `preview [on|off]` — toggle drafting-command live preview.
         {
             let lc = trimmed.to_ascii_lowercase();
@@ -6115,36 +6128,40 @@ impl CadApp {
         true
     }
 
-    /// Click on a dobject during a selection session. Plain click = ADD
-    /// (no-op if already in the basket). Shift+click = REMOVE (no-op if
-    /// not in the basket). The persistent `remove` sub-command from the
-    /// command line flips the default: while it's on, plain clicks act
-    /// like Shift+clicks and Shift+clicks act like plain clicks.
+    /// Selection click model (AutoCAD/SolidWorks-style):
+    ///   • Alt (or active deselect mode) → REMOVE the dobject.
+    ///   • Shift                         → ADD to the current selection.
+    ///   • plain + `fresh`               → REPLACE (select only this).
+    ///   • plain inside a command select session → ADD (accumulate the basket).
+    /// `fresh` is true for pointer-mode picks (a new selection bunch).
     #[track_caller]
-    fn click_select(&mut self, i: usize, shift: bool) {
+    fn click_select(&mut self, i: usize, shift: bool, alt: bool, fresh: bool) {
         let basket_before = self.selection.clone();
-        // Effective intent: Shift inverts whatever the current mode says.
-        let want_remove = shift ^ self.select_remove_mode;
-        if want_remove {
+        let remove = alt || (self.select_remove_mode && !shift);
+        if remove {
             if let Some(pos) = self.selection.iter().position(|&x| x == i) {
                 self.selection.remove(pos);
                 self.history.push(format!("    – #{} removed", i));
             } else {
-                self.history.push(format!(
-                    "    (skip) #{} not in the basket", i));
+                self.history.push(format!("    (skip) #{} not selected", i));
             }
-        } else if !self.selection.contains(&i) {
-            self.selection.push(i);
-            self.history.push(format!("    + #{} added", i));
         } else {
-            self.history.push(format!(
-                "    (skip) #{} already in the basket — Shift+click to remove", i));
+            if !shift && fresh {
+                // Plain click = start a fresh selection (replace).
+                self.selection.clear();
+                self.selected = None;
+            }
+            if !self.selection.contains(&i) {
+                self.selection.push(i);
+                self.history.push(format!("    + #{} selected", i));
+            }
         }
         crate::dbg_event!(self,
             crate::dbg_recorder::DbgEvent::SelectChange {
                 basket_before,
                 basket_after: self.selection.clone(),
-                cause: format!("click_select(i={}, shift={})", i, shift),
+                cause: format!("click_select(i={}, shift={}, alt={}, fresh={})",
+                    i, shift, alt, fresh),
             });
     }
 
@@ -6224,7 +6241,7 @@ impl CadApp {
         }
     }
 
-    fn add_window_selection(&mut self, p1: Vec2, p2: Vec2, shift: bool) {
+    fn add_window_selection(&mut self, p1: Vec2, p2: Vec2, shift: bool, alt: bool, fresh: bool) {
         let basket_before = self.selection.clone();
         let bbox_min = Vec2::new(p1.x.min(p2.x), p1.y.min(p2.y));
         let bbox_max = Vec2::new(p1.x.max(p2.x), p1.y.max(p2.y));
@@ -6244,7 +6261,12 @@ impl CadApp {
             Some(false) => true,             // armed crossing
             None        => p2.x < p1.x,      // direction-default (R→L = crossing)
         };
-        let want_remove = shift ^ self.select_remove_mode;
+        let want_remove = alt || (self.select_remove_mode && !shift);
+        // Plain window-drag = fresh selection (replace) when `fresh`.
+        if !want_remove && !shift && fresh {
+            self.selection.clear();
+            self.selected = None;
+        }
 
         let cands: Vec<usize> = match (self.index.as_ref(), self.index_dirty) {
             (Some(g), false) => g.query_bbox(bbox_min, bbox_max)
@@ -18088,6 +18110,31 @@ impl eframe::App for CadApp {
                 self.pre_op_selection.clear();
                 self.selection.clear();
             }
+            // Esc always returns to a clean slate (AutoCAD convention): drop
+            // any pickfirst selection + half-started window, and reclaim the
+            // command line so the next typed command lands immediately.
+            self.selection.clear();
+            self.selected = None;
+            self.window_first = None;
+            self.refocus_cmd = true;
+        }
+
+        // Delete key — erase the current pickfirst selection directly, without
+        // routing through the command line. Focus-independent so it works even
+        // on the frame right after a drag-select. Guarded so it never fires
+        // while editing text or running another command/flow.
+        if ctx.input(|i| i.key_pressed(egui::Key::Delete))
+            && !self.selection.is_empty()
+            && self.layer_rename.is_none()
+            && self.cmd.trim().is_empty()
+            && self.cmd_flow.is_none()
+            && self.zoom_state == ZoomState::Off
+            && self.tool == Tool::None
+            && self.select_mode == SelectMode::Off
+            && self.text_draft == TextDraftState::Off
+            && !self.text_waiting_height
+        {
+            self.run_command("erase");
         }
 
         // Enter (when the command line is empty) finalises an in-progress
@@ -20587,15 +20634,15 @@ impl eframe::App for CadApp {
                     let press_world   = press_world_stashed;
                     let release_world = self.s2w(r, rect);
                     let shift = ctx.input(|i| i.modifiers.shift);
+                    let alt   = ctx.input(|i| i.modifiers.alt);
                     let was_off = self.select_mode == SelectMode::Off;
-                    if was_off {
-                        // Shift+drag from idle — open a one-shot ForSelect
-                        // window, apply, finalise.
-                        self.begin_selection(SelectMode::ForSelect);
-                    }
-                    // Shift removes only WITHIN an active session (so an idle
-                    // Shift-drag still selects rather than removing from nothing).
-                    self.add_window_selection(press_world, release_world, shift && !was_off);
+                    // Pointer-mode drag (was_off) applies DIRECTLY to the live
+                    // selection — do NOT begin_selection(), which clears it and
+                    // would turn Shift+drag (add) / Alt+drag (remove) into a
+                    // replace. `fresh = was_off`: a plain idle drag replaces;
+                    // Shift adds, Alt removes; inside a session it accumulates.
+                    self.add_window_selection(
+                        press_world, release_world, shift, alt, was_off);
                     // STRETCH: the crossing window is also the per-vertex
                     // test region — remember it (last window wins).
                     if self.queued_op == QueuedOp::Stretch {
@@ -20605,14 +20652,15 @@ impl eframe::App for CadApp {
                                              press_world.y.max(release_world.y));
                         self.stretch_window_box = Some((wmin, wmax));
                     }
-                    if was_off {
-                        self.finalise_selection();
-                    } else {
+                    if !was_off {
                         // Inside select_mode: stay in the session so the
                         // user can add more windows / clicks. window_first
                         // would re-arm naturally on next click.
                         self.window_first = None;
                     }
+                    // Reclaim the command line so the NEXT typed command (e.g.
+                    // `e` to erase the just-selected items) lands.
+                    self.refocus_cmd = true;
                     window_drag_consumed_click = true;
                 }
             }
@@ -21300,6 +21348,7 @@ impl eframe::App for CadApp {
                         self.refocus_cmd = true;
                     } else if self.select_mode != SelectMode::Off {
                         let shift = ctx.input(|i| i.modifiers.shift);
+                        let alt   = ctx.input(|i| i.modifiers.alt);
                         let tol_world = 10.0 / self.scale as f64;
                         // If the user explicitly typed `w` or `c`, their
                         // intent is unambiguous: this click starts a
@@ -21316,10 +21365,11 @@ impl eframe::App for CadApp {
                             self.nearest_entity_under(world, tol_world)
                         };
                         if let Some(i) = hit {
-                            self.click_select(i, shift);
+                            // In a command select session — accumulate (not fresh).
+                            self.click_select(i, shift, alt, false);
                             self.window_first = None;   // any half-started window is dropped
                         } else if let Some(first) = self.window_first.take() {
-                            self.add_window_selection(first, world, shift);
+                            self.add_window_selection(first, world, shift, alt, false);
                         } else {
                             self.window_first = Some(world);
                             let hint = match self.armed_window_inside {
@@ -21342,12 +21392,14 @@ impl eframe::App for CadApp {
                         // typing anything). Shift-click on empty preserves
                         // the basket so missing the dobject by a few pixels
                         // mid-shift-multi-select doesn't wipe it.
-                        // See `feedback_rust_cad_pointer_is_selector` memo.
+                        // Click = replace, Shift = add, Alt = remove.
                         let shift = ctx.input(|i| i.modifiers.shift);
+                        let alt   = ctx.input(|i| i.modifiers.alt);
                         let tol_world = 10.0 / self.scale as f64;
                         if let Some(i) = self.nearest_entity_under(world, tol_world) {
-                            self.click_select(i, shift);
-                        } else if !shift {
+                            // Pointer-mode pick: plain = fresh selection (replace).
+                            self.click_select(i, shift, alt, true);
+                        } else if !shift && !alt {
                             self.selection.clear();
                             self.selected = None;
                         }
