@@ -4228,7 +4228,10 @@ impl CadApp {
                 }
                 let r = self.env.FltRad;
                 self.fillet_state = FilletState::WaitingForFirst(r);
-                self.fillet_multiple = false;       // each F starts single-mode
+                // Continuous by default: keep filleting pair after pair until
+                // Esc. `R` changes the radius mid-command (persists as the new
+                // default); `M` toggles back to single-shot.
+                self.fillet_multiple = true;
                 self.refresh_fillet_prompt();
             }
             Ok(Command::Chamfer(opt)) => {
