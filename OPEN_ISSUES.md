@@ -50,12 +50,6 @@ Legend: 🔴 broken / confirmed not working · 🟡 partial / needs follow-up ·
 
 ## 🟡 UI REDESIGN — in progress
 
-### U1. Quick Access Toolbar — real logo PNG ⚪ WAITING ON USER
-- Loader is wired (`load_logo_texture`, runtime PNG via the `image` crate); it
-  reads `cad_app/assets/logo.png` and falls back to a painted placeholder.
-  **Action: user must save the brand PNG to `cad_app/assets/logo.png`** (I can't
-  extract the pasted image). Once it's there it loads automatically.
-
 ### U2. Quick Access Toolbar — persistence + real icons
 - `qat_actions` customization is in-session only (resets on restart) — persist it
   (e.g. in UserEnv / a small config). Shortcut glyphs are simple painted
@@ -116,3 +110,6 @@ Legend: 🔴 broken / confirmed not working · 🟡 partial / needs follow-up ·
 - Fillet too-big radius guard + re-prompt `113cab0`
 - Generalized fillet/chamfer (polylines/arcs/P option) `b0a2291`
   — NOTE: the line↔polyline part is still buggy, see issue #1.
+- UI: two-line top bar — customizable Quick Access row + menu categories,
+  logo column spanning both rows (real PNG asset), slim "Quick access" drop
+  window. `4a300d5` `6a8e075` `d733340`
