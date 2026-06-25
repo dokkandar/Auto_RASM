@@ -342,7 +342,11 @@ pub fn nearest_polyline_segment(pl: &Polyline, p: Vec2) -> Option<usize> {
 enum Ctx {
     Line,
     Arc { center: Vec2, r: f64, a0: f64, sweep: f64 },
-    PolyEnd { pl: Polyline, free_vtx: usize, seg: usize },
+    /// A polyline whose clicked segment `seg` (vertices seg, seg+1) is being
+    /// filleted against a separate object. The vertex that gets trimmed to the
+    /// tangent point is the one FARTHER from the pick (the corner side); it
+    /// must be a free end of an open polyline, else we refuse (see poly_move_ok).
+    Poly { pl: Polyline, seg: usize },
 }
 
 fn geom_piece_ctx(g: &Geom, pick: Vec2) -> Result<(Piece, Ctx), String> {
@@ -360,16 +364,33 @@ fn geom_piece_ctx(g: &Geom, pick: Vec2) -> Result<(Piece, Ctx), String> {
             if n < 2 { return Err("fillet: polyline has no segments".into()); }
             let seg = nearest_polyline_segment(pl, pick)
                 .ok_or_else(|| "fillet: could not locate the polyline segment".to_string())?;
-            let last = n - 2;
-            if seg != 0 && seg != last {
-                return Err("fillet: pick the polyline's END segment (or pick two segments of the same polyline)".into());
-            }
-            let free_vtx = if seg == 0 { 0 } else { n - 1 };
             let pc = polyseg_piece(pl, seg)
                 .ok_or_else(|| "fillet: degenerate polyline segment".to_string())?;
-            Ok((pc, Ctx::PolyEnd { pl: pl.clone(), free_vtx, seg }))
+            Ok((pc, Ctx::Poly { pl: pl.clone(), seg }))
         }
         _ => Err("fillet: supports Line, Arc and Polyline (Walls use the Line path)".into()),
+    }
+}
+
+/// The polyline vertex that a fillet trims to the tangent point — the clicked
+/// segment's endpoint FARTHER from the pick (the corner side) — and whether it
+/// is a FREE end of an open polyline (so moving it keeps the polyline valid).
+fn poly_moved_vertex(pl: &Polyline, seg: usize, pick: Vec2) -> (usize, bool) {
+    let n = pl.vertices.len();
+    let va = pl.vertices[seg].pos;
+    let vb = pl.vertices[seg + 1].pos;
+    let move_i = if va.dist(pick) >= vb.dist(pick) { seg } else { seg + 1 };
+    let ok = !pl.closed && (move_i == 0 || move_i == n - 1);
+    (move_i, ok)
+}
+
+/// True unless this side is a polyline whose corner-side vertex is INTERIOR
+/// (shared) — in that case the fillet can't trim it in place without breaking
+/// the polyline, and the caller errors instead of producing garbage.
+fn poly_move_ok(ctx: &Ctx, pick: Vec2) -> bool {
+    match ctx {
+        Ctx::Poly { pl, seg } => poly_moved_vertex(pl, *seg, pick).1,
+        _ => true,
     }
 }
 
@@ -385,18 +406,18 @@ fn rebuild_side(ctx: &Ctx, piece: &Piece, tp: Vec2, pick: Vec2) -> Geom {
             Geom::Line(Line { a: keep, b: tp })
         }
         Ctx::Arc { center, r, a0, sweep } => arc_keep(*center, *r, *a0, *sweep, tp, pick),
-        Ctx::PolyEnd { pl, free_vtx, seg } => {
+        Ctx::Poly { pl, seg } => {
+            // Move the corner-side vertex (farther from the pick) to tp; keep
+            // the rest of the polyline. Recompute the clicked segment's bulge
+            // so an arc segment stays on its circle.
+            let (move_i, _) = poly_moved_vertex(pl, *seg, pick);
+            let va = pl.vertices[*seg].pos;
+            let vb = pl.vertices[*seg + 1].pos;
             let mut np = pl.clone();
-            let other = np.vertices[*seg + (if *free_vtx == *seg { 1 } else { 0 })].pos;
-            // The segment runs free_vtx ↔ other; move free_vtx to tp.
-            let a = np.vertices[*seg].pos;
-            let b = np.vertices[*seg + 1].pos;
-            let bulge_i = np.vertices[*seg].bulge;
-            np.vertices[*free_vtx].pos = tp;
-            // Recompute the end segment's bulge for the moved endpoint.
-            let (new_a, new_b) = if *free_vtx == *seg { (tp, b) } else { (a, tp) };
-            np.vertices[*seg].bulge = recompute_bulge(bulge_i, a, b, new_a, new_b);
-            let _ = other;
+            np.vertices[move_i].pos = tp;
+            let new_a = np.vertices[*seg].pos;
+            let new_b = np.vertices[*seg + 1].pos;
+            np.vertices[*seg].bulge = recompute_bulge(pl.vertices[*seg].bulge, va, vb, new_a, new_b);
             Geom::Polyline(np)
         }
     }
@@ -410,6 +431,9 @@ pub fn fillet_geoms(
     if radius < 0.0 { return Err("fillet: radius must be ≥ 0".into()); }
     let (pc1, ctx1) = geom_piece_ctx(g1, p1)?;
     let (pc2, ctx2) = geom_piece_ctx(g2, p2)?;
+    if !poly_move_ok(&ctx1, p1) || !poly_move_ok(&ctx2, p2) {
+        return Err("fillet: can't fillet that polyline segment to a separate object in place — its corner-side end isn't free. Explode the polyline first, or pick the polyline so the end nearest the other object is its loose tip.".into());
+    }
 
     if radius < EPS {
         // Sharp corner: trim/extend both to their intersection nearest the picks.
@@ -447,6 +471,9 @@ pub fn chamfer_geoms(
     if d1 < 0.0 || d2 < 0.0 { return Err("chamfer: distances must be ≥ 0".into()); }
     let (pc1, ctx1) = geom_piece_ctx(g1, p1)?;
     let (pc2, ctx2) = geom_piece_ctx(g2, p2)?;
+    if !poly_move_ok(&ctx1, p1) || !poly_move_ok(&ctx2, p2) {
+        return Err("chamfer: can't chamfer that polyline segment to a separate object in place — its corner-side end isn't free. Explode the polyline first.".into());
+    }
     let mid = (p1 + p2) * 0.5;
     let corner = nearest_point(&piece_intersect(&pc1, &pc2), mid)
         .or_else(|| infinite_corner(&pc1, &pc2))
@@ -850,6 +877,52 @@ mod tests {
         if let Geom::Line(l) = out.g1_new {
             assert!(l.a.dist(Vec2::new(2.0, 0.0)).min(l.b.dist(Vec2::new(2.0, 0.0))) < 1e-6);
         } else { panic!(); }
+    }
+
+    #[test]
+    fn fillet_line_to_polyline_end_segment_moves_free_tip() {
+        // Open polyline: free tip (10,0) → interior (0,0) → free (0,10).
+        // Vertical line at x=20. Fillet the horizontal end segment (whose free
+        // tip (10,0) faces the line) — picking the polyline on the BODY side.
+        let pl = Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(10.0, 0.0), bulge: 0.0 },   // free tip (seg 0 start)
+                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },    // interior
+                PolyVertex { pos: Vec2::new(0.0, 10.0), bulge: 0.0 },   // free end
+            ],
+            closed: false,
+            widths: Vec::new(),
+        };
+        let line = Geom::Line(Line { a: Vec2::new(20.0, -5.0), b: Vec2::new(20.0, 5.0) });
+        let out = fillet_geoms(&line, Vec2::new(20.0, 4.0),
+                               &Geom::Polyline(pl), Vec2::new(3.0, 0.0), 2.0).unwrap();
+        assert!(out.arc.is_some(), "expected a fillet arc");
+        let Geom::Polyline(np) = out.g2_new else { panic!("polyline side should stay a polyline") };
+        // Free tip extended to the tangent point (18,0); interior + far end intact.
+        assert!(np.vertices[0].pos.dist(Vec2::new(18.0, 0.0)) < 1e-6,
+            "tip moved to {:?}", np.vertices[0].pos);
+        assert!(np.vertices[1].pos.dist(Vec2::new(0.0, 0.0)) < 1e-9, "interior moved!");
+        assert!(np.vertices[2].pos.dist(Vec2::new(0.0, 10.0)) < 1e-9, "far end moved!");
+    }
+
+    #[test]
+    fn fillet_line_to_polyline_interior_side_is_refused_not_garbage() {
+        // Same polyline, but pick near the FREE TIP (10,0): the corner-side
+        // vertex would then be the INTERIOR (0,0), which can't be moved in
+        // place — must error (suggesting explode), NOT mangle the polyline.
+        let pl = Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(10.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(0.0, 10.0), bulge: 0.0 },
+            ],
+            closed: false,
+            widths: Vec::new(),
+        };
+        let line = Geom::Line(Line { a: Vec2::new(20.0, -5.0), b: Vec2::new(20.0, 5.0) });
+        let err = fillet_geoms(&line, Vec2::new(20.0, 4.0),
+                               &Geom::Polyline(pl), Vec2::new(9.0, 0.0), 2.0).unwrap_err();
+        assert!(err.contains("Explode") || err.contains("free"), "msg was: {err}");
     }
 
     #[test]

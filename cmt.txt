@@ -22,6 +22,22 @@ as a red "NativeCommandError" even on success — check the final ref-update lin
 PART 1 — COMMITS (newest first), each with what changed & why
 ================================================================================
 
+---- (2026-06-25) FILLET line↔polyline: stop mangling the polyline ----
+Filleting a line to a polyline produced garbage (the polyline's whole shape
+distorted), while exploding the polyline first and filleting a bare segment
+worked. Cause: the line↔polyline path ALWAYS moved the polyline's FREE end
+vertex to the tangent point, even when the corner was on the INTERIOR side —
+yanking the wrong vertex across the drawing. Fix: pick the clicked segment's
+endpoint FARTHER from the pick (the corner side) as the one to trim to the
+tangent point; move it ONLY if it is a free end of an open polyline
+(poly_moved_vertex / poly_move_ok). If the corner-side vertex is interior
+(shared), refuse with a clear message ("explode the polyline first, or pick so
+the end nearest the other object is its loose tip") instead of producing
+garbage. Same guard added to chamfer_geoms. Ctx::PolyEnd → Ctx::Poly{pl,seg}
+(the end-segment-only restriction is gone; geometry decides). 2 tests
+(fillet_line_to_polyline_end_segment_moves_free_tip, ..._interior_side_is_
+refused_not_garbage). cad_kernel: 183 tests pass.
+
 ---- (2026-06-25) EXTEND line→tangent circle + Ttr tangent-pick snap noise ----
 Two issues from a session dump (draw a Ttr circle tangent to an arc + a line,
 then EXTEND both to it — the arc extended, the line said "no intersection"):
