@@ -41,10 +41,10 @@ in `cad_app::settings::UserEnv`. Every row tracks:
 | `AperBx` | Aperture box on/off | ○ Stub | — |
 | `BkgPlt` | Background plotting on/off | ○ Stub (no plot subsystem) | — |
 | `CrsACol` | Crossing‑selection area colour | ◐ Planned | (used today as hardcoded `Color32(120,230,120)` in app.rs window overlay) |
-| `CrsHrS` | Crosshair size (screen %) | ◐ Planned | settings preview only |
+| `CrsHrS` | Crosshair size (screen %) | **● Active** | `app.rs` — crosshair render uses `env.CrsHrS as f32 / 100.0`; settings slider (default 5) |
 | `DrDspM` | Dragging display during MOVE/COPY | ◐ Planned | (Move tool already shows ghost; will respect this flag once wired) |
 | `GalVw` | Block gallery view on/off | ○ Stub (no blocks) | — |
-| `HltSel` | Highlight selected objects | ◐ Planned | (selected dobjects already yellow; flag will gate it) |
+| `HltSel` | Highlight selected objects | **● Active** | `app.rs` — `if env.HltSel` gates the selected-dobject highlight colour (default true) |
 | `HpQckP` | Hatch quick preview on/off | ○ Stub (no hatch) | — |
 | `ImgHlt` | Image frame highlight on/off | ○ Stub (no raster) | — |
 | `IntsCol` | Intersection marker colour | ◐ Planned | (currently hardcoded `Color32(255,90,90)` in app.rs intersection render) |
@@ -61,7 +61,7 @@ in `cad_app::settings::UserEnv`. Every row tracks:
 | `RvClCrM` | Revcloud creation mode | ○ Stub (no revcloud) | — |
 | `RvClGrp` | Revcloud grip display | ○ Stub | — |
 | `SelAr` | Selection area effect | ◐ Planned | (window/crossing rect overlay already shown) |
-| `SelPrv` | Preview highlight of selection | ◐ Planned | (currently always on for hover-select in array dialog) |
+| `SelPrv` | Preview highlight of selection | **● Active** | `app.rs` — `if env.SelPrv` gates cursor-over hover preview (default true) |
 | `SelPrvL` | Selection preview dobject limit | ◐ Planned | — |
 | `TrkPth` | Tracking path display mode | ○ Stub | — |
 | `TrnDsp` | Object transparency display | ○ Stub (no per-dobject alpha yet) | — |
@@ -71,17 +71,18 @@ in `cad_app::settings::UserEnv`. Every row tracks:
 | `WmfBkg` | WMF background colour | ○ Stub (no WMF) | — |
 | `WmfFrg` | WMF foreground colour | ○ Stub | — |
 | `WpFrmM` | Frame display of wipeouts | ○ Stub (no wipeouts) | — |
+| `LodAnc` | APX (user-toggled draft display) dot-anchor strategy: 0=bbox center, 1=primitive center, 2=first vertex. APX mode is toggled by a status-bar button | **● Active** | `app.rs` — APX draft render anchor (default 0) |
 
 ## 2 — Selection & Grips
 
 | Short | Description | Status | Wired |
 |-------|-------------|--------|-------|
-| `GrClrS` | Selected (hot) grip colour | ◐ Planned | (currently hardcoded blue+white in `draw_grips`, app.rs) |
-| `GrClrU` | Unselected grip colour | ◐ Planned | (same) |
+| `GrClrS` | Selected (hot) grip colour | **● Active** | `app.rs draw_grips` — `env.GrClrS` (default 0xFF6464) |
+| `GrClrU` | Unselected grip colour | **● Active** | `app.rs draw_grips` — `env.GrClrU` (default 0x4099FF) |
 | `GrpBlk` | Show grips inside blocks | ○ Stub (no blocks) | — |
 | `GrpEnb` | Enable/disable grips | **● Active** | `app.rs` — toolbar button, `Command::GripsToggle`, `if self.env.GrpEnb` in render loop |
 | `GrpObjL` | Maximum dobjects for grip display | ◐ Planned | — |
-| `GrpSz` | Grip size (pixels) | ◐ Planned | (currently hardcoded `s = 4.0` in `draw_grips`) |
+| `GrpSz` | Grip size (pixels) | **● Active** | `app.rs draw_grips` — `env.GrpSz` (default 4) |
 | `GrpTip` | Grip hover tooltips on/off | ○ Stub | — |
 | `HidTxt` | Hide text during move/rotate | ○ Stub (no text) | — |
 | `ObjIsoM` | Object isolation mode | ○ Stub | — |
@@ -94,19 +95,25 @@ in `cad_app::settings::UserEnv`. Every row tracks:
 | `SelCyc` | Selection cycling on/off | ◐ Planned (relates to Tab cycling) | — |
 | `SelOfSc` | Select off-screen dobjects | ◐ Planned | — |
 | `SubSelM` | Subobject selection mode | ○ Stub (no subobjects) | — |
+| `GrpHvR` | Grip hover + grab radius (pixels) — within this distance a grip highlights and a click/drag grabs it | **● Active** | `app.rs` — grip hover highlight + grab tolerance (default 25) |
+| `SelDmTm` | Selection-drag activation hold time (ms) — a press becomes a window-drag only after being held this long; a faster press-drag is a click | **● Active** | `app.rs` click/drag classifier — the hold gate (default 250); see `CLICK_DRAG_HANDLER.md` |
 
 ## 3 — Object Snaps, Tracking & Precision
 
 | Short | Description | Status | Wired |
 |-------|-------------|--------|-------|
 | `OsnCrd` | Osnap coordinate override keyboard | ◐ Planned | — |
-| `PkBxSz` | Pickbox height (pixels) — click hit-test tolerance | ◌ Tentative (in code; `HitTolPx` may supersede it — keep & revisit) | — |
+| `PkBxSz` | Pickbox height (pixels) — click hit-test tolerance | **● Active** | `app.rs` — hit-test tolerance in selection / nearest-entity picks (default 10) |
 | `PolAdA` | Polar additional angles | ◐ Planned (needs polar tracking) | — |
 | `PolAng` | Polar angle setting | ◐ Planned | — |
 | `PolDst` | Polar snap distance | ◐ Planned | — |
 | `PolMod` | Polar tracking mode | ◐ Planned | — |
 | `SpTGSZ` | Object-snap target height (pixels) | **● Active** | `app.rs` — `world_radius = env.SpTGSZ as f64 / scale` in `find_all_snaps` call |
 | `TmpOvr` | Temporary override keys | ◐ Planned | — |
+| `GrdEnb` | Background grid display (AutoCAD `GRIDMODE`) — F7 toggles | **● Active** | `app.rs` — grid overlay render gate (default on) |
+| `GrdSnp` | Snap cursor to grid intersections (`SNAPMODE`) — F9 toggles; osnap wins over it | **● Active** | `app.rs` — rounds drafting coords to `GrdSpc` (default off) |
+| `GrdSpc` | Grid spacing in world units (`GRIDUNIT`) — shared by display grid + snap rounding | **● Active** | `app.rs` — grid draw + snap rounding (default 10.0) |
+| `CrdEnb` | **CARD** — cardinal-directions drafting lock (cursor H or V only from the anchor). AutoCAD `ORTHOMODE`. F8 / `card` cmd / status badge. Legacy key `OrtEnb` accepted on load. | **● Active** | `app.rs` — projects cursor onto the nearer axis (default off) |
 
 ## 4 — Editing & Behavior
 
@@ -121,7 +128,14 @@ in `cad_app::settings::UserEnv`. Every row tracks:
 | `BndTyp` | Xref bind type | ○ Stub (no xrefs) | — |
 | `CmDlgM` | Dialog boxes for PLOT, etc. | ○ Stub (no plot) | — |
 | `DblClkE` | Double-click editing on/off | ◐ Planned | — |
-| `EdgMod` | Edge-mode for trim / extend. ON = treat cutting / boundary edges as their infinite extensions for "imaginary intersection" cuts; OFF = use only intersections on the visible curve. AutoCAD analog: `EDGEMODE` | ◐ Planned (queued for Slice M.1 / M.2) | — |
+| `EdgMod` | Edge-mode for trim / extend. ON = treat cutting / boundary edges as their infinite extensions for "imaginary intersection" cuts; OFF = use only intersections on the visible curve. AutoCAD analog: `EDGEMODE` | **● Active** | `app.rs` — trim/extend honour `env.EdgMod` (default on) |
+| `FltRad` | Default fillet radius (`FILLETRAD`); set inline `fillet <r>`, persists | **● Active** | `app.rs` fillet — `env.FltRad` (default 0.0) |
+| `ChmDs1` | Default chamfer distance on the FIRST line (`CHAMFERA`) | **● Active** | `app.rs` chamfer — `env.ChmDs1` (default 0.0) |
+| `ChmDs2` | Default chamfer distance on the SECOND line (`CHAMFERB`) | **● Active** | `app.rs` chamfer — `env.ChmDs2` (default 0.0) |
+| `OfsDis` | Default offset distance (`OFFSETDIST`); set inline `offset <d>`, persists, bare `offset` reuses | **● Active** | `app.rs` offset — `env.OfsDis` (default 1.0) |
+| `WlThk` | Default wall thickness for the `wall` command (±t/2 about the centerline); set inline `wall <t>` | **● Active** | `app.rs` wall — `env.WlThk` (default 0.20) |
+| `TxHt` | Default text height (world units) for the `text` command | **● Active** | `app.rs` text — `env.TxHt` (default 0.25) |
+| `WlCnL` | Wall centerline visible — dashed half-alpha overlay on every `Geom::Wall` | **● Active** | `app.rs` wall render — `if env.WlCnL` (default true) |
 | `HpMaxA` | Maximum hatch area for preview | ○ Stub (no hatch) | — |
 | `HpObjW` | Hatch dobject warning limit | ○ Stub | — |
 | `HpSep` | Separate hatch dobjects on/off | ○ Stub | — |
@@ -135,7 +149,7 @@ in `cad_app::settings::UserEnv`. Every row tracks:
 | `SrfAsc` | Surface associativity | ○ Stub (no surfaces) | — |
 | `TblInd` | Table cell indicator on/off | ○ Stub (no tables) | — |
 | `TblTbr` | Table toolbar on/off | ○ Stub | — |
-| `TrmMod` | Trim/Fillet/Chamfer mode | ◐ Planned (needs trim/fillet) | — |
+| `TrmMd` | Trim mode shared by Fillet/Chamfer (`TRIMMODE`). `true`=trim originals back to the corner; `false`=keep full-length + add the arc/bevel separately ("No Trim"). Toggle `t`/`nt` at the prompt. (Canonical code name `TrmMd`; `TrmMod` was the original catalog spelling.) | **● Active** | `app.rs` fillet/chamfer — `env.TrmMd` (default true) |
 | `XEdit` | Edit in-place on/off | ○ Stub (no ref edit) | — |
 | `XFdCtl` | Ref-edit object fading | ○ Stub | — |
 
@@ -163,8 +177,8 @@ in `cad_app::settings::UserEnv`. Every row tracks:
 
 | Short | Description | Status | Wired |
 |-------|-------------|--------|-------|
-| `XrLdMd` | External-reference demand-loading | **● Active** | settings UI only (mode value persisted; no xref runtime yet) |
-| `XrTmpP` | Path for temporary xref copies | **● Active** | settings UI only |
+| `XrLdMd` | External-reference demand-loading | ◐ Planned (settings-only) | field exists + persisted + in UI; no xref runtime yet |
+| `XrTmpP` | Path for temporary xref copies | ◐ Planned (settings-only) | field exists + persisted + in UI; no xref runtime yet |
 | `XrCtl` | Xref log file on/off | ○ Stub | — |
 | `XrLyr` | Default layer for xref insertion | ○ Stub | — |
 | `XrNtfy` | Xref change notification | ○ Stub | — |
@@ -215,7 +229,7 @@ in `cad_app::settings::UserEnv`. Every row tracks:
 
 | Short | Description | Status | Wired |
 |-------|-------------|--------|-------|
-| `FlDlgM` | Suppress file-navigation dialogs | **● Active** | settings UI only (will gate native dialogs when file I/O lands) |
+| `FlDlgM` | Suppress file-navigation dialogs | ◐ Planned (settings-only) | field exists + persisted + in UI; will gate native dialogs when file I/O lands |
 | `FntAlt` | Alternate font when font not found | ○ Stub (no text) | — |
 | `FntMap` | Font mapping file path | ○ Stub | — |
 | `LspAsD` | Load acad.lsp into every drawing | ○ Stub (no LISP) | — |
@@ -243,6 +257,9 @@ in `cad_app::settings::UserEnv`. Every row tracks:
 | `StpPrSc` | Walk/fly steps per second | ○ Stub | — |
 | `SunPrW` | Sun properties window on/off | ○ Stub (no sun/3D) | — |
 | `UcsOrt` | Orthographic UCS toggle | ○ Stub (2D-only) | — |
+| `UcsIcn` | UCS origin-marker icon on/off (AutoCAD `UCSICON`) — origin dot + X/Y axis arrows | **● Active** | `app.rs` — UCS icon render (default on) |
+| `UcsMod` | UCS icon placement: 0=bottom-left corner always; 1=anchor at world (0,0) when visible (`UCSICON ORigin`) | **● Active** | `app.rs` — icon placement (default 0) |
+| `UcsAvP` | Avatar image path (PNG/SVG) drawn on the UCS icon X-axis; empty → placeholder rectangle | **● Active** | `app.rs` — UCS icon avatar; persisted (default empty) |
 | `VtDur` | Smooth view transition duration | ◐ Planned | — |
 | `VtEnbl` | Smooth view transition on/off | ◐ Planned | — |
 | `VtFps` | Smooth view transition speed (FPS) | ◐ Planned | — |
@@ -360,14 +377,65 @@ human memory across sessions — trust the file.
 
 ## Currently Active wiring (the short list)
 
-The full source of truth for what's actually wired today:
+**Status snapshot — 2026-06-24 (commit `36ee804`).** `UserEnv` currently
+declares **40 fields**. Of those:
 
-| Cryptic | Field | Wired in |
-|---------|-------|----------|
-| `SpTGSZ` | `env.SpTGSZ: u8` | `cad_app/src/app.rs` — `world_radius` in `find_all_snaps()` call site; also surfaced as the snap-window slider |
-| `GrpEnb` | `env.GrpEnb: bool` | `cad_app/src/app.rs` — toolbar "grips" button; `Command::GripsToggle` handler; `if self.env.GrpEnb` in canvas render loop |
-| `XrLdMd`, `XrTmpP`, `FlDlgM` | `env.XrLdMd: u8`, `env.XrTmpP: String`, `env.FlDlgM: bool` | settings persistence only — wiring lands when xref / file-I/O subsystems exist |
+- **28 ● Active** — read by behaviour code, not just the settings widget.
+- **3 settings-only** (`XrLdMd`, `XrTmpP`, `FlDlgM`) — persisted + in the UI,
+  but the subsystem they gate (xref / file-I/O) isn't built, so they don't yet
+  change runtime behaviour. Treated as "awaiting wiring".
+- **9 ◐ Planned widgets** (`AtDlgM`, `AtPrmM`, `CmDlgM`, `DrDspM`, `GrpBlk`,
+  `MnuBar`, `RllTp`, `TltEnb`, `WpFrmM`) — defined + have a settings widget,
+  feature not built.
+- The **~150 other rows** above are catalogue-only (`◐`/`○`/`◌`) — named here
+  for forward-compat but NOT yet fields in `UserEnv`.
 
-Everything else (~150) is **defined-or-pending** — present in `UserEnv`
-in name, surfaced in the settings UI in name, but not yet acting on the
-runtime. Wiring proceeds incrementally as features land.
+The 28 ● Active fields, by family:
+
+| Family | Fields |
+|--------|--------|
+| Snap / pick | `SpTGSZ`, `PkBxSz`, `CrsHrS` |
+| Selection | `SelDmTm`, `SelPrv`, `HltSel` |
+| Grips | `GrpEnb`, `GrpSz`, `GrpHvR`, `GrClrU`, `GrClrS` |
+| Editing defaults | `FltRad`, `ChmDs1`, `ChmDs2`, `OfsDis`, `WlThk`, `TxHt`, `TrmMd`, `EdgMod` |
+| Walls | `WlCnL` (+ `WlThk` above) |
+| Grid / CARD | `GrdEnb`, `GrdSnp`, `GrdSpc`, `CrdEnb` |
+| UCS icon | `UcsIcn`, `UcsMod`, `UcsAvP` |
+| Draft display | `LodAnc` |
+
+---
+
+## How to regenerate this status (run the same)
+
+This catalogue drifts as features land. **Do not hand-maintain the ●/◐ badges
+from memory** — re-derive them from the code. Run these three from the repo
+root; the union tells you the truth:
+
+```bash
+# 1. The fields that ACTUALLY EXIST in UserEnv right now:
+sed -n '/pub struct UserEnv/,/^}/p' cad_app/src/settings.rs \
+  | grep -oE 'pub [A-Za-z0-9_]+:' | sed 's/pub //; s/://'
+
+# 2. The fields READ by behaviour code (count per field).
+#    A field here with a count > its settings-widget reads is ● Active.
+#    Exclude settings.rs (the UI) + the env.save/get/set/txt plumbing:
+grep -rhoE 'env\.[A-Z][A-Za-z0-9_]+' \
+    cad_app/src/app.rs cad_app/src/app/ cad_app/src/gpu.rs cad_kernel/src/ cad_wall/src/ \
+  | grep -vE 'env\.(save|set|get|txt)' | sort | uniq -c | sort -rn
+
+# 3. UserEnv fields that have NO row in this file yet (need adding):
+for f in $(sed -n '/pub struct UserEnv/,/^}/p' cad_app/src/settings.rs \
+            | grep -oE 'pub [A-Za-z0-9_]+:' | sed 's/pub //; s/://'); do
+  grep -q "\`$f\`" Variables.md || echo "MISSING ROW: $f"
+done
+```
+
+**Classification rule:** a field is **● Active** iff it is read somewhere other
+than its own settings widget (check the file:line of each read with
+`grep -rn 'env.<Field>' cad_app/src`). A field that only appears in the settings
+window binding + `env.save()` is **◐ Planned** (defined + surfaced, not acting).
+A name that isn't a `UserEnv` field at all is catalogue-only (`◐`/`○`/`◌`).
+
+When you wire a planned field, follow §"Process — how new settings get added"
+above, then flip its badge to ● Active here and fill the Wired column. When you
+add a brand-new field, run command 3 to confirm it gets a row.
