@@ -172,6 +172,46 @@ impl Dim {
         }
     }
 
+    /// The VISIBLE line segments of the dimension — extension lines + the
+    /// dimension line for linear dims; the leader/dim line for radius &
+    /// diameter. Used for click hit-testing so the user can pick the
+    /// dimension by clicking ON the line they see (not only its def points).
+    /// Arrowheads/text aren't included; the dim-line endpoints cover the
+    /// arrow region and grip_points() covers the text anchor.
+    pub fn outline_segments(&self) -> Vec<(Vec2, Vec2)> {
+        match &self.kind {
+            DimKind::Linear { p1, p2, dimline_pos, ortho } => {
+                let u = match ortho {
+                    LinearOrtho::Horizontal => Vec2::new(1.0, 0.0),
+                    LinearOrtho::Vertical   => Vec2::new(0.0, 1.0),
+                    LinearOrtho::Aligned => {
+                        let d = *p2 - *p1;
+                        if d.len() < 1e-9 { Vec2::new(1.0, 0.0) } else {
+                            let l = d.len(); Vec2::new(d.x / l, d.y / l)
+                        }
+                    }
+                };
+                // Project each def point onto the dim line (through
+                // `dimline_pos`, direction `u`) to get the dim-line ends.
+                let proj = |q: Vec2| {
+                    let t = (q - *dimline_pos).dot(u);
+                    Vec2::new(dimline_pos.x + u.x * t, dimline_pos.y + u.y * t)
+                };
+                let d1 = proj(*p1);
+                let d2 = proj(*p2);
+                vec![(*p1, d1), (*p2, d2), (d1, d2)]   // ext1, ext2, dim line
+            }
+            DimKind::Radius { center, on_circle, leader_end } =>
+                vec![(*center, *on_circle), (*on_circle, *leader_end)],
+            DimKind::Diameter { center, on_circle, leader_end } => {
+                // Diameter line runs through the centre to the far side.
+                let opp = Vec2::new(center.x * 2.0 - on_circle.x,
+                                    center.y * 2.0 - on_circle.y);
+                vec![(opp, *on_circle), (*on_circle, *leader_end)]
+            }
+        }
+    }
+
     /// Return a copy of this Dim with every defining point passed
     /// through `f`. Used by the kernel transforms (translated, rotated,
     /// scaled, mirrored) so each transform implementation reduces to a

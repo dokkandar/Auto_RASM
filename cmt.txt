@@ -22,6 +22,16 @@ as a red "NativeCommandError" even on success — check the final ref-update lin
 PART 1 — COMMITS (newest first), each with what changed & why
 ================================================================================
 
+---- (2026-06-25) DIMENSION: click-pick on the dim line (was def-points only) ----
+A dimension could only be selected by window-pick, never by clicking on/near the
+line. Cause: Geom::Dimension::distance_to_point measured distance to the def/grip
+points ONLY, so a click on the dimension line or extension lines missed. Fix:
+new Dim::outline_segments() returns the VISIBLE segments (ext line 1 + ext line 2
++ dim line for linear; the diameter/leader line for radius/diameter — linear ends
+are the projections of p1/p2 onto the dim line through dimline_pos). distance_to_
+point now takes the min over those segments AND the grip points. cad_kernel: 180
+tests pass (new dimension_picks_on_the_dim_line_not_only_def_points).
+
 ---- (2026-06-25) FILLET / CHAMFER: no object-snap noise while picking objects ----
 Selecting an arc/curve during fillet showed the CEN osnap (aperture at the arc
 centre + the radius preview line to it) — pure noise, since fillet/chamfer pick
