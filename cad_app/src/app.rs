@@ -815,6 +815,10 @@ pub struct CadApp {
     qat_actions: Vec<QatAction>,
     /// Whether the QAT "customize" drop window is open.
     qat_customize_open: bool,
+    /// True only on the frame the drop window opened — suppresses the
+    /// click-outside dismissal for that frame (the opening click was the
+    /// chevron, which sits outside the window).
+    qat_just_opened: bool,
     /// Brand logo texture (loaded once from assets/logo.png). None until
     /// loaded; `logo_load_tried` prevents re-attempting every frame when the
     /// file is absent (falls back to a painted placeholder).
@@ -2221,6 +2225,7 @@ impl Default for CadApp {
             settings_open:     false,
             qat_actions:       QatAction::default_set(),
             qat_customize_open: false,
+            qat_just_opened:   false,
             logo_tex:          None,
             logo_load_tried:   false,
             refocus_cmd:       true,
@@ -13750,8 +13755,8 @@ impl CadApp {
         let size = egui::vec2(60.0, 56.0);
         let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
         let rect = resp.rect;
-        // Subtle column background + a divider on its right edge.
-        painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(30, 37, 46));
+        // No custom fill — let the toolbar panel background show through so the
+        // logo column matches the bar. Just a subtle divider on the right edge.
         painter.line_segment([rect.right_top(), rect.right_bottom()],
             egui::Stroke::new(1.0, egui::Color32::from_rgb(55, 64, 78)));
         // Lazy-load the logo texture once.
@@ -13786,41 +13791,77 @@ impl CadApp {
         }
     }
 
-    /// The "customize Quick Access Toolbar" drop window — one panel listing
-    /// every action with a checkbox; ticking adds it to the top strip,
-    /// unticking removes it. Order follows `QatAction::all()`.
+    /// The "Quick access" drop window — a narrow, neat list of actions, each
+    /// with a leading check when it's on the toolbar. Clicking a row toggles
+    /// it. No close button: ESC or a click outside dismisses it.
     fn qat_customize_window(&mut self, ctx: &egui::Context) {
         if !self.qat_customize_open { return; }
-        let mut open = self.qat_customize_open;
-        egui::Window::new("Customize Quick Access")
-            .collapsible(false)
+        let item_size = 13.0;
+        let bg = egui::Color32::from_rgb(45, 54, 66);
+        let frame = egui::Frame::popup(&ctx.style())
+            .fill(bg)
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 80, 95)))
+            .inner_margin(egui::Margin::symmetric(8.0, 6.0));
+        let win = egui::Window::new("qat_quick_access")
+            .title_bar(false)
             .resizable(false)
-            .open(&mut open)
+            .frame(frame)
             .anchor(egui::Align2::LEFT_TOP, egui::vec2(60.0, 44.0))
             .show(ctx, |ui| {
-                ui.label(egui::RichText::new("Show as shortcut on the top toolbar:")
-                    .size(12.0).color(egui::Color32::from_rgb(170, 185, 200)));
-                ui.add_space(4.0);
+                ui.set_width(150.0);
+                // Title — 20% bigger than the list items.
+                ui.label(egui::RichText::new("Quick access")
+                    .size(item_size * 1.2)
+                    .color(egui::Color32::from_rgb(210, 220, 232)));
+                ui.add_space(3.0);
+                ui.separator();              // single separation line
+                ui.add_space(3.0);
+                let accent = egui::Color32::from_rgb(120, 180, 235);
+                let text_c = egui::Color32::from_rgb(205, 216, 228);
                 for act in QatAction::all() {
-                    let mut on = self.qat_actions.contains(&act);
-                    if ui.checkbox(&mut on, act.label()).changed() {
+                    let on = self.qat_actions.contains(&act);
+                    let (rect, resp) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), 20.0), egui::Sense::click());
+                    if resp.hovered() {
+                        ui.painter().rect_filled(rect, 3.0,
+                            egui::Color32::from_rgb(58, 70, 86));
+                    }
+                    let font = egui::FontId::proportional(item_size);
+                    if on {
+                        ui.painter().text(
+                            egui::pos2(rect.left() + 6.0, rect.center().y),
+                            egui::Align2::LEFT_CENTER, "✓", font.clone(), accent);
+                    }
+                    ui.painter().text(
+                        egui::pos2(rect.left() + 22.0, rect.center().y),
+                        egui::Align2::LEFT_CENTER, act.label(), font, text_c);
+                    if resp.clicked() {
                         if on {
-                            // Re-insert in canonical order.
+                            self.qat_actions.retain(|a| *a != act);
+                        } else {
+                            // Re-insert keeping canonical order.
                             self.qat_actions = QatAction::all().into_iter()
                                 .filter(|a| *a == act || self.qat_actions.contains(a))
                                 .collect();
-                        } else {
-                            self.qat_actions.retain(|a| *a != act);
                         }
                     }
                 }
-                ui.add_space(6.0);
-                ui.separator();
-                if ui.button("Reset to default").clicked() {
-                    self.qat_actions = QatAction::default_set();
-                }
             });
-        self.qat_customize_open = open;
+        // Dismiss on ESC, or on a click outside the drop window. Skip the
+        // outside-click on the very frame it opened (that press was the
+        // chevron itself, which lives outside the window rect).
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.qat_customize_open = false;
+        } else if self.qat_just_opened {
+            self.qat_just_opened = false;
+        } else if let Some(win) = win {
+            let rect = win.response.rect;
+            let clicked_outside = ctx.input(|i| {
+                i.pointer.any_pressed()
+                    && i.pointer.interact_pos().is_some_and(|p| !rect.contains(p))
+            });
+            if clicked_outside { self.qat_customize_open = false; }
+        }
     }
 
     /// Re-issue the fillet prompt with the current radius, trim mode,
@@ -16845,7 +16886,9 @@ fn paint_qat_icon(painter: &egui::Painter, r: egui::Rect, act: QatAction, col: e
 /// (the Office/AutoCAD Quick-Access drop button the user described as "arrow
 /// with a small line on top").
 fn qat_customize_button(ui: &mut egui::Ui, open: bool) -> bool {
-    let size = egui::vec2(22.0, 30.0);
+    // Chevron uses the same colour as the menu/category text.
+    let col = ui.visuals().widgets.inactive.fg_stroke.color;
+    let size = egui::vec2(20.0, 28.0);
     let (resp, painter) = ui.allocate_painter(size, egui::Sense::click());
     let rect = resp.rect;
     let bg = if open {
@@ -16856,7 +16899,6 @@ fn qat_customize_button(ui: &mut egui::Ui, open: bool) -> bool {
         egui::Color32::TRANSPARENT
     };
     painter.rect(rect, 4.0, bg, egui::Stroke::NONE);
-    let col = egui::Color32::from_rgb(205, 216, 228);
     let cx = rect.center().x;
     let top = rect.top() + 10.0;
     // Short horizontal bar.
@@ -18432,7 +18474,12 @@ impl eframe::App for CadApp {
                         }
                         ui.add_space(2.0);
                         if qat_customize_button(ui, self.qat_customize_open) {
-                            self.qat_customize_open = !self.qat_customize_open;
+                            if self.qat_customize_open {
+                                self.qat_customize_open = false;
+                            } else {
+                                self.qat_customize_open = true;
+                                self.qat_just_opened = true;
+                            }
                         }
                         // Product title, far right.
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
