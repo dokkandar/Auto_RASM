@@ -956,6 +956,11 @@ pub struct CadApp {
     tool:          Tool,
     arc_method:    ArcMethod,
     arc_picker_open: bool,
+    /// The last point PICKED/placed during a draw command (AutoCAD's "last
+    /// point"). When a draw tool/flow is waiting for its FIRST point, pressing
+    /// Enter/Space uses this point — so a new line/arc/circle/… continues from
+    /// where the previous command ended.
+    last_point:    Option<Vec2>,
     pending:       Vec<Vec2>,
     /// Per-segment bulge for the polyline tool. `pending_bulges[i]` is the
     /// AutoCAD bulge (tan(theta/4)) of the segment from `pending[i]` to
@@ -2590,6 +2595,7 @@ impl Default for CadApp {
             btr_awaiting_name:   false,
             selected:      None,
             tool:          Tool::None,
+            last_point:    None,
             arc_method:    ArcMethod::ThreePoints,
             arc_picker_open: false,
             pending:       Vec::new(),
@@ -3143,6 +3149,7 @@ impl CadApp {
                             if dir.len() > EPS {
                                 let p = anchor + dir / dir.len() * dist;
                                 if self.tool == Tool::Line {
+                                    self.last_point = Some(p);
                                     self.pending.push(p);
                                     self.try_finalise();
                                 } else if let MoveState::WaitingForDest(base)
@@ -4673,7 +4680,10 @@ impl CadApp {
                 let d1 = self.env.ChmDs1;
                 let d2 = self.env.ChmDs2;
                 self.chamfer_state = ChamferState::WaitingForFirst(d1, d2);
-                self.chamfer_multiple = false;
+                // Continuous by default (like fillet): chamfer pair after pair
+                // until Esc. `D` changes distances mid-command; `M` toggles
+                // back to single-shot.
+                self.chamfer_multiple = true;
                 self.refresh_chamfer_prompt();
             }
             Ok(Command::Join) => {
@@ -13520,6 +13530,35 @@ impl CadApp {
     /// All current CIRCLE steps accept a point/coordinate.
     fn flow_wants_point(&self) -> bool { self.cmd_flow.is_some() }
 
+    /// Pending-based draw tools that capture their first point with a click.
+    fn draw_tool_wants_first_point(&self) -> bool {
+        matches!(self.tool,
+            Tool::Line | Tool::Arc | Tool::Ellipse | Tool::EllipseArc
+            | Tool::Polyline | Tool::Spline | Tool::Rectangle | Tool::Point)
+    }
+
+    /// Enter/Space at a draw tool's FIRST-point prompt: feed the remembered
+    /// `last_point` as that point so the new command continues from where the
+    /// previous one ended (AutoCAD "last point"). Returns true if consumed.
+    fn feed_first_point_from_last(&mut self) -> bool {
+        let Some(p) = self.last_point else { return false; };
+        // CIRCLE / ARC / cmd-flow waiting for a point.
+        if self.cmd_flow.is_some() && self.flow_wants_point() {
+            self.flow_input_point(p);
+            self.refocus_cmd = true;
+            return true;
+        }
+        // Pending-based draw tool with no point captured yet (first point).
+        if self.pending.is_empty() && self.draw_tool_wants_first_point() {
+            self.pending.push(p);
+            self.last_point = Some(p);
+            self.try_finalise();
+            self.refocus_cmd = true;
+            return true;
+        }
+        false
+    }
+
     /// Record (current prompt, reply) into the transcript + log. Call BEFORE
     /// advancing the step.
     fn flow_record(&mut self, reply: impl Into<String>) {
@@ -13563,6 +13602,7 @@ impl CadApp {
     /// A POINT answer — a canvas click (already snapped) or a typed `x,y`.
     fn flow_input_point(&mut self, p: Vec2) {
         let step = match self.cmd_flow.as_ref() { Some(f) => f.circle, None => return };
+        self.last_point = Some(p);   // remember for Enter-continues-from-last-point
         let r = format!("{:.3},{:.3}", p.x, p.y);
         match step {
             CircleStep::Center      => self.flow_to(r, CircleStep::Radius(p)),
@@ -14934,7 +14974,14 @@ impl CadApp {
                 self.expand_cutter_geoms(&d.geom, &mut cutter_geoms, 0);
             }
         }
-        if cutter_geoms.is_empty() {
+        // A POLYLINE target with no other cutters is still valid: the clicked
+        // segment meets no boundary, so it should be REMOVED (the kernel splits
+        // the polyline at that segment). Only non-polyline targets need a real
+        // cutter — for a Line/Arc "no cutters" means nothing to do.
+        let target_is_polyline = matches!(
+            self.doc.dobjects.get(target_idx).map(|d| &d.geom),
+            Some(Geom::Polyline(_)));
+        if cutter_geoms.is_empty() && !target_is_polyline {
             // No OTHER dobjects to cut against → roll back, fail.
             if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
             self.history.push(format!(
@@ -18574,6 +18621,12 @@ impl eframe::App for CadApp {
             self.history.push(format!("  SNAP {}", if self.env.GrdSnp { "on" } else { "off" }));
         }
 
+        // Ctrl+Z — Undo. Consumed so the command-line TextEdit doesn't also undo
+        // its own typed text; Ctrl+Z always undoes the DRAWING (AutoCAD-style).
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)) {
+            self.run_command("undo");
+        }
+
         // global Esc: cancel any in-progress draw or pick / intersect / select mode
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.pending.clear();
@@ -18876,6 +18929,13 @@ impl eframe::App for CadApp {
             self.btr_awaiting_name = false;
             if space_now { self.cmd.clear(); }
             self.finish_block_task_recorder();
+            return;
+        }
+        // Draw tool at its FIRST-point prompt: Enter/Space continues from the
+        // last picked point (AutoCAD "last point"). Only fires when nothing is
+        // pending yet, so it never steals Enter from finish/close.
+        if trigger && cmd_is_empty && self.feed_first_point_from_last() {
+            if space_now { self.cmd.clear(); }
             return;
         }
         // Insert ANGLE step — empty Enter = 0° rotation, place + cut.
@@ -21535,6 +21595,12 @@ impl eframe::App for CadApp {
                     // point (line endpoint, move base/dest, …).
                     let click_world = snap_hit.map(|h| h.point)
                         .unwrap_or_else(|| self.apply_constraints(world));
+                    // Remember the last picked point during a draw tool/flow, so
+                    // Enter/Space at the next command's first-point prompt
+                    // continues from here (AutoCAD "last point").
+                    if self.tool != Tool::None || self.cmd_flow.is_some() {
+                        self.last_point = Some(click_world);
+                    }
                     // SESSION RECORDER — every canvas click is captured
                     // with screen + world coords, hit-test result, tool,
                     // and a one-line state summary so the reader can
@@ -23770,9 +23836,16 @@ impl eframe::App for CadApp {
                                     append_arc_world_samples(a, b, bulge, &mut pts);
                                     let mm = pts.len().max(1);
                                     for (j, pt) in pts.iter().enumerate() {
-                                        if !first && j == 0 { continue; }
                                         let t = if mm > 1 { j as f64 / (mm - 1) as f64 } else { 0.0 };
-                                        cl.push((*pt, sw + (ew - sw) * t));
+                                        let w = sw + (ew - sw) * t;
+                                        if !first && j == 0 {
+                                            // coincident re-emit only on a width step
+                                            if let Some(&(_, pw)) = cl.last() {
+                                                if (pw - w).abs() > 1e-9 { cl.push((*pt, w)); }
+                                            }
+                                            continue;
+                                        }
+                                        cl.push((*pt, w));
                                     }
                                 };
                                 let mut cl: Vec<(Vec2, f64)> = Vec::new();
@@ -24967,9 +25040,21 @@ fn polyline_width_centerline(p: &Polyline) -> Vec<(Vec2, f64)> {
         append_arc_world_samples(a, b, bulge, &mut pts);   // a + interior + b
         let mm = pts.len().max(1);
         for (j, pt) in pts.iter().enumerate() {
-            if i > 0 && j == 0 { continue; }               // dedup shared vertex
             let t = if mm > 1 { j as f64 / (mm - 1) as f64 } else { 0.0 };
-            cl.push((*pt, sw + (ew - sw) * t));
+            let w = sw + (ew - sw) * t;     // at j==0, w == sw (this seg's start)
+            if i > 0 && j == 0 {
+                // The shared start vertex is already in `cl` as segment i-1's
+                // end. Re-emit a COINCIDENT point only when the width STEPS
+                // here (sw_i != ew_{i-1}); otherwise dedup. This stops the first
+                // segment after a width change from falsely tapering.
+                if let Some(&(_, prev_w)) = cl.last() {
+                    if (prev_w - w).abs() > 1e-9 {
+                        cl.push((*pt, w));
+                    }
+                }
+                continue;
+            }
+            cl.push((*pt, w));
         }
     }
     cl

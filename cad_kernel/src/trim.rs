@@ -26,9 +26,12 @@ fn trim_polyline_connected(
     let a_pt = p.vertices[best_i].pos;        // start of clicked segment
     let b_pt = p.vertices[best_i + 1].pos;    // end of clicked segment
     let w_clicked = p.widths.get(best_i).copied().unwrap_or((0.0, 0.0));
+    // Intersects a cutter → trim normally. No intersection → REMOVE the whole
+    // clicked segment (empty pieces): the polyline splits into a "before" run
+    // ending at v[best_i] and an "after" run starting at v[best_i+1].
     let pieces = match segs[best_i].trim_at(cutters, pick, edge_mode) {
         Ok(ps) => ps,
-        Err(_) => vec![segs[best_i].clone()],
+        Err(_) => Vec::new(),
     };
     let near = |x: Vec2, y: Vec2| (x - y).len() < 1e-6;
     let ep = |g: &Geom| -> (Vec2, Vec2) {
@@ -51,6 +54,8 @@ fn trim_polyline_connected(
         if near(pa, a_pt) || near(pb, a_pt) { start_piece = Some(pc); }
         else if near(pa, b_pt) || near(pb, b_pt) { end_piece = Some(pc); }
     }
+    // Non-width polylines keep EMPTY widths in their runs (so they stay plain).
+    let has_w = !p.widths.is_empty();
     let mut out: Vec<Geom> = Vec::new();
     // --- before run: v[0..=best_i] (+ start piece's far end) ---
     {
@@ -66,7 +71,10 @@ fn trim_polyline_connected(
             wb.push(w_clicked);
         }
         if vb.len() >= 2 {
-            out.push(Geom::Polyline(Polyline { vertices: vb, closed: false, widths: wb }));
+            out.push(Geom::Polyline(Polyline {
+                vertices: vb, closed: false,
+                widths: if has_w { wb } else { Vec::new() },
+            }));
         }
     }
     // --- after run: (end piece's cut end +) v[best_i+1..] ---
@@ -85,7 +93,10 @@ fn trim_polyline_connected(
             if i < n - 1 { wa.push(p.widths.get(i).copied().unwrap_or((0.0, 0.0))); }
         }
         if va.len() >= 2 {
-            out.push(Geom::Polyline(Polyline { vertices: va, closed: false, widths: wa }));
+            out.push(Geom::Polyline(Polyline {
+                vertices: va, closed: false,
+                widths: if has_w { wa } else { Vec::new() },
+            }));
         }
     }
     // Fallback: nothing chained into a run (e.g. a 2-vertex polyline) — keep the
@@ -156,7 +167,10 @@ impl Geom {
             let c_eff = if edge_mode { c.extended_for_edgemode() } else { c.clone() };
             hits.extend(intersect(self, &c_eff));
         }
-        if hits.is_empty() {
+        // A POLYLINE is handled per-segment below: a clicked segment that meets
+        // no cutter is REMOVED, so an all-miss polyline is still valid (it just
+        // deletes that segment). Only non-polyline targets need a real hit.
+        if hits.is_empty() && !matches!(self, Geom::Polyline(_)) {
             return Err("trim: target has no intersection with the cutting edges");
         }
 
@@ -369,24 +383,28 @@ impl Geom {
                     if d < best_d { best_d = d; best_i = i; }
                 }
                 let has_w = !p.widths.is_empty();
-                // WIDTH + OPEN: keep CONNECTED runs so corners stay mitred and
-                // width is preserved. Trimming the clicked segment splits the
-                // polyline into a "before" run and an "after" run at the cut.
-                if has_w && !p.closed {
+                // OPEN polyline: keep CONNECTED runs so the rest stays a single
+                // polyline (mitred corners + widths preserved). Trimming the
+                // clicked segment splits it into a "before" run and an "after"
+                // run at the cut; a segment that meets no cutter is removed.
+                if !p.closed {
                     return Ok(trim_polyline_connected(p, &segs, best_i, cutters, pick, edge_mode));
                 }
-                // Otherwise: EXPLODE into independent Line/Arc segments (v1).
+                // CLOSED polyline: EXPLODE into independent Line/Arc segments (v1).
                 let mut out = Vec::new();
                 for (i, s) in segs.into_iter().enumerate() {
                     let w = p.widths.get(i).copied().unwrap_or((0.0, 0.0));
                     if i == best_i {
                         match s.trim_at(cutters, pick, edge_mode) {
+                            // Intersects a cutter → normal trim (keep the pieces).
                             Ok(pieces) => {
                                 for piece in pieces {
                                     out.push(if has_w { wrap_with_width(piece, w) } else { piece });
                                 }
                             }
-                            Err(_) => out.push(if has_w { wrap_with_width(s, w) } else { s }),
+                            // No intersection with any boundary → REMOVE the
+                            // whole clicked segment (push nothing).
+                            Err(_) => {}
                         }
                     } else {
                         out.push(if has_w { wrap_with_width(s, w) } else { s });

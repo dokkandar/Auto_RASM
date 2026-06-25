@@ -22,6 +22,57 @@ as a red "NativeCommandError" even on success — check the final ref-update lin
 PART 1 — COMMITS (newest first), each with what changed & why
 ================================================================================
 
+---- (2026-06-25) keys: Ctrl+Z = Undo ----
+Ctrl+Z now undoes the drawing. Consumed via input_mut.consume_key so the
+command-line TextEdit doesn't also undo its own typed text — Ctrl+Z is always
+the drawing undo (AutoCAD-style). Calls run_command("undo"). Added after the
+F7/F8/F9 handlers in update().
+
+---- (2026-06-25) pline width: DXF/RSM persistence + chamfer continuous + taper fix ----
+1. PERSISTENCE (Stage 4): polyline tapered width now survives save/reload.
+   - RSM bumped to v4: after the polyline vertices, write u32 count + (start,end)
+     f64 per segment; read gated on ver>=4 (older files → empty widths).
+   - DXF LWPOLYLINE: write per-vertex 40/41 (start/end width of the segment at
+     that vertex) when non-zero; read parses 40/41 per vertex AND the constant-
+     width 43, maps to per-segment widths (n-1 open / n closed), empty when all
+     zero. Round-trip tests added (cad_io: 19 pass).
+2. CHAMFER continuous by default (mirror of fillet): loop until Esc; `D` changes
+   distances mid-command; `M` single-shot. (chamfer_multiple = true at start.)
+3. TAPER QUIRK fixed: polyline_width_centerline (and the live-preview push_seg)
+   emitted one width per vertex, so the first segment after a width change
+   tapered old->new. Now a COINCIDENT point carrying the new start width is
+   emitted only when the width STEPS at a shared vertex; fill_width_strip already
+   skips the zero-length span. Uniform segments after a width change stay uniform
+   (a clean step at the change).
+
+---- (2026-06-24) draw: Enter/Space at first-point = continue from last point ----
+For draw tools that ask for a start point (line, arc, circle, ellipse, polyline,
+rectangle, spline, point), pressing Enter or Space INSTEAD of picking now uses
+the last point drawn in the previous command (AutoCAD "last point"). New field
+CadApp.last_point: Option<Vec2>, set on every draw-tool click (where click_world
+is computed), in flow_input_point (circle/arc + typed coords), and the Line DDE
+path. New helpers draw_tool_wants_first_point + feed_first_point_from_last;
+called in the empty-Enter cascade (only when nothing is pending yet, so it never
+steals Enter from finish/close). cmd_flow tools route via flow_input_point;
+pending tools via pending.push + try_finalise.
+
+---- (2026-06-24) trim: click a polyline segment with no boundary → remove it ----
+When trimming a polyline, clicking a target segment that does NOT intersect any
+selected cutter now REMOVES that whole segment (was: kept). Connected-runs path
+splits the polyline at the removed segment (before-run + after-run); explode
+path drops the clicked segment, keeps the rest. Segment that crosses a cutter
+still trims normally. (cad_kernel/src/trim.rs)
+App-side (cad_app apply_trim_pick): a POLYLINE target with NO other cutters
+(e.g. the polyline itself was the only thing selected) no longer errors "no
+other cutters available" — it proceeds with an empty cutter list so the clicked
+segment is removed. Non-polyline targets still require a real cutter.
+Kernel trim_at top guard ("target has no intersection with the cutting edges")
+is now SKIPPED for Polyline targets (the per-segment logic handles miss = remove).
+ALL OPEN polylines now go through the connected-runs path (was width-only), so
+trimming/removing a segment keeps the rest as a single polyline instead of
+exploding to bare Lines (non-width runs carry EMPTY widths). Updated the
+trim_polyline test to expect 2 polylines. Closed polylines still explode (v1).
+
 ---- ac62164 (2026-06-24) fillet: continuous by default ----
 FILLET now loops: pick pair after pair until Esc. `R` changes radius mid-command
 (persisted to env.FltRad as next default); `M` toggles single-shot; `T` toggles
@@ -177,6 +228,7 @@ GLOBAL KEYBOARD KEYS
   Tab        Cycle snap candidates under the cursor
   Ctrl+C / Ctrl+V   Copy / Paste (clipboard events)
   Ctrl+G     Group the current selection
+  Ctrl+Z     Undo (drawing undo; consumed so it never undoes cmd-line text)
   F7         Toggle grid (env.GrdEnb)
   F8         Toggle CARD — cardinal/ortho drafting lock (cursor H or V only)
   F9         Toggle grid snap (env.GrdSnp)

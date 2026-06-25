@@ -68,7 +68,11 @@ const MAGIC: [u8; 4] = *b"RSM\x01";
 // v4: + embedded raster-image underlays section (after wall styles).
 // v5: + BlockRef `mirror_x` flag (after rotation in the geom-12 record).
 // v6: + BlockRef `scale_y` (after mirror_x) — per-axis scale / stretched blocks.
-const VERSION: u16  = 6;
+// v7: + per-segment polyline widths (in the geom polyline record). NOTE: the
+//     HSI windows-ui branch shipped this as "v4"; renumbered to v7 here because
+//     our v4/v5/v6 were already taken by raster / mirror_x / scale_y. The width
+//     reader is therefore gated on ver >= 7 so v4..v6 files (no widths) load.
+const VERSION: u16  = 7;
 
 // =============================================================================
 //   WRITER
@@ -400,6 +404,12 @@ fn write_geom(w: &mut Vec<u8>, g: &Geom) {
             for v in &p.vertices {
                 write_vec2(w, v.pos);
                 write_f64(w, v.bulge);
+            }
+            // v7: per-segment (start,end) widths. Empty = thin (count 0).
+            write_u32(w, p.widths.len() as u32);
+            for &(sw, ew) in &p.widths {
+                write_f64(w, sw);
+                write_f64(w, ew);
             }
         }
         Geom::Hatch(h) => {
@@ -823,7 +833,17 @@ fn read_geom(r: &mut R, ver: u16) -> Result<Geom, String> {
             for _ in 0..n {
                 vertices.push(PolyVertex { pos: r.vec2()?, bulge: r.f64()? });
             }
-            Geom::Polyline(Polyline { vertices, closed, widths: Vec::new() })
+            // v7: per-segment (start,end) widths (absent / empty in v4..v6 and
+            // older files — see the VERSION note about the renumber from HSI v4).
+            let widths = if ver >= 7 {
+                let wn = r.u32()? as usize;
+                let mut ws = Vec::with_capacity(wn);
+                for _ in 0..wn { ws.push((r.f64()?, r.f64()?)); }
+                ws
+            } else {
+                Vec::new()
+            };
+            Geom::Polyline(Polyline { vertices, closed, widths })
         }
         7 => {
             let pattern = match r.u8()? {
@@ -1152,6 +1172,24 @@ mod tests {
         }.into());
         let back = round_trip(&doc);
         assert_eq!(back.dobjects.len(), 7);
+    }
+
+    #[test]
+    fn polyline_widths_round_trip() {
+        let mut doc = Document::default();
+        doc.push(Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(4.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(4.0, 4.0), bulge: 0.0 },
+            ],
+            closed: false,
+            widths: vec![(2.0, 2.0), (1.0, 3.0)],
+        }.into());
+        let back = round_trip(&doc);
+        if let Geom::Polyline(p) = &back.dobjects[0].geom {
+            assert_eq!(p.widths, vec![(2.0, 2.0), (1.0, 3.0)]);
+        } else { panic!("not a polyline"); }
     }
 
     #[test]
