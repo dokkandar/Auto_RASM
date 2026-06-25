@@ -48,6 +48,19 @@ Legend: 🔴 broken / confirmed not working · 🟡 partial / needs follow-up ·
 
 ---
 
+## 🟡 UI REDESIGN — in progress
+
+### U1. Quick Access Toolbar — real logo PNG
+- The top-line logo is a PAINTED PLACEHOLDER (teal gear-ring + gold R). The real
+  brand PNG needs wiring: save it to `cad_app/assets/logo.png`, add the `image`
+  crate (or egui_extras image loader), load it once into a texture, show it in
+  `draw_logo`. ⚪ I can't extract the pasted image — user must drop the file.
+
+### U2. Quick Access Toolbar — persistence + real icons
+- `qat_actions` customization is in-session only (resets on restart) — persist it
+  (e.g. in UserEnv / a small config). Shortcut glyphs are simple painted
+  placeholders; swap for real icon art when the command-icon set is designed.
+
 ## 🔵 NOT STARTED / DEFERRED
 
 ### 5. Groups not persisted to `.rsm`
