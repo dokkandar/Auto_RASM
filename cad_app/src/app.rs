@@ -819,6 +819,9 @@ pub struct CadApp {
     /// click-outside dismissal for that frame (the opening click was the
     /// chevron, which sits outside the window).
     qat_just_opened: bool,
+    /// Screen rect of the customize chevron, captured each frame so the drop
+    /// window can open directly beneath it.
+    qat_chevron_rect: Option<egui::Rect>,
     /// Brand logo texture (loaded once from assets/logo.png). None until
     /// loaded; `logo_load_tried` prevents re-attempting every frame when the
     /// file is absent (falls back to a painted placeholder).
@@ -2226,6 +2229,7 @@ impl Default for CadApp {
             qat_actions:       QatAction::default_set(),
             qat_customize_open: false,
             qat_just_opened:   false,
+            qat_chevron_rect:  None,
             logo_tex:          None,
             logo_load_tried:   false,
             refocus_cmd:       true,
@@ -13755,10 +13759,8 @@ impl CadApp {
         let size = egui::vec2(60.0, 56.0);
         let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
         let rect = resp.rect;
-        // No custom fill — let the toolbar panel background show through so the
-        // logo column matches the bar. Just a subtle divider on the right edge.
-        painter.line_segment([rect.right_top(), rect.right_bottom()],
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(55, 64, 78)));
+        // No custom fill or divider — the logo sits flush on the toolbar
+        // panel background.
         // Lazy-load the logo texture once.
         if self.logo_tex.is_none() && !self.logo_load_tried {
             self.logo_tex = load_logo_texture(ui.ctx());
@@ -13781,13 +13783,12 @@ impl CadApp {
     /// Run a Quick Access Toolbar shortcut.
     fn run_qat_action(&mut self, act: QatAction) {
         match act {
-            QatAction::New       => self.run_command("clear"),
-            QatAction::Open      => self.open_file_dialog(FileDialogMode::Open, ".rsm"),
-            QatAction::Save      => self.do_save_current(),
-            QatAction::SaveAsDxf => self.open_file_dialog(FileDialogMode::Save, ".dxf"),
-            QatAction::SaveAsRsm => self.open_file_dialog(FileDialogMode::Save, ".rsm"),
-            QatAction::Undo      => self.run_command("undo"),
-            QatAction::Redo      => self.run_command("redo"),
+            QatAction::New    => self.run_command("clear"),
+            QatAction::Open   => self.open_file_dialog(FileDialogMode::Open, ".rsm"),
+            QatAction::Save   => self.do_save_current(),
+            QatAction::SaveAs => self.open_file_dialog(FileDialogMode::Save, ".rsm"),
+            QatAction::Undo   => self.run_command("undo"),
+            QatAction::Redo   => self.run_command("redo"),
         }
     }
 
@@ -13797,18 +13798,35 @@ impl CadApp {
     fn qat_customize_window(&mut self, ctx: &egui::Context) {
         if !self.qat_customize_open { return; }
         let item_size = 13.0;
+        let item_font = egui::FontId::proportional(item_size);
+        let accent = egui::Color32::from_rgb(120, 180, 235);
+        let text_c = egui::Color32::from_rgb(205, 216, 228);
+        // Width = check column + the longest label (or the title) + padding.
+        let check_col = 22.0;
+        let label_w = |s: &str, sz: f32| ctx.fonts(|f| f.layout_no_wrap(
+            s.to_string(), egui::FontId::proportional(sz), text_c).size().x);
+        let longest = QatAction::all().iter()
+            .map(|a| label_w(a.label(), item_size))
+            .fold(0.0_f32, f32::max);
+        let title_w = label_w("Quick access", item_size * 1.2);
+        let content_w = (check_col + longest + 6.0).max(title_w);
+
         let bg = egui::Color32::from_rgb(45, 54, 66);
         let frame = egui::Frame::popup(&ctx.style())
             .fill(bg)
             .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 80, 95)))
             .inner_margin(egui::Margin::symmetric(8.0, 6.0));
+        // Open directly beneath the chevron.
+        let pos = self.qat_chevron_rect
+            .map(|r| egui::pos2(r.left(), r.bottom() + 2.0))
+            .unwrap_or(egui::pos2(60.0, 44.0));
         let win = egui::Window::new("qat_quick_access")
             .title_bar(false)
             .resizable(false)
             .frame(frame)
-            .anchor(egui::Align2::LEFT_TOP, egui::vec2(60.0, 44.0))
+            .fixed_pos(pos)
             .show(ctx, |ui| {
-                ui.set_width(150.0);
+                ui.set_width(content_w);
                 // Title — 20% bigger than the list items.
                 ui.label(egui::RichText::new("Quick access")
                     .size(item_size * 1.2)
@@ -13816,8 +13834,6 @@ impl CadApp {
                 ui.add_space(3.0);
                 ui.separator();              // single separation line
                 ui.add_space(3.0);
-                let accent = egui::Color32::from_rgb(120, 180, 235);
-                let text_c = egui::Color32::from_rgb(205, 216, 228);
                 for act in QatAction::all() {
                     let on = self.qat_actions.contains(&act);
                     let (rect, resp) = ui.allocate_exact_size(
@@ -13826,15 +13842,19 @@ impl CadApp {
                         ui.painter().rect_filled(rect, 3.0,
                             egui::Color32::from_rgb(58, 70, 86));
                     }
-                    let font = egui::FontId::proportional(item_size);
+                    // Painted checkmark (the font lacks a ✓ glyph).
                     if on {
-                        ui.painter().text(
-                            egui::pos2(rect.left() + 6.0, rect.center().y),
-                            egui::Align2::LEFT_CENTER, "✓", font.clone(), accent);
+                        let cy = rect.center().y;
+                        let cx = rect.left() + 7.0;
+                        let s = egui::Stroke::new(1.8, accent);
+                        ui.painter().line_segment(
+                            [egui::pos2(cx, cy + 1.0), egui::pos2(cx + 3.0, cy + 4.0)], s);
+                        ui.painter().line_segment(
+                            [egui::pos2(cx + 3.0, cy + 4.0), egui::pos2(cx + 8.0, cy - 4.0)], s);
                     }
                     ui.painter().text(
-                        egui::pos2(rect.left() + 22.0, rect.center().y),
-                        egui::Align2::LEFT_CENTER, act.label(), font, text_c);
+                        egui::pos2(rect.left() + check_col, rect.center().y),
+                        egui::Align2::LEFT_CENTER, act.label(), item_font.clone(), text_c);
                     if resp.clicked() {
                         if on {
                             self.qat_actions.retain(|a| *a != act);
@@ -16718,33 +16738,30 @@ pub enum QatAction {
     New,
     Open,
     Save,
-    SaveAsDxf,
-    SaveAsRsm,
+    SaveAs,
     Undo,
     Redo,
 }
 
 impl QatAction {
     /// Every action offered in the customize drop window, in display order.
-    fn all() -> [QatAction; 7] {
-        [QatAction::New, QatAction::Open, QatAction::Save, QatAction::SaveAsDxf,
-         QatAction::SaveAsRsm, QatAction::Undo, QatAction::Redo]
+    fn all() -> [QatAction; 6] {
+        [QatAction::New, QatAction::Open, QatAction::Save, QatAction::SaveAs,
+         QatAction::Undo, QatAction::Redo]
     }
     /// The shortcuts shown by default (first run / before customization).
     fn default_set() -> Vec<QatAction> {
-        vec![QatAction::New, QatAction::Open, QatAction::Save,
-             QatAction::SaveAsDxf, QatAction::Undo, QatAction::Redo]
+        QatAction::all().to_vec()
     }
     /// Human label for the customize list + tooltips.
     fn label(self) -> &'static str {
         match self {
-            QatAction::New       => "New",
-            QatAction::Open      => "Open…",
-            QatAction::Save      => "Save",
-            QatAction::SaveAsDxf => "Save As .dxf…",
-            QatAction::SaveAsRsm => "Save As .rsm…",
-            QatAction::Undo      => "Undo",
-            QatAction::Redo      => "Redo",
+            QatAction::New    => "New",
+            QatAction::Open   => "Open…",
+            QatAction::Save   => "Save",
+            QatAction::SaveAs => "Save As",
+            QatAction::Undo   => "Undo",
+            QatAction::Redo   => "Redo",
         }
     }
 }
@@ -16761,6 +16778,9 @@ fn load_logo_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
     for path in candidates {
         let Ok(bytes) = std::fs::read(path) else { continue };
         let Ok(img) = image::load_from_memory(&bytes) else { continue };
+        // Pre-downscale with a high-quality filter so the small on-screen logo
+        // stays crisp (raw 626px → ~50px bilinear in egui looks rough/aliased).
+        let img = img.resize(128, 128, image::imageops::FilterType::Lanczos3);
         let rgba = img.to_rgba8();
         let (w, h) = rgba.dimensions();
         let color = egui::ColorImage::from_rgba_unmultiplied(
@@ -16836,7 +16856,7 @@ fn paint_qat_icon(painter: &egui::Painter, r: egui::Rect, act: QatAction, col: e
                 egui::pos2(r.left(), r.bottom()),
             ], st));
         }
-        QatAction::Save | QatAction::SaveAsDxf | QatAction::SaveAsRsm => {
+        QatAction::Save | QatAction::SaveAs => {
             // A floppy disk: outer square + label notch + shutter.
             painter.rect_stroke(r, 2.0, st);
             let top = egui::Rect::from_min_max(
@@ -16847,16 +16867,12 @@ fn paint_qat_icon(painter: &egui::Painter, r: egui::Rect, act: QatAction, col: e
                 egui::pos2(r.left() + r.width() * 0.18, r.top() + r.height() * 0.52),
                 egui::pos2(r.right() - r.width() * 0.18, r.bottom() - r.height() * 0.10));
             painter.rect_stroke(body, 0.0, st);
-            // Tiny format tag for the Save-As variants.
-            let tag = match act {
-                QatAction::SaveAsDxf => Some("DXF"),
-                QatAction::SaveAsRsm => Some("RSM"),
-                _ => None,
-            };
-            if let Some(t) = tag {
-                painter.text(egui::pos2(body.center().x, body.center().y),
-                    egui::Align2::CENTER_CENTER, t,
-                    egui::FontId::proportional(5.5), col);
+            // Save-As: a small pencil stroke over the disk to mark "as…".
+            if matches!(act, QatAction::SaveAs) {
+                painter.line_segment(
+                    [egui::pos2(r.right() - 1.0, r.top() - 1.0),
+                     egui::pos2(r.right() - r.width() * 0.45, r.top() + r.height() * 0.45)],
+                    egui::Stroke::new(1.6, col));
             }
         }
         QatAction::Undo | QatAction::Redo => {
@@ -16885,7 +16901,7 @@ fn paint_qat_icon(painter: &egui::Painter, r: egui::Rect, act: QatAction, col: e
 /// The "customize" affordance — a short bar with a down-chevron beneath it
 /// (the Office/AutoCAD Quick-Access drop button the user described as "arrow
 /// with a small line on top").
-fn qat_customize_button(ui: &mut egui::Ui, open: bool) -> bool {
+fn qat_customize_button(ui: &mut egui::Ui, open: bool) -> egui::Response {
     // Chevron uses the same colour as the menu/category text.
     let col = ui.visuals().widgets.inactive.fg_stroke.color;
     let size = egui::vec2(20.0, 28.0);
@@ -16910,7 +16926,7 @@ fn qat_customize_button(ui: &mut egui::Ui, open: bool) -> bool {
         egui::pos2(cx, top + 9.0),
         egui::pos2(cx + 5.0, top + 4.0),
     ], egui::Stroke::new(1.6, col)));
-    resp.on_hover_text("Customize Quick Access Toolbar").clicked()
+    resp.on_hover_text("Customize Quick Access Toolbar")
 }
 
 fn panel_button(ui: &mut egui::Ui, label: &str, active: bool) -> bool {
@@ -18473,7 +18489,9 @@ impl eframe::App for CadApp {
                             if qat_button(ui, act) { self.run_qat_action(act); }
                         }
                         ui.add_space(2.0);
-                        if qat_customize_button(ui, self.qat_customize_open) {
+                        let chev = qat_customize_button(ui, self.qat_customize_open);
+                        self.qat_chevron_rect = Some(chev.rect);
+                        if chev.clicked() {
                             if self.qat_customize_open {
                                 self.qat_customize_open = false;
                             } else {
