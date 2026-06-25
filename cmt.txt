@@ -22,6 +22,25 @@ as a red "NativeCommandError" even on success — check the final ref-update lin
 PART 1 — COMMITS (newest first), each with what changed & why
 ================================================================================
 
+---- (2026-06-25) EXTEND line→tangent circle + Ttr tangent-pick snap noise ----
+Two issues from a session dump (draw a Ttr circle tangent to an arc + a line,
+then EXTEND both to it — the arc extended, the line said "no intersection"):
+  * KERNEL: intersect_line_circle used an ABSOLUTE discriminant epsilon
+    (disc < -EPS). For a TANGENT line the discriminant is ~0 but its magnitude
+    scales with |d|⁴ — and extend lengthens the line to 1e6 — so float error
+    dwarfed EPS and the tangent point was rejected (the line never reached its
+    circle). Rewrote it in perpendicular-distance form (stable regardless of
+    line length): foot-of-perpendicular param, compare pd vs r with a geometric
+    tolerance, tangent → single point. (Arc extend already worked: it routes
+    through circle_circle, which was already tangent-tolerant.) Regression test
+    line_circle_tangent_large_coords_and_long_line. cad_kernel: 181 tests pass.
+  * APP: while the Ttr flow asks for a tangent OBJECT, object snap fired (CEN
+    aperture + radius line) and — worse — snapped the click to the arc's CENTRE,
+    so nearest_entity_under missed the curve and the arc was only pickable at its
+    ends. Added flow_picks_object() (true for CircleStep::TtrObj1/TtrObj2) and
+    folded it into the snap-suppression `entity_pick_phase` gate, so a Ttr
+    tangent pick uses the raw click — selectable anywhere on the object, no snap.
+
 ---- (2026-06-25) DIMENSION: click-pick on the dim line (was def-points only) ----
 A dimension could only be selected by window-pick, never by clicking on/near the
 line. Cause: Geom::Dimension::distance_to_point measured distance to the def/grip

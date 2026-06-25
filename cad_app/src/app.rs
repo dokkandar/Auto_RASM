@@ -12221,6 +12221,16 @@ impl CadApp {
     /// All current CIRCLE steps accept a point/coordinate.
     fn flow_wants_point(&self) -> bool { self.cmd_flow.is_some() }
 
+    /// True while a command flow is asking the user to PICK AN OBJECT (an
+    /// entity), not a point — currently the circle Ttr "first/second tangent"
+    /// steps. Object snap must be suppressed there so a click anywhere on the
+    /// object selects the entity, instead of snapping the cursor to the
+    /// object's centre/endpoint (which then hit-tests as a miss on the curve).
+    fn flow_picks_object(&self) -> bool {
+        matches!(self.cmd_flow.as_ref().map(|f| f.circle),
+            Some(CircleStep::TtrObj1) | Some(CircleStep::TtrObj2(..)))
+    }
+
     /// Pending-based draw tools that capture their first point with a click.
     fn draw_tool_wants_first_point(&self) -> bool {
         matches!(self.tool,
@@ -19876,7 +19886,8 @@ impl eframe::App for CadApp {
             // tool was left active when the command started (which otherwise
             // keeps `snap_phase_active` true via `self.tool`).
             let entity_pick_phase = self.fillet_state != FilletState::Off
-                || self.chamfer_state != ChamferState::Off;
+                || self.chamfer_state != ChamferState::Off
+                || self.flow_picks_object();   // circle Ttr tangent-object picks
             let snap_candidates: Vec<SnapHit> = if snap_phase_active
                 && !entity_pick_phase
                 && !self.picking_source && !self.intersect_pending_click

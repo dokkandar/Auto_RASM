@@ -183,29 +183,37 @@ pub fn intersect_line_line(a: Line, b: Line) -> Vec<Vec2> {
 // Keep solutions with t ∈ [0,1] (segment, not infinite line).
 
 pub fn intersect_line_circle(line: Line, c: Circle) -> Vec<Vec2> {
+    // Perpendicular-distance form. The earlier quadratic-discriminant form used
+    // an ABSOLUTE epsilon (`disc < -EPS`); for a TANGENT line the discriminant
+    // is ~0 but its magnitude scales with |d|⁴, so on large coordinates — or a
+    // line lengthened to 1e6 for edge-mode extend — the float error dwarfs EPS
+    // and the tangent was wrongly rejected (a TTR-tangent line wouldn't extend
+    // to its circle). Working from the perpendicular distance is stable
+    // regardless of the line's length.
     let d  = line.b - line.a;
-    let f  = line.a - c.center;
     let aa = d.dot(d);
-    let bb = 2.0 * f.dot(d);
-    let cc = f.dot(f) - c.radius * c.radius;
-    let disc = bb * bb - 4.0 * aa * cc;
-
-    if disc < -EPS || approx_zero(aa) {
-        return vec![];
-    }
-    let disc = disc.max(0.0);
-    let sq   = disc.sqrt();
-    let t1   = (-bb - sq) / (2.0 * aa);
-    let t2   = (-bb + sq) / (2.0 * aa);
-
+    if approx_zero(aa) { return vec![]; }
+    let len = aa.sqrt();
+    let t0   = (c.center - line.a).dot(d) / aa;   // param of the perpendicular foot
+    let foot = line.a + d * t0;
+    let pd   = foot.dist(c.center);               // perpendicular distance to centre
+    let r    = c.radius;
+    // Tangent tolerance relative to the radius (geometric, length-independent).
+    let tol  = 1e-6 * r.max(1.0);
+    if pd > r + tol { return vec![]; }            // genuine miss
+    let half = (r * r - pd * pd).max(0.0).sqrt(); // half-chord length
+    let ts: [f64; 2] = if half <= tol {
+        [t0, f64::NAN]                            // tangent — single point
+    } else {
+        let dt = half / len;
+        [t0 - dt, t0 + dt]
+    };
     let mut out = Vec::with_capacity(2);
-    for t in [t1, t2] {
+    for t in ts {
+        if t.is_nan() { continue; }
         if t >= -EPS && t <= 1.0 + EPS {
             out.push(line.a + d * t);
         }
-    }
-    if out.len() == 2 && out[0].dist(out[1]) < EPS {
-        out.pop();                            // tangent: collapse to one
     }
     out
 }
@@ -439,6 +447,23 @@ mod tests {
         );
         assert_eq!(pts.len(), 1);
         assert!(approx_pt(pts[0], 0.0, 5.0));
+    }
+
+    #[test]
+    fn line_circle_tangent_large_coords_and_long_line() {
+        // Regression: a TTR-tangent line lengthened to ~1e6 (edge-mode extend)
+        // on large coordinates must still report its tangent point. The old
+        // absolute-epsilon discriminant test rejected it.
+        let cx = 450.0;
+        let cy = -38.0;
+        let r = 60.0;
+        // Horizontal line tangent to the bottom of the circle (y = cy - r),
+        // lengthened far past the drawing like extended_for_edgemode does.
+        let y = cy - r;
+        let line = Line { a: Vec2::new(cx - 1.0e6, y), b: Vec2::new(cx + 1.0e6, y) };
+        let pts = intersect_line_circle(line, Circle { center: Vec2::new(cx, cy), radius: r });
+        assert_eq!(pts.len(), 1, "tangent must yield exactly one point, got {pts:?}");
+        assert!(approx_pt(pts[0], cx, y), "tangent point was {:?}", pts[0]);
     }
 
     #[test]
