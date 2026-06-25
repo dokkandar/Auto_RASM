@@ -50,16 +50,24 @@ Legend: 🔴 broken / confirmed not working · 🟡 partial / needs follow-up ·
 
 ## 🟡 UI REDESIGN — in progress
 
-### U1. Quick Access Toolbar — real logo PNG
-- The top-line logo is a PAINTED PLACEHOLDER (teal gear-ring + gold R). The real
-  brand PNG needs wiring: save it to `cad_app/assets/logo.png`, add the `image`
-  crate (or egui_extras image loader), load it once into a texture, show it in
-  `draw_logo`. ⚪ I can't extract the pasted image — user must drop the file.
+### U1. Quick Access Toolbar — real logo PNG ⚪ WAITING ON USER
+- Loader is wired (`load_logo_texture`, runtime PNG via the `image` crate); it
+  reads `cad_app/assets/logo.png` and falls back to a painted placeholder.
+  **Action: user must save the brand PNG to `cad_app/assets/logo.png`** (I can't
+  extract the pasted image). Once it's there it loads automatically.
 
 ### U2. Quick Access Toolbar — persistence + real icons
 - `qat_actions` customization is in-session only (resets on restart) — persist it
   (e.g. in UserEnv / a small config). Shortcut glyphs are simple painted
   placeholders; swap for real icon art when the command-icon set is designed.
+
+### U3. Custom title bar / window buttons (min · max · close)
+- User wants min/maximize/close buttons next to "AutoRASM 2026" and questions the
+  OS "RUST_CAD" title bar. Proper fix = frameless window (`with_decorations(false)`)
+  + a custom draggable title bar with the three window buttons, plus resize
+  handling on Windows (borderless winit windows need explicit edge-resize, e.g.
+  `ViewportCommand::BeginResize`). Deferred pending user OK (resize risk). The OS
+  title was renamed to "AutoRASM 2026" in the meantime.
 
 ## 🔵 NOT STARTED / DEFERRED
 
