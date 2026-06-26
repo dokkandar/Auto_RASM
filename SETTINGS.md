@@ -201,8 +201,8 @@ below the marker is rewritten; the prose above it is hand-maintained.
 
 | Name | Type | Default | Status | Edit | Description |
 |---|---|---|---|---|---|
-| `AperBx` | Bool | `false` | Stub |  | Aperture box on/off |
-| `BkgPlt` | Bool | `false` | Stub |  | Background plotting on/off |
+| `AperBx` | Bool | `false` | Stub |  | Show the snap-target box around the crosshair (size = SpTGSZ) |
+| `BkgPlt` | Bool | `false` | Stub |  | Print/plot in the background while you keep working |
 | `CrsACol` | Color | `0x78E678` | Planned |  | Crossing-selection area colour |
 | `CrsHrS` | U8 1-100 | `5` | Planned | yes | Crosshair size (screen %) |
 | `DrDspM` | Choice(off/on/auto) | `2` | Planned | yes | Dragging display during MOVE/COPY |
@@ -210,24 +210,24 @@ below the marker is rewritten; the prose above it is hand-maintained.
 | `HltSel` | Bool | `true` | Planned | yes | Highlight selected objects |
 | `HpQckP` | Bool | `false` | Stub |  | Hatch quick preview on/off |
 | `ImgHlt` | Bool | `false` | Stub |  | Image frame highlight on/off |
-| `IntsCol` | Color | `0xFF5A5A` | Planned |  | Intersection marker colour |
-| `IntsDsp` | Bool | `true` | Planned |  | Intersection marker display |
+| `IntsCol` | Color | `0xFF5A5A` | Planned |  | Colour of the intersection (∩) markers where objects cross |
+| `IntsDsp` | Bool | `true` | Planned |  | Show the intersection (∩) markers where objects cross |
 | `LnFade` | Bool | `false` | Stub |  | Line fading in edit mode |
 | `LtGlyD` | Bool | `false` | Stub |  | Light glyph display |
 | `LyLkFd` | U8 0-100 | `50` | Planned |  | Locked-layer fade percentage |
 | `MTxtFx` | Bool | `false` | Stub |  | Mtext fixed-width editor on/off |
 | `OleHid` | Bool | `false` | Stub |  | Hide OLE objects on/off |
 | `PcBnd` | Bool | `false` | Stub |  | Point-cloud bounding-box display |
-| `PcClpF` | Bool | `false` | Stub |  | Point-cloud clip frame display |
-| `PrvFlt` | Bool | `false` | Stub |  | Preview filter for commands |
+| `PcClpF` | Bool | `false` | Stub |  | Show the crop-boundary outline of a 3D point cloud (laser scan) |
+| `PrvFlt` | Bool | `false` | Stub |  | Object types skipped during hover preview-highlight |
 | `RllTp` | Bool | `true` | Planned | yes | Tooltips on dobject rollover |
-| `RvClCrM` | Bool | `false` | Stub |  | Revcloud creation mode |
+| `RvClCrM` | Bool | `false` | Stub |  | How revision clouds are drawn (the change-marking cloud outline) |
 | `RvClGrp` | Bool | `false` | Stub |  | Revcloud grip display |
 | `SelAr` | Bool | `true` | Planned |  | Selection area effect |
 | `SelPrv` | Bool | `true` | Planned | yes | Preview highlight of selection |
 | `SelPrvL` | Int 0-1_000_000 | `2000` | Planned |  | Selection preview dobject limit |
 | `TrkPth` | Bool | `false` | Stub |  | Tracking path display mode |
-| `TrnDsp` | Bool | `false` | Stub |  | Object transparency display |
+| `TrnDsp` | Bool | `false` | Stub |  | Draw objects' transparency (see-through) level on/off |
 | `TryIco` | Bool | `false` | Stub |  | Tray icon display |
 | `TryTim` | Int 1-1_000_000 | `5` | Stub |  | Tray notification timeout |
 | `WinACol` | Color | `0x78AAFF` | Planned |  | Window-selection area colour |
