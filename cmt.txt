@@ -22,6 +22,125 @@ as a red "NativeCommandError" even on success — check the final ref-update lin
 PART 1 — COMMITS (newest first), each with what changed & why
 ================================================================================
 
+---- (2026-06-25) FILLET line↔polyline: stop mangling the polyline ----
+Filleting a line to a polyline produced garbage (the polyline's whole shape
+distorted), while exploding the polyline first and filleting a bare segment
+worked. Cause: the line↔polyline path ALWAYS moved the polyline's FREE end
+vertex to the tangent point, even when the corner was on the INTERIOR side —
+yanking the wrong vertex across the drawing. Fix: pick the clicked segment's
+endpoint FARTHER from the pick (the corner side) as the one to trim to the
+tangent point; move it ONLY if it is a free end of an open polyline
+(poly_moved_vertex / poly_move_ok). If the corner-side vertex is interior
+(shared), refuse with a clear message ("explode the polyline first, or pick so
+the end nearest the other object is its loose tip") instead of producing
+garbage. Same guard added to chamfer_geoms. Ctx::PolyEnd → Ctx::Poly{pl,seg}
+(the end-segment-only restriction is gone; geometry decides). 2 tests
+(fillet_line_to_polyline_end_segment_moves_free_tip, ..._interior_side_is_
+refused_not_garbage). cad_kernel: 183 tests pass.
+
+---- (2026-06-25) EXTEND line→tangent circle + Ttr tangent-pick snap noise ----
+Two issues from a session dump (draw a Ttr circle tangent to an arc + a line,
+then EXTEND both to it — the arc extended, the line said "no intersection"):
+  * KERNEL: intersect_line_circle used an ABSOLUTE discriminant epsilon
+    (disc < -EPS). For a TANGENT line the discriminant is ~0 but its magnitude
+    scales with |d|⁴ — and extend lengthens the line to 1e6 — so float error
+    dwarfed EPS and the tangent point was rejected (the line never reached its
+    circle). Rewrote it in perpendicular-distance form (stable regardless of
+    line length): foot-of-perpendicular param, compare pd vs r with a geometric
+    tolerance, tangent → single point. (Arc extend already worked: it routes
+    through circle_circle, which was already tangent-tolerant.) Regression test
+    line_circle_tangent_large_coords_and_long_line. cad_kernel: 181 tests pass.
+  * APP: while the Ttr flow asks for a tangent OBJECT, object snap fired (CEN
+    aperture + radius line) and — worse — snapped the click to the arc's CENTRE,
+    so nearest_entity_under missed the curve and the arc was only pickable at its
+    ends. Added flow_picks_object() (true for CircleStep::TtrObj1/TtrObj2) and
+    folded it into the snap-suppression `entity_pick_phase` gate, so a Ttr
+    tangent pick uses the raw click — selectable anywhere on the object, no snap.
+
+---- (2026-06-25) DIMENSION: click-pick on the dim line (was def-points only) ----
+A dimension could only be selected by window-pick, never by clicking on/near the
+line. Cause: Geom::Dimension::distance_to_point measured distance to the def/grip
+points ONLY, so a click on the dimension line or extension lines missed. Fix:
+new Dim::outline_segments() returns the VISIBLE segments (ext line 1 + ext line 2
++ dim line for linear; the diameter/leader line for radius/diameter — linear ends
+are the projections of p1/p2 onto the dim line through dimline_pos). distance_to_
+point now takes the min over those segments AND the grip points. cad_kernel: 180
+tests pass (new dimension_picks_on_the_dim_line_not_only_def_points).
+
+---- (2026-06-25) FILLET / CHAMFER: no object-snap noise while picking objects ----
+Selecting an arc/curve during fillet showed the CEN osnap (aperture at the arc
+centre + the radius preview line to it) — pure noise, since fillet/chamfer pick
+ENTITIES, not points. Two causes / fixes:
+  * The draw tool was left ACTIVE when fillet started (sticky continuous tools),
+    so `self.tool != Tool::None` kept `snap_phase_active` true. Command::Fillet
+    and Command::Chamfer now clear `self.tool = Tool::None` + pending (like
+    STRETCH already does), so the leftover tool no longer drives snap.
+  * Defence-in-depth: the snap-candidate gate now also requires the entity-pick
+    phase be off (`fillet_state == Off && chamfer_state == Off`), so object snap
+    is suppressed during fillet/chamfer regardless of tool state.
+
+---- (2026-06-25) FILLET P: re-apply with a new radius UPDATES the rounding ----
+Re-running `fillet P` on an already-filleted polyline used to round the already-
+rounded corners (stacking). Now polyline_all() first calls defillet_polyline()
+which collapses existing fillet arcs back to sharp corners, then fillets the
+sharpened outline — so changing the radius mid-command and re-picking the same
+polyline UPDATES every corner to the new radius. A fillet arc is detected by its
+signature: a line→arc→line run where the arc is TANGENT to both straight
+neighbours; the recovered corner is the intersection of the two straight sides.
+Genuine (non-tangent) arcs and arc-neighboured arcs are left untouched. Only the
+Fillet op de-fillets (chamfer P does not). 2 tests (refillet_updates_radius_
+does_not_stack, defillet_recovers_original_square_corners). cad_kernel: 179 pass.
+
+---- (2026-06-25) FILLET / CHAMFER: radius-too-big guard + re-prompt (don't exit) ----
+Two follow-ups from a session dump (P-fillet with a too-big radius drew a self-
+intersecting blob and silently exited):
+  * KERNEL: polyline_all now does an OVERLAP CHECK — two fillets on the SAME
+    segment (one at each end) must not eat past each other. After solving every
+    corner it verifies each segment's trimmed span keeps its direction (start
+    param ≤ end param via along_param()); if not → Err "radius too large —
+    rounded corners would overlap". count==0 message is now "radius too large
+    for any corner". 2 new tests (fillet_all_radius_too_large_overlaps_errs,
+    fillet_corner_radius_too_large_errs). cad_kernel: 177 tests pass.
+  * APP: on any "too large" fillet error the command STAYS active and re-prompts
+    for a smaller radius (fillet_radius_too_big() arms fillet_waiting_radius +
+    sets the prompt). Mirror for chamfer (chamfer_dist_too_big() on "too large"/
+    "exceeds" → re-arms the two-step distance entry). The canvas pick branches
+    skip their multiple/exit logic while a re-prompt is armed, so the prompt
+    isn't overwritten and the command never drops out. Esc still cancels.
+
+---- (2026-06-25) FILLET / CHAMFER: polylines, arcs, and the P (whole-polyline) option ----
+FILLET and CHAMFER were LINE+LINE only (Walls rode on their centerline). Now they
+generalize to line/arc pieces and polylines:
+  * two segments of the SAME polyline  → round/bevel that corner IN PLACE (insert
+    a fillet-arc vertex via bulge; chamfer inserts a straight bevel vertex).
+  * a polyline's END segment ↔ a separate Line/Arc/Polyline-end → trims the end
+    segment (moves the free vertex to the tangent point) + adds the fillet arc.
+  * the AutoCAD `P` option → pick ONE polyline, round/bevel EVERY corner at once.
+  * bare Line ↔ Arc, Arc ↔ Arc now work too (was unsupported).
+
+KERNEL — new module cad_kernel/src/fillet.rs (re-exported from lib.rs). Unified
+"offset-locus" solver: the centre of a radius-r circle tangent to a line lies on
+a parallel offset line; tangent to a circle/arc, on a concentric circle R±r.
+Intersect the two pieces' loci → candidate centres; pick the one INSIDE the corner
+(on the keep-side bisector) nearest the corner; tangent points are the feet/radial
+projections. Public fns:
+  fillet_geoms / chamfer_geoms (g1,p1,g2,p2,...) -> FilletOut/ChamferOut  [separate objs]
+  fillet_polyline_corner / chamfer_polyline_corner (pl, seg_a, seg_b, ...) -> Polyline
+  fillet_polyline_all / chamfer_polyline_all (pl, ...) -> (Polyline, count)  [P option]
+  nearest_polyline_segment(pl, p) -> Option<usize>   [which segment was clicked]
+Polyline arc (bulge) segments are handled; bulges recomputed when endpoints move.
+Splines / ellipse-arcs NOT yet (no simple offset locus — tessellate first, or add
+a numerical solver). 5 unit tests (perp lines, square all-corners, open-L corner,
+chamfer square). cad_kernel: 175 tests pass.
+
+APP — apply_fillet/apply_chamfer became DISPATCHERS:
+  same polyline (2 segments) → apply_*_corner;  Line/Wall pair → apply_*_lines
+  (old centerline/curved-wall path, unchanged);  else → apply_*_general (kernel).
+P option: `p` sub-command toggles fillet_poly_all/chamfer_poly_all; the next pick
+is a polyline → apply_*_poly_all. Prompts show ", POLY" + a `p=poly` hint; flag
+resets at command start and on Esc. New per-corner apply_*_corner / apply_*_general
+/ apply_*_poly_all methods (snapshot_doc + undo-pop on Err, like the originals).
+
 ---- (2026-06-25) keys: Ctrl+Z = Undo ----
 Ctrl+Z now undoes the drawing. Consumed via input_mut.consume_key so the
 command-line TextEdit doesn't also undo its own typed text — Ctrl+Z is always
@@ -252,6 +371,9 @@ SUB-COMMAND KEYS (typed while a command is active)
     (+ real-time drag)
   FILLET / CHAMFER (while picking):
     R radius (fillet) / D distances (chamfer) · T trim toggle · M multiple toggle
+    P polyline mode (pick ONE polyline → round/bevel ALL its corners)
+    Works on: Line, Arc, Wall, and Polylines (two segments of one polyline =
+    round that corner; an end segment vs a separate object; or P for all corners).
   Selection session (while a command asks you to select):
     p previous selection · l last created object · d remove from selection
 
@@ -278,19 +400,21 @@ PART 3 — KEY ARCHITECTURE NOTES (for re-implementers)
 ================================================================================
 PART 4 — OPEN / PENDING WORK
 ================================================================================
-1. DXF/RSM PERSISTENCE OF PLINE WIDTH (Stage 4) — NOT done. Save/reload drops
-   width (cad_io read paths default widths to empty). Need DXF LWPOLYLINE group
-   codes 40/41 (start/end width) + 43 (const width) read/write, and RSM
-   serialization of Polyline.widths.
-2. Width-change-boundary taper quirk: polyline_width_centerline assigns ONE
-   width per vertex (incoming segment's end), so the first segment after a width
-   change tapers old→new instead of being uniform. Fix: carry per-segment
-   start/end widths into the centerline.
-3. Possibly apply continuous-by-default to CHAMFER (same m/d/t structure).
-4. Groups: in-session only — not persisted to .rsm yet.
-5. Old open bug: circular-arc "curves wrong after pe+j" — diagnostic in
+1. FILLET/CHAMFER on SPLINE and ELLIPSE-ARC — NOT done (no simple offset locus).
+   Plan: either tessellate to a dense polyline first (result becomes a polyline)
+   or add a numerical tangent-circle root-finder in fillet.rs alongside the
+   offset-locus solver.
+2. FILLET/CHAMFER of two NON-ADJACENT segments of one polyline — currently errs
+   ("segments must be adjacent"). AutoCAD removes the intervening segments; not
+   implemented.
+3. Groups: in-session only — not persisted to .rsm yet.
+4. Old open bug: circular-arc "curves wrong after pe+j" — diagnostic in
    pedit_join_selected prints `src arc:` / `pl v[i]`; needs a session dump.
-6. RECONCILE: origin/main is ~14 commits ahead (other machine) with OVERLAPPING
+5. RECONCILE: origin/main is ~14 commits ahead (other machine) with OVERLAPPING
    file-dialog/zoom/block work. Do NOT blind-merge this branch into main —
    review upstream vs this branch first.
+
+DONE since last edit: pline width DXF/RSM persistence (Stage 4); width-change
+taper quirk; chamfer continuous-by-default; generalized fillet/chamfer (polylines
++ arcs + P option).
 ================================================================================

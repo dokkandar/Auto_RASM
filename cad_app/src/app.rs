@@ -1033,6 +1033,32 @@ pub struct CadApp {
     env: UserEnv,
     /// Settings window visibility.
     settings_open: bool,
+    /// Which section (left sidebar) is selected in the settings window.
+    /// Empty → default to the first section on first render.
+    settings_section: String,
+    /// When `Some(name)`, the command line is waiting for the NEW VALUE of a
+    /// SYSVAR (after `setvar NAME` or a bare variable name). The next input is
+    /// consumed as that value (validated via varreg::env_set). Esc cancels.
+    var_set_pending: Option<String>,
+
+    // ---- Quick Access Toolbar (top line) -----------------------------
+    /// Ordered list of file/common actions shown as icon shortcuts on the
+    /// top Quick Access row. Customizable via the `▾` dropdown.
+    qat_actions: Vec<QatAction>,
+    /// Whether the QAT "customize" drop window is open.
+    qat_customize_open: bool,
+    /// True only on the frame the drop window opened — suppresses the
+    /// click-outside dismissal for that frame (the opening click was the
+    /// chevron, which sits outside the window).
+    qat_just_opened: bool,
+    /// Screen rect of the customize chevron, captured each frame so the drop
+    /// window can open directly beneath it.
+    qat_chevron_rect: Option<egui::Rect>,
+    /// Brand logo texture (loaded once from assets/logo.png). None until
+    /// loaded; `logo_load_tried` prevents re-attempting every frame when the
+    /// file is absent (falls back to a painted placeholder).
+    logo_tex: Option<egui::TextureHandle>,
+    logo_load_tried: bool,
 
     // "Always-listen" command line: set when something else stole keyboard
     // focus (canvas click, window switch). The command-box renderer
@@ -1330,9 +1356,15 @@ pub struct CadApp {
     /// non-empty cmd-line input is consumed as a number — NOT passed
     /// to the main parser. Cleared on success or Esc.
     fillet_waiting_radius: bool,
+    /// Polyline mode (the AutoCAD `P` option). When ON the next picked
+    /// object must be a polyline; the fillet is applied to EVERY corner.
+    /// Toggled with `p`; cleared when fillet exits.
+    fillet_poly_all: bool,
     chamfer_state:  ChamferState,
     /// Same as `fillet_multiple` for Chamfer.
     chamfer_multiple: bool,
+    /// Polyline mode for Chamfer (the `P` option). See `fillet_poly_all`.
+    chamfer_poly_all: bool,
     /// Chamfer's two-step distance entry after `d` alone (AutoCAD
     /// style): Off → WaitingD1 → WaitingD2(d1) → back to WaitingForFirst.
     /// At each step, empty input keeps the current value. Inline
@@ -2625,6 +2657,14 @@ impl Default for CadApp {
             snap_window_open:  false,
             env:               UserEnv::load(),
             settings_open:     false,
+            settings_section:  String::new(),
+            var_set_pending:   None,
+            qat_actions:       QatAction::default_set(),
+            qat_customize_open: false,
+            qat_just_opened:   false,
+            qat_chevron_rect:  None,
+            logo_tex:          None,
+            logo_load_tried:   false,
             refocus_cmd:       true,
             snap_cycle_index:  0,
             snap_cycle_anchor: None,
@@ -2739,8 +2779,10 @@ impl Default for CadApp {
             fillet_state:   FilletState::Off,
             fillet_multiple: false,
             fillet_waiting_radius: false,
+            fillet_poly_all: false,
             chamfer_state:  ChamferState::Off,
             chamfer_multiple: false,
+            chamfer_poly_all: false,
             chamfer_dist_wait: ChamferDistWait::Off,
             trim_state:     TrimState::Off,
             extend_state:   ExtendState::Off,
@@ -2867,6 +2909,35 @@ impl CadApp {
             source:        crate::dbg_recorder::CmdSource::Typed,
         });
 
+        // ---- SYSVAR value entry (after `setvar NAME` or a bare var name) ----
+        // The next input is the new value; empty keeps current; bad input
+        // re-prompts (Esc cancels via the Esc handler).
+        if let Some(name) = self.var_set_pending.clone() {
+            if trimmed.is_empty() {
+                let cur = crate::varreg::env_get(&self.env, &name).unwrap_or_default();
+                self.history.push(format!("  {} kept at {}", name, cur));
+                self.var_set_pending = None;
+                self.clear_prompt();
+            } else {
+                match crate::varreg::env_set(&mut self.env, &name, trimmed) {
+                    Ok(_) => {
+                        let _ = self.env.save();
+                        let nv = crate::varreg::env_get(&self.env, &name).unwrap_or_default();
+                        self.history.push(format!("  {} = {}", name, nv));
+                        self.var_set_pending = None;
+                        self.clear_prompt();
+                    }
+                    Err(e) => {
+                        self.history.push(format!("  ! {}", e));
+                        let cur = crate::varreg::env_get(&self.env, &name).unwrap_or_default();
+                        self.set_prompt(format!(
+                            "Enter new value for {} <{}>:  [Esc=cancel]", name, cur));
+                    }
+                }
+            }
+            return;
+        }
+
         // ---- Prompt-driven command flow (Slice 1: CIRCLE) ----------------
         // When a flow is live the command line IS its prompt — route typed
         // input there. Otherwise `circle`/`ci` STARTS the flow. Each prompt +
@@ -2913,6 +2984,25 @@ impl CadApp {
             if let Some(rest) = lc.strip_prefix("zoom ").or_else(|| lc.strip_prefix("z ")) {
                 self.zoom_start(rest.trim());
                 return;
+            }
+        }
+        // ---- SYSVAR access: `setvar [NAME [VALUE]]` / `setvar ?`, or a bare
+        // variable name typed as a command (AutoCAD-style). ------------------
+        {
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if let Some(&first) = parts.first() {
+                if first.eq_ignore_ascii_case("setvar") {
+                    let name = parts.get(1).copied();
+                    let value = if parts.len() > 2 { parts[2..].join(" ") } else { String::new() };
+                    self.handle_setvar(name, &value);
+                    return;
+                }
+                // A bare variable name (optionally with an inline value).
+                if crate::varreg::find(first).is_some() {
+                    let value = if parts.len() > 1 { parts[1..].join(" ") } else { String::new() };
+                    self.handle_setvar(Some(first), &value);
+                    return;
+                }
             }
         }
         // `group` / `ungroup` — operate on the current selection.
@@ -3600,6 +3690,15 @@ impl CadApp {
                     self.refresh_fillet_prompt();
                     return;
                 }
+                Some("p") | Some("polyline") => {
+                    self.fillet_poly_all = !self.fillet_poly_all;
+                    self.history.push(format!(
+                        "  fillet: polyline mode → {}",
+                        if self.fillet_poly_all { "ON (pick ONE polyline → rounds ALL its corners)" }
+                        else { "OFF" }));
+                    self.refresh_fillet_prompt();
+                    return;
+                }
                 Some("r") | Some("radius") => {
                     // Inline form: `r 2`, `r 2.5`, `r r=3`, `r,2` all
                     // accepted via parse_dist_tokens leniency.
@@ -3654,6 +3753,15 @@ impl CadApp {
                     self.history.push(format!(
                         "  chamfer: multiple mode → {}",
                         if self.chamfer_multiple { "ON" } else { "OFF" }));
+                    self.refresh_chamfer_prompt();
+                    return;
+                }
+                Some("p") | Some("polyline") => {
+                    self.chamfer_poly_all = !self.chamfer_poly_all;
+                    self.history.push(format!(
+                        "  chamfer: polyline mode → {}",
+                        if self.chamfer_poly_all { "ON (pick ONE polyline → bevels ALL its corners)" }
+                        else { "OFF" }));
                     self.refresh_chamfer_prompt();
                     return;
                 }
@@ -4662,12 +4770,18 @@ impl CadApp {
                     self.env.FltRad = r;
                     let _ = self.env.save();
                 }
+                // Drop any active (sticky) draw tool so its click semantics and
+                // object-snap markers don't bleed into the fillet pick phase.
+                self.tool = Tool::None;
+                self.pending.clear();
                 let r = self.env.FltRad;
                 self.fillet_state = FilletState::WaitingForFirst(r);
                 // Continuous by default: keep filleting pair after pair until
                 // Esc. `R` changes the radius mid-command (persists as the new
-                // default); `M` toggles back to single-shot.
+                // default); `M` toggles back to single-shot; `P` = polyline
+                // (round every corner of one picked polyline).
                 self.fillet_multiple = true;
+                self.fillet_poly_all = false;
                 self.refresh_fillet_prompt();
             }
             Ok(Command::Chamfer(opt)) => {
@@ -4677,13 +4791,16 @@ impl CadApp {
                     self.env.ChmDs2 = d2;
                     let _ = self.env.save();
                 }
+                self.tool = Tool::None;
+                self.pending.clear();
                 let d1 = self.env.ChmDs1;
                 let d2 = self.env.ChmDs2;
                 self.chamfer_state = ChamferState::WaitingForFirst(d1, d2);
                 // Continuous by default (like fillet): chamfer pair after pair
                 // until Esc. `D` changes distances mid-command; `M` toggles
-                // back to single-shot.
+                // back to single-shot; `P` = polyline (bevel every corner).
                 self.chamfer_multiple = true;
+                self.chamfer_poly_all = false;
                 self.refresh_chamfer_prompt();
             }
             Ok(Command::Join) => {
@@ -13530,6 +13647,16 @@ impl CadApp {
     /// All current CIRCLE steps accept a point/coordinate.
     fn flow_wants_point(&self) -> bool { self.cmd_flow.is_some() }
 
+    /// True while a command flow is asking the user to PICK AN OBJECT (an
+    /// entity), not a point — currently the circle Ttr "first/second tangent"
+    /// steps. Object snap must be suppressed there so a click anywhere on the
+    /// object selects the entity, instead of snapping the cursor to the
+    /// object's centre/endpoint (which then hit-tests as a miss on the curve).
+    fn flow_picks_object(&self) -> bool {
+        matches!(self.cmd_flow.as_ref().map(|f| f.circle),
+            Some(CircleStep::TtrObj1) | Some(CircleStep::TtrObj2(..)))
+    }
+
     /// Pending-based draw tools that capture their first point with a click.
     fn draw_tool_wants_first_point(&self) -> bool {
         matches!(self.tool,
@@ -15110,20 +15237,416 @@ impl CadApp {
         }
     }
 
+    /// The tall logo column at the left of the top bar — spans the Quick
+    /// Access row + the menu-category row. Shows the brand PNG if present,
+    /// else a painted placeholder.
+    fn draw_logo_column(&mut self, ui: &mut egui::Ui) {
+        let size = egui::vec2(60.0, 56.0);
+        let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
+        let rect = resp.rect;
+        // No custom fill or divider — the logo sits flush on the toolbar
+        // panel background.
+        // Lazy-load the logo texture once.
+        if self.logo_tex.is_none() && !self.logo_load_tried {
+            self.logo_tex = load_logo_texture(ui.ctx());
+            self.logo_load_tried = true;
+        }
+        if let Some(tex) = &self.logo_tex {
+            let avail = rect.shrink(5.0);
+            let img = tex.size_vec2();
+            let scale = (avail.width() / img.x).min(avail.height() / img.y);
+            let draw = img * scale;
+            let img_rect = egui::Rect::from_center_size(rect.center(), draw);
+            painter.image(tex.id(), img_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE);
+        } else {
+            draw_logo_placeholder(&painter, rect);
+        }
+    }
+
+    /// Run a Quick Access Toolbar shortcut.
+    fn run_qat_action(&mut self, act: QatAction) {
+        match act {
+            QatAction::New    => self.run_command("clear"),
+            QatAction::Open   => self.open_file_dialog(FileDialogMode::Open, ".rsm"),
+            QatAction::Save   => self.do_save_current(),
+            QatAction::SaveAs => self.open_file_dialog(FileDialogMode::Save, ".rsm"),
+            QatAction::Undo   => self.run_command("undo"),
+            QatAction::Redo   => self.run_command("redo"),
+        }
+    }
+
+    /// The "Quick access" drop window — a narrow, neat list of actions, each
+    /// with a leading check when it's on the toolbar. Clicking a row toggles
+    /// it. No close button: ESC or a click outside dismisses it.
+    fn qat_customize_window(&mut self, ctx: &egui::Context) {
+        if !self.qat_customize_open { return; }
+        let item_size = 13.0;
+        let item_font = egui::FontId::proportional(item_size);
+        let accent = egui::Color32::from_rgb(120, 180, 235);
+        let text_c = egui::Color32::from_rgb(205, 216, 228);
+        // Width = check column + the longest label (or the title) + padding.
+        let check_col = 22.0;
+        let label_w = |s: &str, sz: f32| ctx.fonts(|f| f.layout_no_wrap(
+            s.to_string(), egui::FontId::proportional(sz), text_c).size().x);
+        let longest = QatAction::all().iter()
+            .map(|a| label_w(a.label(), item_size))
+            .fold(0.0_f32, f32::max);
+        let title_w = label_w("Quick access", item_size * 1.2);
+        let content_w = (check_col + longest + 6.0).max(title_w);
+
+        let bg = egui::Color32::from_rgb(45, 54, 66);
+        let frame = egui::Frame::popup(&ctx.style())
+            .fill(bg)
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 80, 95)))
+            .rounding(0.0)                              // right-angle corners
+            .shadow(egui::epaint::Shadow {              // drop shadow to bottom-right
+                offset: egui::vec2(4.0, 4.0),
+                blur: 10.0,
+                spread: 0.0,
+                color: egui::Color32::from_black_alpha(120),
+            })
+            .inner_margin(egui::Margin::symmetric(8.0, 6.0));
+        // Open directly beneath the chevron.
+        let pos = self.qat_chevron_rect
+            .map(|r| egui::pos2(r.left(), r.bottom() + 2.0))
+            .unwrap_or(egui::pos2(60.0, 44.0));
+        let win = egui::Window::new("qat_quick_access")
+            .title_bar(false)
+            .resizable(false)
+            .frame(frame)
+            .fixed_pos(pos)
+            .show(ctx, |ui| {
+                ui.set_width(content_w);
+                // Title — 20% bigger than the list items.
+                ui.label(egui::RichText::new("Quick access")
+                    .size(item_size * 1.2)
+                    .color(egui::Color32::from_rgb(210, 220, 232)));
+                ui.add_space(3.0);
+                ui.separator();              // single separation line
+                ui.add_space(3.0);
+                for act in QatAction::all() {
+                    let on = self.qat_actions.contains(&act);
+                    let (rect, resp) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), 20.0), egui::Sense::click());
+                    if resp.hovered() {
+                        ui.painter().rect_filled(rect, 3.0,
+                            egui::Color32::from_rgb(58, 70, 86));
+                    }
+                    // Painted checkmark (the font lacks a ✓ glyph).
+                    if on {
+                        let cy = rect.center().y;
+                        let cx = rect.left() + 7.0;
+                        let s = egui::Stroke::new(1.8, accent);
+                        ui.painter().line_segment(
+                            [egui::pos2(cx, cy + 1.0), egui::pos2(cx + 3.0, cy + 4.0)], s);
+                        ui.painter().line_segment(
+                            [egui::pos2(cx + 3.0, cy + 4.0), egui::pos2(cx + 8.0, cy - 4.0)], s);
+                    }
+                    ui.painter().text(
+                        egui::pos2(rect.left() + check_col, rect.center().y),
+                        egui::Align2::LEFT_CENTER, act.label(), item_font.clone(), text_c);
+                    if resp.clicked() {
+                        if on {
+                            self.qat_actions.retain(|a| *a != act);
+                        } else {
+                            // Re-insert keeping canonical order.
+                            self.qat_actions = QatAction::all().into_iter()
+                                .filter(|a| *a == act || self.qat_actions.contains(a))
+                                .collect();
+                        }
+                    }
+                }
+            });
+        // Dismiss on ESC, or on a click outside the drop window. Skip the
+        // outside-click on the very frame it opened (that press was the
+        // chevron itself, which lives outside the window rect).
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.qat_customize_open = false;
+        } else if self.qat_just_opened {
+            self.qat_just_opened = false;
+        } else if let Some(win) = win {
+            let rect = win.response.rect;
+            let clicked_outside = ctx.input(|i| {
+                i.pointer.any_pressed()
+                    && i.pointer.interact_pos().is_some_and(|p| !rect.contains(p))
+            });
+            if clicked_outside { self.qat_customize_open = false; }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // USER-ENVIRONMENT SETTINGS window — registry-driven (varreg::VARS).
+    // Left sidebar = sections; right panel = typed rows with status badges.
+    // Every variable is shown; WIRED ones are editable (through the shared
+    // validated varreg::env_set), the rest are disabled (Option A).
+    // ---------------------------------------------------------------------
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        if !self.settings_open { return; }
+        let sections = crate::varreg::sections();
+        if self.settings_section.is_empty() {
+            if let Some(first) = sections.first() {
+                self.settings_section = first.to_string();
+            }
+        }
+        let mut keep = true;
+        egui::Window::new("USER-ENVIRONMENT SETTINGS")
+            .open(&mut keep)
+            .resizable(true)
+            .default_width(820.0)
+            .default_height(580.0)
+            .default_pos(egui::pos2(40.0, 70.0))
+            .show(ctx, |ui| {
+                ui.horizontal_top(|ui| {
+                    // ---- left sidebar: section list -------------------------
+                    ui.vertical(|ui| {
+                        ui.set_width(210.0);
+                        egui::ScrollArea::vertical().id_salt("set_sections")
+                            .max_height(500.0)
+                            .show(ui, |ui| {
+                                for sec in &sections {
+                                    let count = crate::varreg::VARS.iter()
+                                        .filter(|v| v.section == *sec).count();
+                                    let selected = self.settings_section == *sec;
+                                    if settings_section_item(ui, sec, count, selected) {
+                                        self.settings_section = sec.to_string();
+                                    }
+                                }
+                            });
+                    });
+                    ui.separator();
+                    // ---- right panel: rows for the selected section ---------
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.heading(egui::RichText::new(&self.settings_section).size(15.0));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                settings_legend(ui);
+                            });
+                        });
+                        ui.label(egui::RichText::new(
+                            "AutoCAD-style SYSVARS. Edits to Active/Planned vars persist to ~/.config/rust_cad/user_env.txt")
+                            .size(11.0).color(egui::Color32::from_rgb(140, 150, 165)));
+                        ui.separator();
+                        let sec = self.settings_section.clone();
+                        egui::ScrollArea::vertical().id_salt("set_rows")
+                            .max_height(470.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for v in crate::varreg::VARS.iter().filter(|v| v.section == sec) {
+                                    self.settings_row(ui, v);
+                                }
+                            });
+                    });
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Save now").clicked() {
+                        match self.env.save() {
+                            Ok(_)  => self.history.push("  settings saved".into()),
+                            Err(e) => self.history.push(format!("  ! settings save failed: {}", e)),
+                        }
+                    }
+                    if ui.button("Reload from disk").clicked() { self.env = UserEnv::load(); }
+                    if ui.button("Reset to defaults").clicked() {
+                        self.env = UserEnv::default();
+                        let _ = self.env.save();
+                    }
+                });
+            });
+        if !keep { self.settings_open = false; }
+    }
+
+    /// One settings row: name · description · status badge · typed input.
+    fn settings_row(&mut self, ui: &mut egui::Ui, v: &crate::varreg::Var) {
+        let frame = egui::Frame::none()
+            .fill(egui::Color32::from_rgb(28, 31, 40))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(38, 42, 51)))
+            .rounding(4.0)
+            .inner_margin(egui::Margin::symmetric(8.0, 5.0));
+        frame.show(ui, |ui| {
+            ui.horizontal(|ui| {
+                // name (mono, fixed width)
+                ui.add_sized([86.0, 18.0], egui::Label::new(
+                    egui::RichText::new(v.name).monospace().strong()
+                        .color(egui::Color32::from_rgb(220, 226, 234))).truncate());
+                // description (flex)
+                ui.add_sized([300.0, 18.0], egui::Label::new(
+                    egui::RichText::new(v.desc).size(11.5)
+                        .color(egui::Color32::from_rgb(155, 162, 174))).truncate());
+                settings_status_badge(ui, v.status);
+                // input — right aligned
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_enabled_ui(v.wired, |ui| {
+                        self.settings_input(ui, v);
+                    });
+                });
+            });
+        });
+        ui.add_space(3.0);
+    }
+
+    /// The typed control for one variable. WIRED → reads/writes the live value
+    /// through varreg::env_get / env_set (validated). UNWIRED → shows the
+    /// default (the enclosing add_enabled_ui(false) greys it out).
+    fn settings_input(&mut self, ui: &mut egui::Ui, v: &crate::varreg::Var) {
+        use crate::varreg::Kind;
+        let cur = if v.wired {
+            crate::varreg::env_get(&self.env, v.name).unwrap_or_default()
+        } else {
+            v.default.to_string()
+        };
+        let mut changed: Option<String> = None;
+        match v.kind {
+            Kind::Bool => {
+                let mut b = matches!(cur.as_str(), "on" | "true" | "1");
+                let label = if b { "On" } else { "Off" };
+                if ui.checkbox(&mut b, label).changed() {
+                    changed = Some(if b { "true" } else { "false" }.into());
+                }
+            }
+            Kind::U8 { min, max } => {
+                let mut n: u8 = cur.parse().unwrap_or(min);
+                if ui.add(egui::DragValue::new(&mut n).range(min..=max)).changed() {
+                    changed = Some(n.to_string());
+                }
+            }
+            Kind::Int { min, max } => {
+                let mut n: i64 = cur.parse().unwrap_or(min);
+                if ui.add(egui::DragValue::new(&mut n).range(min..=max)).changed() {
+                    changed = Some(n.to_string());
+                }
+            }
+            Kind::Float { min, max } => {
+                let mut f: f64 = cur.parse().unwrap_or(0.0);
+                let speed = ((max - min) / 500.0).clamp(0.001, 1.0);
+                if ui.add(egui::DragValue::new(&mut f).range(min..=max).speed(speed)).changed() {
+                    changed = Some(format!("{}", f));
+                }
+            }
+            Kind::Choice(names) => {
+                let cur_idx = names.iter().position(|n| *n == cur)
+                    .unwrap_or_else(|| cur.parse().unwrap_or(0));
+                let mut sel = cur_idx;
+                egui::ComboBox::from_id_salt(v.name)
+                    .selected_text(names.get(sel).copied().unwrap_or(""))
+                    .width(140.0)
+                    .show_ui(ui, |ui| {
+                        for (i, name) in names.iter().enumerate() {
+                            ui.selectable_value(&mut sel, i, *name);
+                        }
+                    });
+                if sel != cur_idx { changed = Some(sel.to_string()); }
+            }
+            Kind::Color => {
+                let rgb = u32::from_str_radix(cur.trim_start_matches("0x")
+                    .trim_start_matches("0X"), 16).unwrap_or(0);
+                let mut c = egui::Color32::from_rgb(
+                    (rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8);
+                if ui.color_edit_button_srgba(&mut c).changed() {
+                    changed = Some(format!("0x{:02X}{:02X}{:02X}", c.r(), c.g(), c.b()));
+                }
+            }
+            Kind::Text => {
+                let mut s = cur.clone();
+                if ui.add(egui::TextEdit::singleline(&mut s).desired_width(150.0)).changed() {
+                    changed = Some(s);
+                }
+            }
+        }
+        if let (Some(nv), true) = (changed, v.wired) {
+            match crate::varreg::env_set(&mut self.env, v.name, &nv) {
+                Ok(_)  => { let _ = self.env.save(); }
+                Err(e) => self.history.push(format!("  ! {}: {}", v.name, e)),
+            }
+        }
+    }
+
+    /// `setvar` / bare-variable-name handler. `name=None` (or "?") lists the
+    /// editable variables; `name` + non-empty `value` sets it inline; `name`
+    /// alone queries + arms the value prompt (for wired vars) or reports the
+    /// read-only status (for unwired ones).
+    fn handle_setvar(&mut self, name: Option<&str>, value: &str) {
+        let Some(name) = name else { self.list_setvars(); return; };
+        if name == "?" { self.list_setvars(); return; }
+        let Some(var) = crate::varreg::find(name) else {
+            self.history.push(format!("  ! unknown variable '{}'", name));
+            return;
+        };
+        let canon = var.name;
+        if !value.trim().is_empty() {
+            match crate::varreg::env_set(&mut self.env, canon, value.trim()) {
+                Ok(_) => {
+                    let _ = self.env.save();
+                    let nv = crate::varreg::env_get(&self.env, canon).unwrap_or_default();
+                    self.history.push(format!("  {} = {}", canon, nv));
+                }
+                Err(e) => self.history.push(format!("  ! {}", e)),
+            }
+            return;
+        }
+        if var.wired {
+            let cur = crate::varreg::env_get(&self.env, canon).unwrap_or_default();
+            self.var_set_pending = Some(canon.to_string());
+            self.set_prompt(format!(
+                "Enter new value for {} <{}>:  [Esc=cancel]", canon, cur));
+        } else {
+            self.history.push(format!(
+                "  {} = {} ({:?} — not editable yet)", canon, var.default, var.status));
+        }
+    }
+
+    /// List the editable (wired) variables with their current values.
+    fn list_setvars(&mut self) {
+        self.history.push("  Editable variables — `setvar NAME VALUE` or type the name:".into());
+        for v in crate::varreg::VARS.iter().filter(|v| v.wired) {
+            let cur = crate::varreg::env_get(&self.env, v.name).unwrap_or_default();
+            self.history.push(format!("    {:<8} = {:<14} {}", v.name, cur, v.desc));
+        }
+    }
+
     /// Re-issue the fillet prompt with the current radius, trim mode,
     /// and multiple-mode badges. Called after any sub-option toggle.
     fn refresh_fillet_prompt(&mut self) {
         let r = self.env.FltRad;
         let tm = if self.env.TrmMd { "trim" } else { "no-trim" };
         let mm = if self.fillet_multiple { ", multi" } else { "" };
-        let phase = match self.fillet_state {
-            FilletState::WaitingForFirst(_)  => "click FIRST line on SIDE to KEEP",
-            FilletState::WaitingForSecond(..) => "click SECOND line",
-            FilletState::Off => return,
+        let pm = if self.fillet_poly_all { ", POLY" } else { "" };
+        let phase = if self.fillet_poly_all {
+            "pick a POLYLINE to round ALL corners"
+        } else {
+            match self.fillet_state {
+                FilletState::WaitingForFirst(_)  => "click FIRST object (or two segments of a polyline)",
+                FilletState::WaitingForSecond(..) => "click SECOND object",
+                FilletState::Off => return,
+            }
         };
         self.set_prompt(format!(
-            "fillet (r={}, {}{}): {}  [t=trim, m=multi, r=radius, Esc]",
-            r, tm, mm, phase));
+            "fillet (r={}, {}{}{}): {}  [t=trim, m=multi, p=poly, r=radius, Esc]",
+            r, tm, mm, pm, phase));
+    }
+
+    /// A fillet failed because the radius was too large. Stay IN the fillet
+    /// command and ask for a smaller radius (arms `fillet_waiting_radius` so
+    /// the next typed number becomes the new radius). Returns true when it
+    /// armed the re-prompt, so the caller knows not to exit / overwrite it.
+    fn fillet_radius_too_big(&mut self, msg: &str) -> bool {
+        if !msg.contains("too large") { return false; }
+        self.fillet_waiting_radius = true;
+        self.set_prompt(format!(
+            "fillet: {} — type a SMALLER radius <{}> then re-pick  [Esc=cancel]",
+            msg, self.env.FltRad));
+        true
+    }
+
+    /// Mirror of `fillet_radius_too_big` for Chamfer — re-prompt for distances.
+    fn chamfer_dist_too_big(&mut self, msg: &str) -> bool {
+        if !(msg.contains("too large") || msg.contains("exceeds")) { return false; }
+        self.chamfer_dist_wait = ChamferDistWait::WaitingD1;
+        self.set_prompt(format!(
+            "chamfer: {} — type a SMALLER first distance <{}> then re-pick  [Esc=cancel]",
+            msg, self.env.ChmDs1));
+        true
     }
 
     /// Re-issue the chamfer prompt — mirror of `refresh_fillet_prompt`.
@@ -15132,20 +15655,145 @@ impl CadApp {
         let d2 = self.env.ChmDs2;
         let tm = if self.env.TrmMd { "trim" } else { "no-trim" };
         let mm = if self.chamfer_multiple { ", multi" } else { "" };
-        let phase = match self.chamfer_state {
-            ChamferState::WaitingForFirst(..)  => "click FIRST line",
-            ChamferState::WaitingForSecond(..) => "click SECOND line",
-            ChamferState::Off => return,
+        let pm = if self.chamfer_poly_all { ", POLY" } else { "" };
+        let phase = if self.chamfer_poly_all {
+            "pick a POLYLINE to bevel ALL corners"
+        } else {
+            match self.chamfer_state {
+                ChamferState::WaitingForFirst(..)  => "click FIRST object (or two segments of a polyline)",
+                ChamferState::WaitingForSecond(..) => "click SECOND object",
+                ChamferState::Off => return,
+            }
         };
         self.set_prompt(format!(
-            "chamfer (d1={}, d2={}, {}{}): {}  [t=trim, m=multi, d=distance, Esc]",
-            d1, d2, tm, mm, phase));
+            "chamfer (d1={}, d2={}, {}{}{}): {}  [t=trim, m=multi, p=poly, d=distance, Esc]",
+            d1, d2, tm, mm, pm, phase));
     }
 
     // ---------------------------------------------------------------------
-    // Slice M.3 — Fillet (line-line). Two clicks; second click commits.
+    // Fillet dispatcher. Routes the two picks:
+    //   * same polyline, two different segments → corner fillet (insert arc)
+    //   * Line/Wall pair                        → centerline path (curved walls)
+    //   * anything with Arc / Polyline-end      → generalized kernel solver
     // ---------------------------------------------------------------------
     fn apply_fillet(&mut self, r: f64, idx1: usize, pick1: Vec2,
+                                  idx2: usize, pick2: Vec2) {
+        if idx1 == idx2 {
+            // Two segments of the SAME polyline → round that corner in place.
+            self.apply_fillet_corner(r, idx1, pick1, pick2);
+            return;
+        }
+        let is_lw = |g: &Geom| matches!(g, Geom::Line(_) | Geom::Wall(_));
+        let lw = self.doc.dobjects.get(idx1).map(|d| is_lw(&d.geom)).unwrap_or(false)
+              && self.doc.dobjects.get(idx2).map(|d| is_lw(&d.geom)).unwrap_or(false);
+        if lw {
+            self.apply_fillet_lines(r, idx1, pick1, idx2, pick2);
+        } else {
+            self.apply_fillet_general(r, idx1, pick1, idx2, pick2);
+        }
+    }
+
+    /// Generalized fillet for any Line/Arc/Polyline-end pair (kernel solver).
+    fn apply_fillet_general(&mut self, r: f64, idx1: usize, pick1: Vec2,
+                                       idx2: usize, pick2: Vec2) {
+        let (Some(d1), Some(d2)) =
+            (self.doc.dobjects.get(idx1), self.doc.dobjects.get(idx2)) else { return; };
+        let g1 = d1.geom.clone();
+        let g2 = d2.geom.clone();
+        let style1 = d1.style;
+        self.snapshot_doc();
+        let trim = self.env.TrmMd;
+        match cad_kernel::fillet_geoms(&g1, pick1, &g2, pick2, r) {
+            Ok(out) => {
+                if trim {
+                    if let Some(d) = self.doc.dobjects.get_mut(idx1) { d.geom = out.g1_new; }
+                    if let Some(d) = self.doc.dobjects.get_mut(idx2) { d.geom = out.g2_new; }
+                }
+                if let Some(arc_geom) = out.arc {
+                    let mut d = DObject::new(arc_geom);
+                    d.style = style1;
+                    self.doc.push(d);
+                }
+                self.history.push(format!(
+                    "  ⌐ fillet ✓ r={} between #{} and #{} ({})",
+                    r, idx1, idx2, if trim { "trim" } else { "no-trim" }));
+                self.intersections.clear();
+                self.index_dirty = true;
+                self.gpu_dirty = true;
+            }
+            Err(msg) => {
+                if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
+                self.history.push(format!("  ! {}", msg));
+                self.fillet_radius_too_big(&msg);
+            }
+        }
+    }
+
+    /// Fillet the corner between two segments of one polyline (in place).
+    fn apply_fillet_corner(&mut self, r: f64, idx: usize, pick1: Vec2, pick2: Vec2) {
+        let Some(d) = self.doc.dobjects.get(idx) else { return; };
+        let Geom::Polyline(pl) = d.geom.clone() else {
+            self.history.push("  ! fillet: same object clicked twice".into());
+            return;
+        };
+        let (Some(sa), Some(sb)) = (
+            cad_kernel::nearest_polyline_segment(&pl, pick1),
+            cad_kernel::nearest_polyline_segment(&pl, pick2),
+        ) else {
+            self.history.push("  ! fillet: couldn't locate the polyline segments".into());
+            return;
+        };
+        if sa == sb {
+            self.history.push("  ! fillet: click two DIFFERENT segments of the polyline".into());
+            return;
+        }
+        self.snapshot_doc();
+        match cad_kernel::fillet_polyline_corner(&pl, sa, sb, r) {
+            Ok(np) => {
+                if let Some(d) = self.doc.dobjects.get_mut(idx) { d.geom = Geom::Polyline(np); }
+                self.history.push(format!(
+                    "  ⌐ fillet ✓ r={} corner of polyline #{} (segments {}+{})", r, idx, sa, sb));
+                self.intersections.clear();
+                self.index_dirty = true;
+                self.gpu_dirty = true;
+            }
+            Err(msg) => {
+                if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
+                self.history.push(format!("  ! {}", msg));
+                self.fillet_radius_too_big(&msg);
+            }
+        }
+    }
+
+    /// Fillet EVERY corner of one polyline (the `P` option).
+    fn apply_fillet_poly_all(&mut self, r: f64, idx: usize) {
+        let Some(d) = self.doc.dobjects.get(idx) else { return; };
+        let Geom::Polyline(pl) = d.geom.clone() else {
+            self.history.push("  ! fillet P: pick a POLYLINE".into());
+            return;
+        };
+        self.snapshot_doc();
+        match cad_kernel::fillet_polyline_all(&pl, r) {
+            Ok((np, count)) => {
+                if let Some(d) = self.doc.dobjects.get_mut(idx) { d.geom = Geom::Polyline(np); }
+                self.history.push(format!(
+                    "  ⌐ fillet ✓ r={} on polyline #{} — {} corner(s) rounded", r, idx, count));
+                self.intersections.clear();
+                self.index_dirty = true;
+                self.gpu_dirty = true;
+            }
+            Err(msg) => {
+                if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
+                self.history.push(format!("  ! {}", msg));
+                self.fillet_radius_too_big(&msg);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Slice M.3 — Fillet (line-line / walls). Two clicks; second commits.
+    // ---------------------------------------------------------------------
+    fn apply_fillet_lines(&mut self, r: f64, idx1: usize, pick1: Vec2,
                                   idx2: usize, pick2: Vec2) {
         if idx1 == idx2 {
             self.history.push("  ! fillet: same dobject clicked twice".into());
@@ -15230,6 +15878,126 @@ impl CadApp {
             Err(msg) => {
                 if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
                 self.history.push(format!("  ! fillet: {}", msg));
+                self.fillet_radius_too_big(msg);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Chamfer dispatcher — mirror of apply_fillet's routing.
+    // ---------------------------------------------------------------------
+    fn apply_chamfer(&mut self, d1_dist: f64, d2_dist: f64,
+                                idx1: usize, pick1: Vec2,
+                                idx2: usize, pick2: Vec2) {
+        if idx1 == idx2 {
+            self.apply_chamfer_corner(d1_dist, d2_dist, idx1, pick1, pick2);
+            return;
+        }
+        let is_l = |g: &Geom| matches!(g, Geom::Line(_));
+        let ll = self.doc.dobjects.get(idx1).map(|d| is_l(&d.geom)).unwrap_or(false)
+              && self.doc.dobjects.get(idx2).map(|d| is_l(&d.geom)).unwrap_or(false);
+        if ll {
+            self.apply_chamfer_lines(d1_dist, d2_dist, idx1, pick1, idx2, pick2);
+        } else {
+            self.apply_chamfer_general(d1_dist, d2_dist, idx1, pick1, idx2, pick2);
+        }
+    }
+
+    /// Generalized chamfer for any Line/Arc/Polyline-end pair.
+    fn apply_chamfer_general(&mut self, d1_dist: f64, d2_dist: f64,
+                                        idx1: usize, pick1: Vec2,
+                                        idx2: usize, pick2: Vec2) {
+        let (Some(da), Some(db)) =
+            (self.doc.dobjects.get(idx1), self.doc.dobjects.get(idx2)) else { return; };
+        let g1 = da.geom.clone();
+        let g2 = db.geom.clone();
+        let style1 = da.style;
+        self.snapshot_doc();
+        let trim = self.env.TrmMd;
+        match cad_kernel::chamfer_geoms(&g1, pick1, &g2, pick2, d1_dist, d2_dist) {
+            Ok(out) => {
+                if trim {
+                    if let Some(d) = self.doc.dobjects.get_mut(idx1) { d.geom = out.g1_new; }
+                    if let Some(d) = self.doc.dobjects.get_mut(idx2) { d.geom = out.g2_new; }
+                }
+                let mut bridge = DObject::new(out.bridge);
+                bridge.style = style1;
+                self.doc.push(bridge);
+                self.history.push(format!(
+                    "  ⌐ chamfer ✓ d=({}, {}) between #{} and #{} ({})",
+                    d1_dist, d2_dist, idx1, idx2, if trim { "trim" } else { "no-trim" }));
+                self.intersections.clear();
+                self.index_dirty = true;
+                self.gpu_dirty = true;
+            }
+            Err(msg) => {
+                if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
+                self.history.push(format!("  ! {}", msg));
+                self.chamfer_dist_too_big(&msg);
+            }
+        }
+    }
+
+    /// Chamfer the corner between two segments of one polyline (in place).
+    fn apply_chamfer_corner(&mut self, d1_dist: f64, d2_dist: f64,
+                                       idx: usize, pick1: Vec2, pick2: Vec2) {
+        let Some(d) = self.doc.dobjects.get(idx) else { return; };
+        let Geom::Polyline(pl) = d.geom.clone() else {
+            self.history.push("  ! chamfer: same object clicked twice".into());
+            return;
+        };
+        let (Some(sa), Some(sb)) = (
+            cad_kernel::nearest_polyline_segment(&pl, pick1),
+            cad_kernel::nearest_polyline_segment(&pl, pick2),
+        ) else {
+            self.history.push("  ! chamfer: couldn't locate the polyline segments".into());
+            return;
+        };
+        if sa == sb {
+            self.history.push("  ! chamfer: click two DIFFERENT segments of the polyline".into());
+            return;
+        }
+        self.snapshot_doc();
+        match cad_kernel::chamfer_polyline_corner(&pl, sa, sb, d1_dist, d2_dist) {
+            Ok(np) => {
+                if let Some(d) = self.doc.dobjects.get_mut(idx) { d.geom = Geom::Polyline(np); }
+                self.history.push(format!(
+                    "  ⌐ chamfer ✓ d=({}, {}) corner of polyline #{} (segments {}+{})",
+                    d1_dist, d2_dist, idx, sa, sb));
+                self.intersections.clear();
+                self.index_dirty = true;
+                self.gpu_dirty = true;
+            }
+            Err(msg) => {
+                if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
+                self.history.push(format!("  ! {}", msg));
+                self.chamfer_dist_too_big(&msg);
+            }
+        }
+    }
+
+    /// Chamfer EVERY corner of one polyline (the `P` option).
+    fn apply_chamfer_poly_all(&mut self, d1_dist: f64, d2_dist: f64, idx: usize) {
+        let Some(d) = self.doc.dobjects.get(idx) else { return; };
+        let Geom::Polyline(pl) = d.geom.clone() else {
+            self.history.push("  ! chamfer P: pick a POLYLINE".into());
+            return;
+        };
+        self.snapshot_doc();
+        match cad_kernel::chamfer_polyline_all(&pl, d1_dist, d2_dist) {
+            Ok((np, count)) => {
+                if let Some(d) = self.doc.dobjects.get_mut(idx) { d.geom = Geom::Polyline(np); }
+                self.history.push(format!(
+                    "  ⌐ chamfer ✓ d=({}, {}) on polyline #{} — {} corner(s) beveled",
+                    d1_dist, d2_dist, idx, count));
+                self.intersections.clear();
+                self.index_dirty = true;
+                self.gpu_dirty = true;
+            }
+            Err(msg) => {
+                if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
+                self.history.push(format!("  ! {}", msg));
+                self.chamfer_dist_too_big(&msg);
             }
         }
     }
@@ -15237,7 +16005,7 @@ impl CadApp {
     // ---------------------------------------------------------------------
     // Slice M.4 — Chamfer (line-line).
     // ---------------------------------------------------------------------
-    fn apply_chamfer(&mut self, d1_dist: f64, d2_dist: f64,
+    fn apply_chamfer_lines(&mut self, d1_dist: f64, d2_dist: f64,
                                 idx1: usize, pick1: Vec2,
                                 idx2: usize, pick2: Vec2) {
         if idx1 == idx2 {
@@ -15277,6 +16045,7 @@ impl CadApp {
             Err(msg) => {
                 if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
                 self.history.push(format!("  ! chamfer: {}", msg));
+                self.chamfer_dist_too_big(msg);
             }
         }
     }
@@ -16495,12 +17264,76 @@ fn active_snap_letters(s: SnapSet) -> String {
     buf
 }
 
-// ---- Settings-window widgets ----------------------------------------------
+// ---- Registry-driven settings page widgets --------------------------------
+
+/// A left-sidebar section entry: name + variable count, selectable.
+fn settings_section_item(ui: &mut egui::Ui, name: &str, count: usize, selected: bool) -> bool {
+    let h = 26.0;
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), h), egui::Sense::click());
+    let bg = if selected {
+        egui::Color32::from_rgb(38, 54, 72)
+    } else if resp.hovered() {
+        egui::Color32::from_rgb(32, 37, 46)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, 3.0, bg);
+    if selected {
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(rect.left_top(), egui::vec2(3.0, h)),
+            0.0, egui::Color32::from_rgb(91, 155, 213));
+    }
+    let txt_c = if selected { egui::Color32::from_rgb(225, 232, 240) }
+               else { egui::Color32::from_rgb(170, 178, 190) };
+    ui.painter().text(egui::pos2(rect.left() + 10.0, rect.center().y),
+        egui::Align2::LEFT_CENTER, name, egui::FontId::proportional(12.5), txt_c);
+    ui.painter().text(egui::pos2(rect.right() - 8.0, rect.center().y),
+        egui::Align2::RIGHT_CENTER, count.to_string(),
+        egui::FontId::monospace(10.0), egui::Color32::from_rgb(110, 118, 130));
+    resp.clicked()
+}
+
+/// (colour, label) for a variable status.
+fn settings_status_meta(s: crate::varreg::Status) -> (egui::Color32, &'static str) {
+    use crate::varreg::Status;
+    match s {
+        Status::Active    => (egui::Color32::from_rgb(67, 181, 129), "ACTIVE"),
+        Status::Planned   => (egui::Color32::from_rgb(91, 155, 213), "PLANNED"),
+        Status::Stub      => (egui::Color32::from_rgb(120, 128, 140), "STUB"),
+        Status::Tentative => (egui::Color32::from_rgb(212, 168, 83), "TENTAT."),
+    }
+}
+
+/// A small pill badge for a variable's status.
+fn settings_status_badge(ui: &mut egui::Ui, s: crate::varreg::Status) {
+    let (col, label) = settings_status_meta(s);
+    let galley = ui.painter().layout_no_wrap(
+        label.to_string(), egui::FontId::proportional(9.0), col);
+    let pad = egui::vec2(6.0, 3.0);
+    let (rect, _resp) = ui.allocate_exact_size(
+        galley.size() + pad * 2.0, egui::Sense::hover());
+    ui.painter().rect(rect, 3.0, col.linear_multiply(0.12),
+        egui::Stroke::new(1.0, col.linear_multiply(0.5)));
+    ui.painter().galley(rect.center() - galley.size() * 0.5, galley, col);
+}
+
+/// The status legend shown in the panel header.
+fn settings_legend(ui: &mut egui::Ui) {
+    use crate::varreg::Status;
+    for s in [Status::Tentative, Status::Stub, Status::Planned, Status::Active] {
+        let (col, label) = settings_status_meta(s);
+        ui.label(egui::RichText::new(label).size(9.0).color(col));
+    }
+}
+
+// ---- Legacy settings-window widgets (kept for env preview helpers) ---------
 //
 // Each row pairs the cryptic field name (bold, monospace) with a plain-
 // English description and a type-appropriate input. The cryptic name is
 // what gets persisted; the description is just for humans.
 
+#[allow(dead_code)]
 fn env_row(ui: &mut egui::Ui, key: &str, desc: &str, body: impl FnOnce(&mut egui::Ui)) {
     ui.horizontal(|ui| {
         ui.add_sized([70.0, 18.0],
@@ -17679,6 +18512,231 @@ fn aci_color_picker(
 ///
 /// `active` highlights the button in the same blue as a selected drafting
 /// tool — visual cue that the corresponding panel is open / feature is on.
+// ---------------------------------------------------------------------------
+// Quick Access Toolbar — top line. A customizable strip of file/common-action
+// icon shortcuts, plus the AutoRASM logo on the left and the product title on
+// the right. The set of shortcuts is edited through the `▾` customize drop
+// window. Command (drafting) icons are a separate strip, handled elsewhere.
+// ---------------------------------------------------------------------------
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum QatAction {
+    New,
+    Open,
+    Save,
+    SaveAs,
+    Undo,
+    Redo,
+}
+
+impl QatAction {
+    /// Every action offered in the customize drop window, in display order.
+    fn all() -> [QatAction; 6] {
+        [QatAction::New, QatAction::Open, QatAction::Save, QatAction::SaveAs,
+         QatAction::Undo, QatAction::Redo]
+    }
+    /// The shortcuts shown by default (first run / before customization).
+    fn default_set() -> Vec<QatAction> {
+        QatAction::all().to_vec()
+    }
+    /// Human label for the customize list + tooltips.
+    fn label(self) -> &'static str {
+        match self {
+            QatAction::New    => "New",
+            QatAction::Open   => "Open…",
+            QatAction::Save   => "Save",
+            QatAction::SaveAs => "Save As",
+            QatAction::Undo   => "Undo",
+            QatAction::Redo   => "Redo",
+        }
+    }
+}
+
+/// Try to load the brand logo PNG into a texture. Looks in a few likely spots
+/// so it works from the repo root, the crate dir, or next to the exe. Returns
+/// None if the file isn't there (caller draws a placeholder).
+fn load_logo_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    // Prefer the vector SVG (crisp at any size); fall back to a PNG.
+    let svg = [
+        concat!(env!("CARGO_MANIFEST_DIR"), "/assets/logo.svg"),
+        "cad_app/assets/logo.svg",
+        "assets/logo.svg",
+    ];
+    for path in svg {
+        if let Ok(bytes) = std::fs::read(path) {
+            if let Some(tex) = rasterize_svg_logo(ctx, &bytes) { return Some(tex); }
+        }
+    }
+    let png = [
+        concat!(env!("CARGO_MANIFEST_DIR"), "/assets/logo.png"),
+        "cad_app/assets/logo.png",
+        "assets/logo.png",
+    ];
+    for path in png {
+        let Ok(bytes) = std::fs::read(path) else { continue };
+        let Ok(img) = image::load_from_memory(&bytes) else { continue };
+        let img = img.resize(256, 256, image::imageops::FilterType::Lanczos3);
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        let color = egui::ColorImage::from_rgba_unmultiplied(
+            [w as usize, h as usize], rgba.as_raw());
+        return Some(ctx.load_texture("autorasm_logo", color, egui::TextureOptions::LINEAR));
+    }
+    None
+}
+
+/// Rasterize an SVG to a texture at a generous resolution so it stays sharp.
+fn rasterize_svg_logo(ctx: &egui::Context, data: &[u8]) -> Option<egui::TextureHandle> {
+    use resvg::{tiny_skia, usvg};
+    let opt = usvg::Options::default();
+    let tree = usvg::Tree::from_data(data, &opt).ok()?;
+    let size = tree.size();
+    // Render so the longest side is ~256 px (≥ any sensible on-screen size).
+    let target = 256.0;
+    let scale = target / size.width().max(size.height());
+    let pw = (size.width() * scale).ceil().max(1.0) as u32;
+    let ph = (size.height() * scale).ceil().max(1.0) as u32;
+    let mut pixmap = tiny_skia::Pixmap::new(pw, ph)?;
+    resvg::render(&tree, tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
+    let color = egui::ColorImage::from_rgba_premultiplied(
+        [pw as usize, ph as usize], pixmap.data());
+    Some(ctx.load_texture("autorasm_logo", color, egui::TextureOptions::LINEAR))
+}
+
+/// Painted placeholder logo (brand-teal gear ring + gold "R"), used until the
+/// real PNG is dropped at assets/logo.png.
+fn draw_logo_placeholder(p: &egui::Painter, rect: egui::Rect) {
+    let c = rect.center();
+    let teal = egui::Color32::from_rgb(38, 78, 98);
+    let gold = egui::Color32::from_rgb(214, 184, 122);
+    let radius = rect.width().min(rect.height()) * 0.34;
+    for k in 0..10 {
+        let a = (k as f32) / 10.0 * std::f32::consts::TAU;
+        let dir = egui::vec2(a.cos(), a.sin());
+        p.line_segment([c + dir * radius, c + dir * (radius + 4.0)],
+            egui::Stroke::new(3.0, teal));
+    }
+    p.circle_stroke(c, radius, egui::Stroke::new(3.0, teal));
+    p.text(c, egui::Align2::CENTER_CENTER, "R",
+        egui::FontId::proportional(radius * 1.1), gold);
+}
+
+/// One Quick Access shortcut button — a small flat icon tile. Icon stroke
+/// uses the same colour as the menu-category text so the bar reads uniform.
+fn qat_button(ui: &mut egui::Ui, act: QatAction) -> bool {
+    let col = ui.visuals().widgets.inactive.fg_stroke.color;
+    let size = egui::vec2(28.0, 28.0);
+    let (resp, painter) = ui.allocate_painter(size, egui::Sense::click());
+    let rect = resp.rect;
+    if resp.hovered() {
+        painter.rect(rect, 4.0, egui::Color32::from_rgb(48, 58, 72), egui::Stroke::NONE);
+    }
+    let icol = if resp.hovered() { egui::Color32::from_rgb(225, 235, 245) } else { col };
+    paint_qat_icon(&painter, rect.shrink(6.0), act, icol);
+    resp.on_hover_text(act.label()).clicked()
+}
+
+/// Simple geometric glyphs for the QAT actions (placeholder art — clean and
+/// recognizable without needing image assets).
+fn paint_qat_icon(painter: &egui::Painter, r: egui::Rect, act: QatAction, col: egui::Color32) {
+    let st = egui::Stroke::new(1.6, col);
+    match act {
+        QatAction::New => {
+            // A page with a folded top-right corner.
+            let fold = r.width() * 0.32;
+            let tl = r.left_top();
+            let tr = egui::pos2(r.right() - fold, r.top());
+            let pts = vec![
+                tl, tr,
+                egui::pos2(r.right(), r.top() + fold),
+                r.right_bottom(), r.left_bottom(), tl,
+            ];
+            painter.add(egui::Shape::closed_line(pts, st));
+            painter.line_segment([tr, egui::pos2(r.right(), r.top() + fold)], st);
+            painter.line_segment([tr, egui::pos2(r.right() - fold, r.top() + fold)], st);
+            painter.line_segment([egui::pos2(r.right() - fold, r.top() + fold),
+                                  egui::pos2(r.right(), r.top() + fold)], st);
+        }
+        QatAction::Open => {
+            // An open folder (trapezoid lid).
+            let y0 = r.top() + r.height() * 0.30;
+            painter.add(egui::Shape::closed_line(vec![
+                egui::pos2(r.left(), y0),
+                egui::pos2(r.left() + r.width() * 0.45, y0),
+                egui::pos2(r.left() + r.width() * 0.55, r.top() + r.height() * 0.12),
+                egui::pos2(r.right(), r.top() + r.height() * 0.12),
+                egui::pos2(r.right(), r.bottom()),
+                egui::pos2(r.left(), r.bottom()),
+            ], st));
+        }
+        QatAction::Save | QatAction::SaveAs => {
+            // A floppy disk: outer square + label notch + shutter.
+            painter.rect_stroke(r, 2.0, st);
+            let top = egui::Rect::from_min_max(
+                egui::pos2(r.left() + r.width() * 0.22, r.top()),
+                egui::pos2(r.right() - r.width() * 0.18, r.top() + r.height() * 0.34));
+            painter.rect_stroke(top, 0.0, st);
+            let body = egui::Rect::from_min_max(
+                egui::pos2(r.left() + r.width() * 0.18, r.top() + r.height() * 0.52),
+                egui::pos2(r.right() - r.width() * 0.18, r.bottom() - r.height() * 0.10));
+            painter.rect_stroke(body, 0.0, st);
+            // Save-As: a small pencil stroke over the disk to mark "as…".
+            if matches!(act, QatAction::SaveAs) {
+                painter.line_segment(
+                    [egui::pos2(r.right() - 1.0, r.top() - 1.0),
+                     egui::pos2(r.right() - r.width() * 0.45, r.top() + r.height() * 0.45)],
+                    egui::Stroke::new(1.6, col));
+            }
+        }
+        QatAction::Undo | QatAction::Redo => {
+            // A curved arrow. Redo is the mirror of Undo.
+            let mirror = matches!(act, QatAction::Redo);
+            let cy = r.center().y;
+            let mut pts = Vec::new();
+            for k in 0..=16 {
+                let t = k as f32 / 16.0;
+                let a = std::f32::consts::PI * (0.15 + t * 0.85);
+                let x = r.center().x + a.cos() * r.width() * 0.40;
+                let y = cy + a.sin() * r.height() * 0.34;
+                pts.push(egui::pos2(if mirror { 2.0 * r.center().x - x } else { x }, y));
+            }
+            painter.add(egui::Shape::line(pts.clone(), st));
+            // Arrowhead at the start of the arc.
+            if let Some(&head) = pts.first() {
+                let dx = if mirror { -1.0 } else { 1.0 };
+                painter.line_segment([head, head + egui::vec2(4.0 * dx, -4.0)], st);
+                painter.line_segment([head, head + egui::vec2(4.0 * dx, 4.0)], st);
+            }
+        }
+    }
+}
+
+/// The "customize" affordance — a short bar with a down-chevron beneath it
+/// (the Office/AutoCAD Quick-Access drop button the user described as "arrow
+/// with a small line on top").
+fn qat_customize_button(ui: &mut egui::Ui, open: bool) -> egui::Response {
+    // Chevron uses the same colour as the menu/category text.
+    let col = ui.visuals().widgets.inactive.fg_stroke.color;
+    let size = egui::vec2(20.0, 28.0);
+    let _ = open;   // no special background when the drop window is open
+    let (resp, painter) = ui.allocate_painter(size, egui::Sense::click());
+    let rect = resp.rect;
+    if resp.hovered() {
+        painter.rect(rect, 4.0, egui::Color32::from_rgb(48, 58, 72), egui::Stroke::NONE);
+    }
+    let cx = rect.center().x;
+    let top = rect.top() + 10.0;
+    // Short horizontal bar.
+    painter.line_segment([egui::pos2(cx - 5.0, top), egui::pos2(cx + 5.0, top)],
+        egui::Stroke::new(1.6, col));
+    // Down chevron beneath.
+    painter.add(egui::Shape::line(vec![
+        egui::pos2(cx - 5.0, top + 4.0),
+        egui::pos2(cx, top + 9.0),
+        egui::pos2(cx + 5.0, top + 4.0),
+    ], egui::Stroke::new(1.6, col)));
+    resp.on_hover_text("Customize Quick Access Toolbar")
+}
+
 fn panel_button(ui: &mut egui::Ui, label: &str, active: bool) -> bool {
     // Allocate space matching tool_button height (52 px) but text-width
     // sized so the label decides the width.
@@ -18752,15 +19810,22 @@ impl eframe::App for CadApp {
                 self.align_state = AlignState::Off;
                 self.history.push("  align cancelled".into());
             }
+            if self.var_set_pending.is_some() {
+                self.var_set_pending = None;
+                self.clear_prompt();
+                self.history.push("  setvar cancelled".into());
+            }
             if self.fillet_state != FilletState::Off {
                 self.fillet_state = FilletState::Off;
                 self.fillet_multiple = false;
                 self.fillet_waiting_radius = false;
+                self.fillet_poly_all = false;
                 self.history.push("  fillet cancelled".into());
             }
             if self.chamfer_state != ChamferState::Off {
                 self.chamfer_state = ChamferState::Off;
                 self.chamfer_multiple = false;
+                self.chamfer_poly_all = false;
                 self.chamfer_dist_wait = ChamferDistWait::Off;
                 self.history.push("  chamfer cancelled".into());
             }
@@ -19219,12 +20284,45 @@ impl eframe::App for CadApp {
             if handled { self.cmd.clear(); }
         }
 
-        // ---- UI.2: MENUBAR (very top) -----------------------------------
-        // Declared BEFORE the toolbar so it sits at the absolute top.
-        // Every menu item dispatches via `run_command` so its behaviour
-        // matches typing the same cmd — keeps one source of truth.
-        egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
-            egui::menu::bar(ui, |ui| {
+        // ---- TOP BAR: logo (spanning) + Quick Access row + menu categories
+        // The AutoRASM logo sits in a tall left column that spans BOTH the
+        // Quick Access row and the menu-category row. Every menu item
+        // dispatches via `run_command` so its behaviour matches typing the
+        // same cmd — one source of truth.
+        egui::TopBottomPanel::top("topbar").show(ctx, |ui| {
+            ui.horizontal_top(|ui| {
+                self.draw_logo_column(ui);
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    ui.add_space(2.0);
+                    // --- line 1: customizable Quick Access shortcuts ---
+                    ui.horizontal(|ui| {
+                        let actions = self.qat_actions.clone();
+                        for act in actions {
+                            if qat_button(ui, act) { self.run_qat_action(act); }
+                        }
+                        ui.add_space(2.0);
+                        let chev = qat_customize_button(ui, self.qat_customize_open);
+                        self.qat_chevron_rect = Some(chev.rect);
+                        if chev.clicked() {
+                            if self.qat_customize_open {
+                                self.qat_customize_open = false;
+                            } else {
+                                self.qat_customize_open = true;
+                                self.qat_just_opened = true;
+                            }
+                        }
+                        // Product title, far right.
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(12.0);
+                            ui.label(egui::RichText::new("AutoRASM  2026")
+                                .size(15.0)
+                                .color(egui::Color32::from_rgb(176, 192, 208)));
+                        });
+                    });
+                    ui.add_space(1.0);
+                    // --- line 2: fixed menu categories ---
+                    egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("New (non-parametric)").clicked() {
                         self.run_command("clear");
@@ -19732,7 +20830,11 @@ impl eframe::App for CadApp {
                     }
                 });
             });
+                    });
+                });
         });
+        // The customize drop window (anchored just under the QAT bar).
+        self.qat_customize_window(ctx);
 
         // ---- top toolbar ------------------------------------------------
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
@@ -20127,117 +21229,8 @@ impl eframe::App for CadApp {
             if !keep { self.snap_window_open = false; }
         }
 
-        // ---- User-Environment Settings window ------------------------------
-        if self.settings_open {
-            let mut keep = true;
-            let mut save_now = false;
-            egui::Window::new("USER-ENVIRONMENT SETTINGS")
-                .open(&mut keep)
-                .resizable(true)
-                .default_width(760.0)
-                .default_height(560.0)
-                .default_pos(egui::pos2(40.0, 80.0))
-                .show(ctx, |ui| {
-                    ui.label("AutoCAD-style SYSVARS for RUST_CAD. Persists to ~/.config/rust_cad/user_env.txt");
-                    ui.separator();
-                    // Horizontal split: settings list on the left, live
-                    // preview on the right. Preview reflects current values
-                    // in real time as the user drags sliders / toggles boxes.
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            ui.set_min_width(450.0);
-                            ui.set_max_width(520.0);
-                            egui::ScrollArea::vertical()
-                                .id_salt("env_scroll")
-                                .max_height(440.0)
-                                .show(ui, |ui| {
-                        ui.heading("Snap & picking");
-                        env_u8(ui, "SpTGSZ", "Object-snap target height (px)",
-                            &mut self.env.SpTGSZ, 4, 80);
-                        env_u8(ui, "PkBxSz", "Pickbox height (px)",
-                            &mut self.env.PkBxSz, 1, 40);
-                        env_u8(ui, "CrsHrS", "Crosshair size (% of viewport)",
-                            &mut self.env.CrsHrS, 1, 100);
-
-                        ui.separator();
-                        ui.heading("Dialogs");
-                        env_bool(ui, "AtDlgM", "Attribute entry dialog on INSERT",
-                            &mut self.env.AtDlgM);
-                        env_bool(ui, "AtPrmM", "Attribute prompting during INSERT",
-                            &mut self.env.AtPrmM);
-                        env_bool(ui, "CmDlgM", "Dialog boxes for PLOT, etc.",
-                            &mut self.env.CmDlgM);
-                        env_bool(ui, "FlDlgM", "Use OS file-navigation dialogs",
-                            &mut self.env.FlDlgM);
-
-                        ui.separator();
-                        ui.heading("Display");
-                        env_u8_choice(ui, "DrDspM", "Dragging display during MOVE/COPY",
-                            &mut self.env.DrDspM, &["off", "on", "auto"]);
-                        env_bool(ui, "MnuBar", "Classic menu bar",
-                            &mut self.env.MnuBar);
-                        env_bool(ui, "TltEnb", "Toolbar/ribbon tooltips",
-                            &mut self.env.TltEnb);
-                        env_bool(ui, "RllTp",  "Tooltips on dobject rollover",
-                            &mut self.env.RllTp);
-                        env_bool(ui, "SelPrv", "Preview-highlight on hover",
-                            &mut self.env.SelPrv);
-                        env_bool(ui, "HltSel", "Highlight selected dobjects",
-                            &mut self.env.HltSel);
-                        env_u8_choice(ui, "WpFrmM", "Wipeout frame display",
-                            &mut self.env.WpFrmM, &["off", "on", "on for selection only"]);
-
-                        ui.separator();
-                        ui.heading("Grips");
-                        env_bool(ui, "GrpEnb", "Enable grips",
-                            &mut self.env.GrpEnb);
-                        env_bool(ui, "GrpBlk", "Grips inside blocks",
-                            &mut self.env.GrpBlk);
-                        env_color(ui, "GrClrU", "Unselected grip colour",
-                            &mut self.env.GrClrU);
-                        env_color(ui, "GrClrS", "Selected (hot) grip colour",
-                            &mut self.env.GrClrS);
-                        env_u8(ui, "GrpSz",  "Grip size (px)",
-                            &mut self.env.GrpSz, 1, 20);
-                        env_u8(ui, "GrpHvR", "Grip hover + grab radius (px)",
-                            &mut self.env.GrpHvR, 4, 80);
-
-                        ui.separator();
-                        ui.heading("External references");
-                        env_u8_choice(ui, "XrLdMd", "Xref demand-loading mode",
-                            &mut self.env.XrLdMd, &["off", "on", "on with copy"]);
-                        env_text(ui, "XrTmpP", "Temp path for xref copies",
-                            &mut self.env.XrTmpP);
-                            });   // ← close inner ScrollArea
-                        });       // ← close left vertical
-                        ui.separator();
-                        // Right column: live preview
-                        ui.vertical(|ui| {
-                            ui.heading("Live preview");
-                            ui.small("Reflects current values in real time.");
-                            ui.add_space(4.0);
-                            draw_settings_preview(ui, &self.env);
-                        });
-                    });
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        if ui.button("Save now").clicked() { save_now = true; }
-                        if ui.button("Reload from disk").clicked() {
-                            self.env = UserEnv::load();
-                        }
-                        if ui.button("Reset to defaults").clicked() {
-                            self.env = UserEnv::default();
-                        }
-                    });
-                });
-            if !keep { self.settings_open = false; }
-            if save_now {
-                match self.env.save() {
-                    Ok(_)  => self.history.push("  settings saved".into()),
-                    Err(e) => self.history.push(format!("  ! settings save failed: {}", e)),
-                }
-            }
-        }
+        // ---- User-Environment Settings window (registry-driven) ------------
+        self.settings_window(ctx);
 
         // ---- arc method picker ----------------------------------------------
         if self.arc_picker_open {
@@ -21028,7 +22021,16 @@ impl eframe::App for CadApp {
             // when the pline tool is mid-flow with at least 2 vertices.
             let pline_phantom: Option<DObject> = self.pline_phantom_dobject();
 
+            // Fillet/Chamfer pick ENTITIES, not points — object snap (the CEN
+            // aperture + radius-line to an arc's centre, END/MID markers, …) is
+            // pure visual noise there and must be suppressed even if a draw
+            // tool was left active when the command started (which otherwise
+            // keeps `snap_phase_active` true via `self.tool`).
+            let entity_pick_phase = self.fillet_state != FilletState::Off
+                || self.chamfer_state != ChamferState::Off
+                || self.flow_picks_object();   // circle Ttr tangent-object picks
             let snap_candidates: Vec<SnapHit> = if snap_phase_active
+                && !entity_pick_phase
                 && !self.picking_source && !self.intersect_pending_click
                 && (!self.doc.dobjects.is_empty() || pline_phantom.is_some())
             {
@@ -22164,10 +23166,24 @@ impl eframe::App for CadApp {
                         let tol_world = 10.0 / self.scale as f64;
                         let hit = self.nearest_entity_under(world, tol_world);
                         match (self.fillet_state, hit) {
+                            // Polyline mode (P option): the first pick is a
+                            // polyline whose every corner gets rounded.
+                            (FilletState::WaitingForFirst(r), Some(i)) if self.fillet_poly_all => {
+                                self.apply_fillet_poly_all(r, i);
+                                if self.fillet_waiting_radius {
+                                    // Radius too large — stay put; the apply
+                                    // armed a "type a smaller radius" prompt.
+                                } else if self.fillet_multiple {
+                                    self.fillet_state = FilletState::WaitingForFirst(r);
+                                    self.refresh_fillet_prompt();
+                                } else {
+                                    self.fillet_state = FilletState::Off;
+                                }
+                            }
                             (FilletState::WaitingForFirst(r), Some(i)) => {
                                 self.fillet_state = FilletState::WaitingForSecond(r, i, click_world);
                                 self.history.push(format!(
-                                    "  fillet — first = #{}. Click SECOND line on the side to KEEP.", i));
+                                    "  fillet — first = #{}. Click SECOND object (or another segment of the same polyline).", i));
                             }
                             (FilletState::WaitingForSecond(r, i1, p1), Some(i2)) => {
                                 self.apply_fillet(r, i1, p1, i2, click_world);
@@ -22175,7 +23191,9 @@ impl eframe::App for CadApp {
                                 // first-pick state with the same radius
                                 // instead of returning to Off. Esc
                                 // exits. Single-mode (default) → Off.
-                                if self.fillet_multiple {
+                                if self.fillet_waiting_radius {
+                                    // Radius too large — stay; re-prompt armed.
+                                } else if self.fillet_multiple {
                                     self.fillet_state = FilletState::WaitingForFirst(r);
                                     self.refresh_fillet_prompt();
                                 } else {
@@ -22191,15 +23209,28 @@ impl eframe::App for CadApp {
                         let tol_world = 10.0 / self.scale as f64;
                         let hit = self.nearest_entity_under(world, tol_world);
                         match (self.chamfer_state, hit) {
+                            (ChamferState::WaitingForFirst(d1, d2), Some(i)) if self.chamfer_poly_all => {
+                                self.apply_chamfer_poly_all(d1, d2, i);
+                                if self.chamfer_dist_wait != ChamferDistWait::Off {
+                                    // Distance too large — stay; re-prompt armed.
+                                } else if self.chamfer_multiple {
+                                    self.chamfer_state = ChamferState::WaitingForFirst(d1, d2);
+                                    self.refresh_chamfer_prompt();
+                                } else {
+                                    self.chamfer_state = ChamferState::Off;
+                                }
+                            }
                             (ChamferState::WaitingForFirst(d1, d2), Some(i)) => {
                                 self.chamfer_state =
                                     ChamferState::WaitingForSecond(d1, d2, i, click_world);
                                 self.history.push(format!(
-                                    "  chamfer — first = #{}. Click SECOND line.", i));
+                                    "  chamfer — first = #{}. Click SECOND object (or another segment of the same polyline).", i));
                             }
                             (ChamferState::WaitingForSecond(d1, d2, i1, p1), Some(i2)) => {
                                 self.apply_chamfer(d1, d2, i1, p1, i2, click_world);
-                                if self.chamfer_multiple {
+                                if self.chamfer_dist_wait != ChamferDistWait::Off {
+                                    // Distance too large — stay; re-prompt armed.
+                                } else if self.chamfer_multiple {
                                     self.chamfer_state =
                                         ChamferState::WaitingForFirst(d1, d2);
                                     self.refresh_chamfer_prompt();

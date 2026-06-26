@@ -5,13 +5,14 @@ mod gpu;
 mod hatch_trace;
 mod param_editor;
 mod settings;
+mod varreg;
 // wall feature logic now lives in the `cad_wall` crate (see ARCHITECTURE.md).
 
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 820.0])
-            .with_title("RUST_CAD — math calculation workbench"),
+            .with_title("AutoRASM 2026"),
         ..Default::default()
     };
     eframe::run_native(

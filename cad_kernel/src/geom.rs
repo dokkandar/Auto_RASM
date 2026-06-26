@@ -1141,12 +1141,16 @@ impl Geom {
             // click-pick; refine to bbox-distance when text starts
             // occupying significant screen area.
             Geom::Text(t) => t.position.dist(p),
-            // Dimension — min distance to the dimension's def points.
-            // The renderer's extension/dim lines are derived state;
-            // picking on those would require re-running the renderer
-            // for hit-test. v1 picks on the def points; refine later.
+            // Dimension — distance to the VISIBLE outline (extension lines +
+            // dim line, or leader for radius/diameter) so the user can click
+            // ON the line, plus the def/grip points (text anchor + def pts)
+            // as a fallback.
             Geom::Dimension(d) => {
                 let mut best = f64::INFINITY;
+                for (a, b) in d.outline_segments() {
+                    let dist = Line { a, b }.distance_to_point(p);
+                    if dist < best { best = dist; }
+                }
                 for gp in d.grip_points() {
                     let dist = gp.dist(p);
                     if dist < best { best = dist; }
@@ -2914,6 +2918,32 @@ mod fillet_chamfer_join_tests {
             approx_eq(a.x, 0.0) && approx_eq(a.y, 0.0) && approx_eq(b.x, 2.0) && approx_eq(b.y, 0.0)));
         assert!(ends.iter().any(|&(a, b)|
             approx_eq(a.x, 4.0) && approx_eq(a.y, 0.0) && approx_eq(b.x, 4.0) && approx_eq(b.y, 4.0)));
+    }
+
+    #[test]
+    fn dimension_picks_on_the_dim_line_not_only_def_points() {
+        // Aligned linear dim: def points (0,0)→(10,0), dim line offset down to
+        // y=-3. The visible dim line runs (0,-3)→(10,-3). A click at its midpoint
+        // (5,-3) — far from every def point — must hit-test as ~0 distance.
+        use crate::dim::{Dim, DimKind, LinearOrtho};
+        let d = Geom::Dimension(Dim {
+            kind: DimKind::Linear {
+                p1: Vec2::new(0.0, 0.0),
+                p2: Vec2::new(10.0, 0.0),
+                dimline_pos: Vec2::new(0.0, -3.0),
+                ortho: LinearOrtho::Aligned,
+            },
+            style: 0,
+            text_override: None,
+        });
+        // On the dim line, mid-span — previously INFINITY-ish (nearest def
+        // point is (0,0)/(10,0) ~5.8 away); now must be ~0.
+        assert!(d.distance_to_point(Vec2::new(5.0, -3.0)) < 1e-6);
+        // On an extension line (x=10 from y=0 to y=-3) at its midpoint.
+        assert!(d.distance_to_point(Vec2::new(10.0, -1.5)) < 1e-6);
+        // Well away from everything → large distance (still selectable only by
+        // window). Sanity that we didn't make everything "hit".
+        assert!(d.distance_to_point(Vec2::new(5.0, 20.0)) > 5.0);
     }
 
     #[test]
