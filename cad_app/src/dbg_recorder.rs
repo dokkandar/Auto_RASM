@@ -26,7 +26,10 @@
 //!     the user pressed Start in the Recorder window.
 
 use cad_kernel::{Document, Vec2};
+use std::fs::File;
+use std::io::Write;
 use std::panic::Location;
+use std::path::PathBuf;
 use std::time::Instant;
 
 // ===========================================================================
@@ -260,6 +263,18 @@ pub struct DbgRecorder {
     pub max_events:       usize,
     /// `true` → capture full Backtrace per event (very slow). Off by default.
     pub capture_backtrace: bool,
+    /// Path of the durable on-disk mirror for the CURRENT session (set on
+    /// `start`). The UI shows this so the user knows where to find the
+    /// dump after a crash / force-close.
+    pub log_path:         Option<PathBuf>,
+    /// Open handle to the on-disk mirror. Every event is written to it
+    /// immediately (unbuffered `File` → bytes reach the kernel), so the
+    /// timeline survives a panic, a hang the user force-closes, or an OOM
+    /// kill. `None` when not recording or if the file couldn't be opened.
+    file:                 Option<File>,
+    /// Monotonic sequence number for on-disk line labels (unaffected by
+    /// in-memory ring eviction, so file `#NNNNN` are always increasing).
+    written:              usize,
 }
 
 impl Default for DbgRecorder {
@@ -272,6 +287,9 @@ impl Default for DbgRecorder {
             auto_snap_every:  50,
             max_events:       100_000,
             capture_backtrace: false,
+            log_path:         None,
+            file:             None,
+            written:          0,
         }
     }
 }
@@ -282,6 +300,20 @@ impl DbgRecorder {
         self.session_started = Some(Instant::now());
         self.events.clear();
         self.snapshots.clear();
+        self.written = 0;
+        // Durable on-disk mirror — open a FRESH log so a crash / hang the
+        // user force-closes / OOM kill still leaves the whole timeline on
+        // disk. Best-effort: a failed open just disables the mirror; the
+        // in-memory recorder is unaffected. A plain `File` (no BufWriter)
+        // is deliberate — each write is handed to the kernel immediately,
+        // so the bytes survive even a hard kill of this process.
+        let path = std::env::temp_dir().join("rust_cad_session.log");
+        self.file = File::create(&path).ok();
+        if let Some(f) = self.file.as_mut() {
+            let _ = writeln!(f, "=== SESSION RECORDER (live mirror) — {} ===", reason);
+        }
+        eprintln!("[recorder] live crash-durable mirror → {}", path.display());
+        self.log_path = Some(path);
         // Stamp the start event without an auto-snapshot — the caller
         // (CadApp::dbg_start) is responsible for pushing the initial
         // doc snapshot via `take_snapshot`. Decoupled because the
@@ -291,6 +323,7 @@ impl DbgRecorder {
             event: DbgEvent::SessionStart { reason: reason.to_string() },
             location: Location::caller(),
         });
+        self.mirror_last_to_file();
     }
 
     pub fn stop(&mut self, reason: &str) {
@@ -304,7 +337,14 @@ impl DbgRecorder {
                 },
                 location: Location::caller(),
             });
+            self.mirror_last_to_file();
+            if let Some(f) = self.file.as_mut() {
+                let _ = writeln!(f, "=== END SESSION ({} events, {} snapshots) ===",
+                    self.events.len(), self.snapshots.len());
+                let _ = f.flush();
+            }
         }
+        self.file = None;   // close the handle — the OS flushes to disk
         self.recording = false;
     }
 
@@ -327,6 +367,31 @@ impl DbgRecorder {
             event,
             location: loc,
         });
+        self.mirror_last_to_file();
+    }
+
+    /// Append the most-recently-pushed event to the durable on-disk mirror
+    /// (if open). Formats one line identical to `dump_text`, using a
+    /// monotonic sequence number so the file stays readable even after
+    /// in-memory ring eviction. Best-effort — write errors are ignored so
+    /// logging can never break the app.
+    fn mirror_last_to_file(&mut self) {
+        if self.file.is_none() { return; }
+        let seq = self.written;
+        let line = match self.events.last() {
+            Some(r) => format!(
+                "[{:6.1} ms] #{:05} @ {}:{} — {}",
+                r.elapsed_ms, seq,
+                r.location.file().rsplit('/').next().unwrap_or(r.location.file()),
+                r.location.line(),
+                format_event_oneline(&r.event)),
+            None => return,
+        };
+        if let Some(f) = self.file.as_mut() {
+            let _ = f.write_all(line.as_bytes());
+            let _ = f.write_all(b"\n");
+        }
+        self.written += 1;
     }
 
     /// Push a Document snapshot. Caller (CadApp) owns the Document and

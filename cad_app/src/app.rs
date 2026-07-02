@@ -12,7 +12,7 @@ use std::thread;
 
 use cad_kernel::*;
 
-use crate::gpu::{view_matrix, CircleInstance, LineInstance, GpuShapeRenderer};
+use crate::gpu::{view_matrix, CircleInstance, ArcInstance, LineInstance, FillVertex, GpuShapeRenderer};
 use crate::settings::UserEnv;
 
 // PEDIT (polyline edit) methods live in `src/app/pedit.rs`. Child module of
@@ -1289,6 +1289,13 @@ pub struct CadApp {
     debug_open:   bool,
     gpu_renderer: StdArc<Mutex<GpuShapeRenderer>>,
     gpu_dirty:    bool,
+    /// Cached per-hatch WORLD-space render geometry, keyed by dobject handle.
+    /// Hatch generation (pattern scanline-clip, solid ear-clip) is EXPENSIVE;
+    /// caching it means it runs once per doc change instead of every frame,
+    /// which is what makes many/dense hatches usable. Colour is applied at
+    /// draw time (not baked in), so selection/snap highlight still work.
+    /// Invalidated wholesale whenever `gpu_dirty` is observed (doc mutated).
+    hatch_cache: HashMap<cad_kernel::Handle, HatchCacheEntry>,
 
     // ---- Layer panel (Slice B) ----
     /// Is the layer dock open? Toggled from the top toolbar.
@@ -2890,6 +2897,7 @@ impl Default for CadApp {
             index_dirty: true,
             index_label: String::new(),
             render_mode:  RenderMode::Cpu,
+            hatch_cache: HashMap::new(),
             debug_open:   false,
             gpu_renderer: StdArc::new(Mutex::new(GpuShapeRenderer::default())),
             gpu_dirty:    true,
@@ -5665,8 +5673,36 @@ impl CadApp {
         user_scale: f64,
         user_angle_deg: f64,
     ) {
+        let (segs, circs) =
+            self.hatch_pattern_geometry(loops, name, user_scale, user_angle_deg);
+        let stroke = egui::Stroke::new(0.9, color);
+        for (a, b) in segs {
+            painter.line_segment([self.w2s(a, rect), self.w2s(b, rect)], stroke);
+        }
+        for (centre, r_world) in circs {
+            let r_px = (r_world as f32) * self.scale;
+            if r_px < 0.5 { continue; }
+            painter.circle_stroke(self.w2s(centre, rect), r_px, stroke);
+        }
+    }
+
+    /// Resolve a named PATTERN hatch to WORLD-space line segments +
+    /// (centre, world_radius) circles. Single source of truth for pattern
+    /// geometry: the egui painter path (CPU mode) and the GPU line/circle
+    /// pipelines (GPU mode) both consume it, so they can never drift.
+    /// Solid fills are NOT handled here (see `render_hatch_solid`). Returns
+    /// empties for an unknown pattern name or a degenerate bbox.
+    fn hatch_pattern_geometry(
+        &self,
+        loops: &[Vec<Vec2>],
+        name: &str,
+        user_scale: f64,
+        user_angle_deg: f64,
+    ) -> (Vec<(Vec2, Vec2)>, Vec<(Vec2, f64)>) {
+        let mut segs: Vec<(Vec2, Vec2)> = Vec::new();
+        let mut circs: Vec<(Vec2, f64)> = Vec::new();
         let pat = cad_kernel::patterns::lookup(name);
-        if pat.is_empty() { return; }
+        if pat.is_empty() { return (segs, circs); }
         // Union bbox of all loops in world coords.
         let mut min = Vec2::new(f64::INFINITY, f64::INFINITY);
         let mut max = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
@@ -5678,17 +5714,15 @@ impl CadApp {
                 if v.y > max.y { max.y = v.y; }
             }
         }
-        if !min.x.is_finite() || !max.x.is_finite() { return; }
+        if !min.x.is_finite() || !max.x.is_finite() { return (segs, circs); }
         let user_angle = user_angle_deg.to_radians();
-        let stroke = egui::Stroke::new(0.9, color);
         let families = match &pat {
             cad_kernel::patterns::Pattern::Families(fs) => fs.as_slice(),
             cad_kernel::patterns::Pattern::Tile { period_x, period_y, segments, circles } => {
-                self.render_hatch_tile(
-                    painter, rect, loops, stroke,
-                    *period_x, *period_y, segments, circles,
-                    user_scale, user_angle, min, max);
-                return;
+                self.hatch_tile_geometry(
+                    loops, *period_x, *period_y, segments, circles,
+                    user_scale, user_angle, min, max, &mut segs, &mut circs);
+                return (segs, circs);
             }
         };
         for fam in families {
@@ -5750,9 +5784,7 @@ impl CadApp {
                         if (t1 - t0).abs() > 1e-6 {
                             let p0 = line_origin + u * t0;
                             let p1 = line_origin + u * t1;
-                            painter.line_segment(
-                                [self.w2s(p0, rect), self.w2s(p1, rect)],
-                                stroke);
+                            segs.push((p0, p1));
                         }
                         i += 2;
                     }
@@ -5760,23 +5792,40 @@ impl CadApp {
                 s += spacing;
             }
         }
+        (segs, circs)
     }
 
-    /// Tile-pattern renderer — tiles a finite-segment cell across the
+    /// GPU-mode helper: resolve a hatch's PATTERN geometry (loops + named
+    /// pattern) to world-space segments + circles. Empty for Solid hatches
+    /// (those stay on the egui fill path). Mirrors the loop resolution the
+    /// egui `render_hatch_fill` does for patterns.
+    fn hatch_pattern_world_geometry(
+        &self,
+        h: &cad_kernel::Hatch,
+    ) -> (Vec<(Vec2, Vec2)>, Vec<(Vec2, f64)>) {
+        if let cad_kernel::HatchPattern::Pattern { name, scale, angle_deg } = &h.pattern {
+            let loops = self.resolve_hatch_loops(h);
+            if loops.is_empty() { return (Vec::new(), Vec::new()); }
+            self.hatch_pattern_geometry(&loops, name, *scale, *angle_deg)
+        } else {
+            (Vec::new(), Vec::new())
+        }
+    }
+
+    /// Tile-pattern GEOMETRY — tiles a finite-segment cell across the
     /// boundary bbox and clips each segment against the loops using the
     /// same infinite-line + even-odd machinery as families, then clamps
     /// the resulting visible intervals to the segment's own length so
-    /// only its in-cell portion is drawn.
+    /// only its in-cell portion is emitted. Appends world-space segments
+    /// to `segs` and (centre, world_radius) circles to `circs` — the egui
+    /// painter path and the GPU pipelines both consume the same output.
     ///
     /// `user_scale` multiplies the period AND the segment coords; the
     /// user_angle rotates the whole pattern about the origin.
     #[allow(clippy::too_many_arguments)]
-    fn render_hatch_tile(
+    fn hatch_tile_geometry(
         &self,
-        painter:    &egui::Painter,
-        rect:       egui::Rect,
         loops:      &[Vec<Vec2>],
-        stroke:     egui::Stroke,
         period_x:   f64,
         period_y:   f64,
         segments:   &[cad_kernel::patterns::PatternSegment],
@@ -5785,6 +5834,8 @@ impl CadApp {
         user_angle: f64,
         min:        Vec2,
         max:        Vec2,
+        segs:       &mut Vec<(Vec2, Vec2)>,
+        circs:      &mut Vec<(Vec2, f64)>,
     ) {
         let s = user_scale.abs().max(1e-9);
         let px = period_x * s;
@@ -5875,9 +5926,7 @@ impl CadApp {
                         |acc, l| acc ^ point_in_polygon(a, l.iter().copied()));
                     if hits.is_empty() {
                         if !a_in { continue; }
-                        painter.line_segment(
-                            [self.w2s(a, rect), self.w2s(b, rect)],
-                            stroke);
+                        segs.push((a, b));
                         continue;
                     }
                     hits.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
@@ -5894,9 +5943,7 @@ impl CadApp {
                         if t1 - t0 > 1e-6 {
                             let p0 = a + dvec * t0;
                             let p1 = a + dvec * t1;
-                            painter.line_segment(
-                                [self.w2s(p0, rect), self.w2s(p1, rect)],
-                                stroke);
+                            segs.push((p0, p1));
                         }
                     }
                 }
@@ -5917,9 +5964,7 @@ impl CadApp {
                     let inside = loops.iter().fold(false,
                         |acc, l| acc ^ point_in_polygon(centre, l.iter().copied()));
                     if !inside { continue; }
-                    let r_px = (r_world as f32) * self.scale;
-                    if r_px < 0.5 { continue; }
-                    painter.circle_stroke(self.w2s(centre, rect), r_px, stroke);
+                    circs.push((centre, r_world));
                 }
             }
         }
@@ -9077,6 +9122,41 @@ impl CadApp {
     /// Floating Recorder window. Controls + live counters + buttons
     /// for Note / Snap-now / Clear / Copy. Inspector / replay UI ships
     /// in Slice C.
+    /// Switch the render mode directly (CPU / GPU / APX are mutually
+    /// exclusive). No-op if already in that mode. Marks the GPU batch dirty
+    /// so the next frame rebuilds for the new path.
+    fn set_render_mode(&mut self, m: RenderMode) {
+        if self.render_mode == m { return; }
+        self.render_mode = m;
+        self.gpu_dirty = true;
+        self.history.push(format!("  render mode → {:?}", m));
+    }
+
+    /// Generate the (expensive) COLOUR-LESS render geometry for the hatch at
+    /// dobject index `i`. World space. Pattern → clipped lines/circles; solid
+    /// → ear-clipped fill/hole triangles per boundary loop. Non-hatch or a
+    /// missing index yields an empty entry. Cached by `hatch_cache`.
+    fn build_hatch_cache_entry(&self, i: usize) -> HatchCacheEntry {
+        let mut out = HatchCacheEntry::default();
+        let Some(d) = self.doc.dobjects.get(i) else { return out; };
+        let Geom::Hatch(h) = &d.geom else { return out; };
+        match &h.pattern {
+            cad_kernel::HatchPattern::Pattern { .. } => {
+                let (segs, circs) = self.hatch_pattern_world_geometry(h);
+                out.segs = segs;
+                out.circs = circs;
+            }
+            cad_kernel::HatchPattern::Solid => {
+                for (li, lp) in self.resolve_hatch_loops(h).iter().enumerate() {
+                    let tris = ear_clip(lp);
+                    if li % 2 == 0 { out.fills.extend(tris); }
+                    else           { out.holes.extend(tris); }
+                }
+            }
+        }
+        out
+    }
+
     fn render_dbg_recorder_window(&mut self, ctx: &egui::Context) {
         if !self.dbg_window_open { return; }
         let mut open = self.dbg_window_open;
@@ -9129,6 +9209,24 @@ impl CadApp {
                 if is_recording { "🔴 RECORDING" } else { "⚪ idle" },
                 self.dbg.events.len(),
                 self.dbg.snapshots.len()));
+            // Crash-durable mirror: every event is written to this file
+            // as it happens, so a force-close / hang / OOM still leaves the
+            // dump on disk. Show the path (click 📋 to copy it).
+            if let Some(p) = self.dbg.log_path.clone() {
+                let s = p.display().to_string();
+                ui.horizontal(|ui| {
+                    ui.small("💾 durable mirror:");
+                    if ui.small_button("📋").on_hover_text("Copy the log path").clicked() {
+                        ctx.copy_text(s.clone());
+                        self.history.push(format!("  🛰 recorder log path: {}", s));
+                    }
+                    ui.monospace(
+                        egui::RichText::new(&s)
+                            .small()
+                            .color(egui::Color32::from_rgb(150, 190, 150)));
+                });
+                ui.small("Survives a force-close — after a crash, read this file for the dump.");
+            }
             ui.add_space(6.0);
             ui.separator();
             // ---- Smart-block authoring: capture base geometry ----------
@@ -17457,15 +17555,10 @@ impl CadApp {
     fn apply_copy(&mut self, v: Vec2) {
         if v.x.abs() < EPS && v.y.abs() < EPS { return; }
         self.snapshot_doc();
-        let copies: Vec<DObject> = self.selection.iter()
-            .filter_map(|&i| self.doc.dobjects.get(i))
-            .map(|d| {
-                let g = d.geom.translated(v);
-                let mut new = DObject::new(g);
-                new.style = d.style;
-                new
-            })
+        let sources: Vec<DObject> = self.selection.iter()
+            .filter_map(|&i| self.doc.dobjects.get(i).cloned())
             .collect();
+        let copies = duplicate_dobjects(&sources, |g| g.translated(v));
         let n = copies.len();
         for c in copies { self.doc.push(c); }
         self.selection_prev = self.selection.clone();
@@ -17505,14 +17598,10 @@ impl CadApp {
             return;
         }
         self.snapshot_doc();
-        let copies: Vec<DObject> = self.selection.iter().filter_map(|&i| {
-            self.doc.dobjects.get(i).map(|d| {
-                let mut copy = d.clone();
-                copy.geom = copy.geom.rotated(pivot, angle);
-                copy.handle = cad_kernel::next_handle();
-                copy
-            })
-        }).collect();
+        let sources: Vec<DObject> = self.selection.iter()
+            .filter_map(|&i| self.doc.dobjects.get(i).cloned())
+            .collect();
+        let copies = duplicate_dobjects(&sources, |g| g.rotated(pivot, angle));
         let n = copies.len();
         for c in copies { self.doc.push(c); }
         self.history.push(format!(
@@ -17551,14 +17640,10 @@ impl CadApp {
             return;
         }
         self.snapshot_doc();
-        let copies: Vec<DObject> = self.selection.iter().filter_map(|&i| {
-            self.doc.dobjects.get(i).map(|d| {
-                let mut copy = d.clone();
-                copy.geom = copy.geom.scaled(pivot, factor);
-                copy.handle = cad_kernel::next_handle();
-                copy
-            })
-        }).collect();
+        let sources: Vec<DObject> = self.selection.iter()
+            .filter_map(|&i| self.doc.dobjects.get(i).cloned())
+            .collect();
+        let copies = duplicate_dobjects(&sources, |g| g.scaled(pivot, factor));
         let n = copies.len();
         for c in copies { self.doc.push(c); }
         self.history.push(format!(
@@ -17578,14 +17663,10 @@ impl CadApp {
         self.snapshot_doc();
         let n = self.selection.len();
         if keep_original {
-            let copies: Vec<DObject> = self.selection.iter()
-                .filter_map(|&i| self.doc.dobjects.get(i))
-                .map(|d| {
-                    let mut new = DObject::new(d.geom.mirrored(a, b));
-                    new.style = d.style;
-                    new
-                })
+            let sources: Vec<DObject> = self.selection.iter()
+                .filter_map(|&i| self.doc.dobjects.get(i).cloned())
                 .collect();
+            let copies = duplicate_dobjects(&sources, |g| g.mirrored(a, b));
             for c in copies { self.doc.push(c); }
             self.selection_prev = self.selection.clone();
             self.selection.clear();
@@ -18582,16 +18663,45 @@ impl CadApp {
         let rows = self.array_rows.max(1);
         let dx   = self.array_dx;
         let dy   = self.array_dy;
-        let cells = cols * rows;
-        let new_dobjects = cells.saturating_sub(1) * sources.len();
+        let cells = cols.saturating_mul(rows);
+        let new_dobjects = cells.saturating_sub(1).saturating_mul(sources.len());
+
+        // Memory guard — DROP the task rather than risk an OOM crash. APX
+        // makes even a huge array RENDER fast, but it can't shrink STORAGE:
+        // N dobjects cost N × size_of::<DObject>() of RAM regardless of the
+        // render mode, so past the memory budget we refuse (document
+        // untouched) instead of allocating into an out-of-memory abort.
+        let per = std::mem::size_of::<DObject>().max(1);
+        let mem_ceiling = ARRAY_MEM_BUDGET_BYTES / per;
+        if new_dobjects > mem_ceiling {
+            self.history.push(format!(
+                "  ! array DROPPED — {}×{} × {} src = {} new dobjects ≈ {} MB exceeds the {} MB memory budget. Reduce the grid (APX speeds rendering, not storage).",
+                cols, rows, sources.len(), new_dobjects,
+                new_dobjects.saturating_mul(per) / (1024 * 1024),
+                ARRAY_MEM_BUDGET_BYTES / (1024 * 1024)));
+            return;
+        }
+        // Heavy but memory-safe → switch render to APX so the result draws
+        // fast (one dot per dobject) instead of bogging the CPU/GPU paths.
+        // (The FPS watchdog would do this anyway on the next slow frame;
+        // doing it up-front avoids even one stalled frame.)
+        if new_dobjects > ARRAY_APX_THRESHOLD && self.render_mode != RenderMode::Apx {
+            self.set_render_mode(RenderMode::Apx);
+            self.history.push(format!(
+                "  ⚡ large array ({} new dobjects) — render switched to APX for speed",
+                new_dobjects));
+        }
 
         self.doc.dobjects.reserve(new_dobjects);
         for r in 0..rows {
             for c in 0..cols {
                 if r == 0 && c == 0 { continue; }   // skip the source cell
                 let off = Vec2::new(c as f64 * dx, r as f64 * dy);
-                for s in &sources {
-                    self.doc.dobjects.push(s.translated(off));
+                // Fresh handles + per-cell hatch boundary remap, so each
+                // cell's hatch resolves to ITS OWN copied boundary (not the
+                // source) and copies never collide handles.
+                for d in duplicate_dobjects(&sources, |g| g.translated(off)) {
+                    self.doc.dobjects.push(d);
                 }
             }
         }
@@ -18605,6 +18715,74 @@ impl CadApp {
         ));
         self.ensure_index();
     }
+}
+
+/// Hard ceiling on how many NEW dobjects one Array operation may create.
+/// Above this the op is DROPPED (document untouched) rather than allowed
+/// to allocate millions of dobjects and freeze the app until the OS
+/// force-closes it. The dialog also disables Generate above this. The
+/// grid inputs allow up to 3000×3000 cells, so this cap is the real guard.
+/// Memory budget for one Array operation's NEW dobjects. Above this the op
+/// is DROPPED — APX makes a huge array RENDER fast, but it can't shrink
+/// STORAGE (N dobjects cost N × size_of::<DObject>() of RAM regardless of
+/// render mode), so allocating past this risks an OOM crash, which is worse
+/// than a graceful refusal. The real ceiling is this budget ÷ the struct
+/// size at call time, so it tracks DObject's actual size.
+const ARRAY_MEM_BUDGET_BYTES: usize = 1_500_000_000;   // ~1.5 GB
+
+/// Above this many NEW dobjects, generating an array auto-switches the
+/// render to APX (one dot per dobject) so the result stays fast instead of
+/// bogging the CPU/GPU paths. Below it the current mode is kept.
+const ARRAY_APX_THRESHOLD: usize = 50_000;
+
+/// Per-frame cap on how many dobjects the CPU (egui painter) render path
+/// will draw. egui tessellates every primitive on the CPU each frame, so a
+/// heavy drawing (tens/hundreds of thousands of dobjects in the viewport)
+/// makes each frame take seconds — the app looks DEAD and you can't even
+/// click to switch modes. Above this budget CPU stops drawing the rest and
+/// shows a banner telling the user to switch to GPU/APX. The frame stays
+/// bounded, so the UI stays responsive and the mode badges remain clickable.
+const CPU_DRAW_BUDGET: usize = 20_000;
+
+/// Max GENERATED primitives (segments + circles + fill/hole triangles) the
+/// hatch cache builds in ONE frame. A big paste/array of hatches builds over
+/// a few frames instead of freezing one; the left-corner note shows how many
+/// hatches remain. Budgeting by primitives (not hatch count) bounds per-frame
+/// work even when individual hatches are very dense.
+const HATCH_GEN_WORK_BUDGET: usize = 200_000;
+
+/// Duplicate a group of source dobjects with FRESH handles, applying
+/// `xform` to each geometry, and remap every copied Hatch's
+/// `boundary_handles` to the copies of its boundaries WITHIN THIS GROUP.
+/// A boundary handle not present in the group is left untouched (the hatch
+/// was drawn onto a boundary outside the selection — copies share it).
+///
+/// This is the single duplication primitive for copy / array / rotate-copy
+/// / scale-copy / mirror-copy. Without the remap a copied hatch keeps
+/// pointing at the ORIGINAL boundary and piles up on the source cell (and
+/// because `DObject::translated` PRESERVES the handle — correct for a move,
+/// wrong for a copy — array copies would even collide handles, so
+/// `find_by_handle` always resolved back to the first/original object).
+fn duplicate_dobjects(
+    sources: &[DObject],
+    xform: impl Fn(&Geom) -> Geom,
+) -> Vec<DObject> {
+    let mut hmap: HashMap<cad_kernel::Handle, cad_kernel::Handle> =
+        HashMap::with_capacity(sources.len());
+    let mut out: Vec<DObject> = Vec::with_capacity(sources.len());
+    for s in sources {
+        let nh = cad_kernel::next_handle();
+        hmap.insert(s.handle, nh);
+        out.push(DObject { geom: xform(&s.geom), style: s.style, handle: nh });
+    }
+    for d in &mut out {
+        if let Geom::Hatch(h) = &mut d.geom {
+            for bh in &mut h.boundary_handles {
+                if let Some(&nh) = hmap.get(bh) { *bh = nh; }
+            }
+        }
+    }
+    out
 }
 
 /// Short one-letter badge string for the active osnap kinds, shown on the
@@ -19169,6 +19347,89 @@ fn polar_angle_picker(ui: &mut egui::Ui, angle_deg: &mut f64, size: f32) -> egui
         egui::FontId::proportional(13.0),
         egui::Color32::from_rgb(220, 230, 240));
     response
+}
+
+/// Cached, COLOUR-LESS render geometry for ONE hatch (world space). Built by
+/// `CadApp::build_hatch_cache_entry`, reused every frame until the doc
+/// mutates. Pattern hatches populate `segs`/`circs`; solid hatches populate
+/// `fills`/`holes` (even boundary loops fill, odd loops over-draw the bg —
+/// poor-man's even-odd). Colour is applied at draw time so highlights work.
+#[derive(Default, Clone)]
+struct HatchCacheEntry {
+    segs:  Vec<(Vec2, Vec2)>,
+    circs: Vec<(Vec2, f64)>,
+    fills: Vec<[Vec2; 3]>,
+    holes: Vec<[Vec2; 3]>,
+}
+
+/// Pack an egui color into the u32 RGBA layout the GPU shaders unpack
+/// (R high byte … A low byte). Alpha is preserved (translucent poché).
+fn pack_rgba(c: egui::Color32) -> u32 {
+    ((c.r() as u32) << 24) | ((c.g() as u32) << 16)
+        | ((c.b() as u32) << 8) | (c.a() as u32)
+}
+
+/// Point-in-triangle (barycentric sign test), inclusive of edges.
+fn point_in_tri(p: Vec2, a: Vec2, b: Vec2, c: Vec2) -> bool {
+    let d1 = (p.x - b.x) * (a.y - b.y) - (a.x - b.x) * (p.y - b.y);
+    let d2 = (p.x - c.x) * (b.y - c.y) - (b.x - c.x) * (p.y - c.y);
+    let d3 = (p.x - a.x) * (c.y - a.y) - (c.x - a.x) * (p.y - a.y);
+    let neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+    let pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+    !(neg && pos)
+}
+
+/// Ear-clipping triangulation of ONE simple polygon (no holes; the caller
+/// handles holes via even-odd over-draw). Concave polygons are fine.
+/// Orientation-agnostic (normalises to CCW). Degenerate input (< 3 pts)
+/// yields nothing; a stuck clip (self-intersecting polygon) bails out with
+/// whatever it produced rather than looping forever. Returns a flat list of
+/// world-space triangles.
+fn ear_clip(poly: &[Vec2]) -> Vec<[Vec2; 3]> {
+    let n = poly.len();
+    if n < 3 { return Vec::new(); }
+    // Signed area → orientation; work on an index ring normalised to CCW.
+    let mut area = 0.0;
+    for i in 0..n {
+        let a = poly[i];
+        let b = poly[(i + 1) % n];
+        area += a.x * b.y - b.x * a.y;
+    }
+    let mut idx: Vec<usize> = (0..n).collect();
+    if area < 0.0 { idx.reverse(); }
+    let mut tris: Vec<[Vec2; 3]> = Vec::with_capacity(n.saturating_sub(2));
+    let mut guard = 0usize;
+    while idx.len() > 3 && guard < n * n + 16 {
+        guard += 1;
+        let m = idx.len();
+        let mut clipped = false;
+        for k in 0..m {
+            let i0 = idx[(k + m - 1) % m];
+            let i1 = idx[k];
+            let i2 = idx[(k + 1) % m];
+            let (a, b, c) = (poly[i0], poly[i1], poly[i2]);
+            // Convex corner? (CCW cross > 0). Reflex corners can't be ears.
+            let cross = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+            if cross <= 0.0 { continue; }
+            // Ear only if no OTHER vertex lies inside triangle a-b-c.
+            let mut is_ear = true;
+            for &j in &idx {
+                if j == i0 || j == i1 || j == i2 { continue; }
+                if point_in_tri(poly[j], a, b, c) { is_ear = false; break; }
+            }
+            if is_ear {
+                tris.push([a, b, c]);
+                idx.remove(k);
+                clipped = true;
+                break;
+            }
+        }
+        if !clipped { break; }   // self-intersecting → stop (rare)
+    }
+    if idx.len() == 3 {
+        tris.push([poly[idx[0]], poly[idx[1]], poly[idx[2]]]);
+    }
+    tris
 }
 
 fn point_in_polygon<I: IntoIterator<Item = Vec2>>(p: Vec2, verts: I) -> bool {
@@ -21278,6 +21539,11 @@ impl eframe::App for CadApp {
             };
         }
 
+        // NOTE: the render mode is NEVER force-switched. Auto-yanking to APX
+        // was disturbing, so heaviness is only ADVISED via a small left-corner
+        // notice drawn in the canvas pass (the user stays in control; the CPU
+        // per-frame budget already keeps the app responsive so they can click
+        // a mode badge). See the left-corner "perf note" in the render loop.
 
         // global drafting-mode toggles (AutoCAD F-keys). Fire on key-press
         // anywhere — they're modeless and don't interfere with text input
@@ -22710,12 +22976,18 @@ impl eframe::App for CadApp {
                             ui.label("    dy");
                             ui.add(egui::DragValue::new(&mut self.array_dy).speed(1.0));
                         });
-                        let cells = self.array_cols * self.array_rows;
-                        let new_dobjects = cells.saturating_sub(1) * sources.len().max(1);
+                        let cells = self.array_cols.saturating_mul(self.array_rows);
+                        let new_dobjects =
+                            cells.saturating_sub(1).saturating_mul(sources.len().max(1));
                         let total_after = self.doc.dobjects.len() + new_dobjects;
+                        let per = std::mem::size_of::<DObject>().max(1);
+                        let mem_ceiling = ARRAY_MEM_BUDGET_BYTES / per;
+                        let est_mb = new_dobjects.saturating_mul(per) / (1024 * 1024);
+                        let over_cap = new_dobjects > mem_ceiling;   // MEMORY limit, not render
+                        let will_apx = new_dobjects > ARRAY_APX_THRESHOLD;
                         ui.label(format!(
-                            "{} cell(s) × {} source(s) = {} new dobjects → {} total",
-                            cells, sources.len(), new_dobjects, total_after
+                            "{} cell(s) × {} source(s) = {} new dobjects → {} total  (≈{} MB)",
+                            cells, sources.len(), new_dobjects, total_after, est_mb
                         ));
                         if total_after > 1500 {
                             ui.colored_label(
@@ -22723,15 +22995,23 @@ impl eframe::App for CadApp {
                                 "• intersection recompute will be skipped above ~1500 (O(N²))",
                             );
                         }
-                        if total_after > 50_000 {
+                        if will_apx && !over_cap {
                             ui.colored_label(
-                                egui::Color32::from_rgb(255, 140, 140),
-                                "• rendering above ~50k dobjects may lag (CPU painter)",
+                                egui::Color32::from_rgb(120, 240, 255),
+                                "↯ large — render switches to APX (fast dots) on Generate",
+                            );
+                        }
+                        if over_cap {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(255, 90, 90),
+                                format!("✗ ≈{} MB exceeds the {} MB memory budget — reduce the grid \
+                                         (APX speeds rendering, but can't shrink storage)",
+                                        est_mb, ARRAY_MEM_BUDGET_BYTES / (1024 * 1024)),
                             );
                         }
                         ui.separator();
                         ui.horizontal(|ui| {
-                            if ui.add_enabled(!sources.is_empty(),
+                            if ui.add_enabled(!sources.is_empty() && !over_cap,
                                               egui::Button::new("Generate")).clicked() {
                                 do_generate = true;
                             }
@@ -22960,8 +23240,14 @@ impl eframe::App for CadApp {
                         // at 3M+ dobjects). GPU swaps the renderer to
                         // the instanced-circle path (circles fast,
                         // other primitives still CPU).
-                        let perf_badge = |ui: &mut egui::Ui, label: &str, on: bool, tip: &str| {
-                            let col = if on {
+                        // Three INDEPENDENT, directly-selectable render-mode
+                        // badges (NOT a cycling toggle): click CPU / GPU / APX
+                        // to jump straight to that mode. Direct-select matters
+                        // because CPU can bog down on a very heavy drawing — you
+                        // want to switch STRAIGHT to GPU, not cycle through the
+                        // slow CPU frame to reach it.
+                        let mode_badge = |ui: &mut egui::Ui, label: &str, active: bool, tip: &str| {
+                            let col = if active {
                                 egui::Color32::from_rgb(255, 200, 80)   // warm amber when active
                             } else {
                                 egui::Color32::from_rgb(80, 90, 105)
@@ -22971,28 +23257,26 @@ impl eframe::App for CadApp {
                             ).sense(egui::Sense::click()));
                             resp.on_hover_text(tip).clicked()
                         };
-                        // Single 3-way render-mode badge — click cycles
-                        // CPU → GPU → APX → CPU (mutually exclusive).
-                        let (mode_lbl, mode_hot) = match self.render_mode {
-                            RenderMode::Cpu => ("CPU", false),
-                            RenderMode::Gpu => ("GPU", true),
-                            RenderMode::Apx => ("APX", true),
-                        };
-                        if perf_badge(ui, mode_lbl, mode_hot,
-                            "Render mode (click to cycle CPU → GPU → APX). \
-                             CPU = egui painter (full fidelity). GPU = our OpenGL \
-                             pipelines (CPU fallback for not-yet-ported types). \
-                             APX = every dobject a dot, one draw call (fastest, \
-                             approximate). Selection / snap always use real geometry.")
+                        ui.label(egui::RichText::new("render").small()
+                            .color(egui::Color32::from_rgb(120, 130, 145)));
+                        if mode_badge(ui, "CPU", self.render_mode == RenderMode::Cpu,
+                            "CPU render — egui painter, full fidelity. Bogs down on \
+                             very heavy drawings, so it's CAPPED per frame for safety \
+                             (switch to GPU/APX to see everything).")
                         {
-                            self.render_mode = match self.render_mode {
-                                RenderMode::Cpu => RenderMode::Gpu,
-                                RenderMode::Gpu => RenderMode::Apx,
-                                RenderMode::Apx => RenderMode::Cpu,
-                            };
-                            self.gpu_dirty = true;
-                            self.history.push(format!(
-                                "  render mode → {:?} (manual)", self.render_mode));
+                            self.set_render_mode(RenderMode::Cpu);
+                        }
+                        if mode_badge(ui, "GPU", self.render_mode == RenderMode::Gpu,
+                            "GPU render — our OpenGL instanced pipelines (fast; egui \
+                             fallback for not-yet-ported fills). Best for heavy drawings.")
+                        {
+                            self.set_render_mode(RenderMode::Gpu);
+                        }
+                        if mode_badge(ui, "APX", self.render_mode == RenderMode::Apx,
+                            "APX render — every dobject a single dot, one draw call. \
+                             Fastest, approximate; selection/snap still use real geometry.")
+                        {
+                            self.set_render_mode(RenderMode::Apx);
                         }
                         ui.separator();
                         // EdgMod toggle
@@ -25013,9 +25297,42 @@ impl eframe::App for CadApp {
                     (0..self.doc.dobjects.len()).collect()
                 };
             let in_viewport = candidates.len();
-            // Render mode (CPU/GPU) and APX (dots) are user-toggled via
-            // the status-bar badges. No auto-switch — the user decides
-            // when to trade fidelity for speed.
+
+            // ---- Hatch geometry cache (the perf fix) ---------------------
+            // Hatch generation (pattern scanline-clip, solid ear-clip) is the
+            // expensive part; without caching it re-ran for EVERY hatch EVERY
+            // frame → dense/many hatches froze the app. Now it runs once per
+            // doc change (cache cleared when gpu_dirty), with a PER-FRAME
+            // GENERATION BUDGET so a huge batch of new hatches fills in over
+            // several frames instead of freezing one. Skipped in APX (dots
+            // only). `hatch_building` drives the left-corner "building…" note.
+            let mut hatch_building = 0usize;
+            if self.render_mode != RenderMode::Apx {
+                if std::mem::take(&mut self.gpu_dirty) { self.hatch_cache.clear(); }
+                let pending: Vec<usize> = candidates.iter().copied().filter(|&i| {
+                    self.doc.dobjects.get(i).map_or(false, |d|
+                        matches!(d.geom, Geom::Hatch(_))
+                        && !self.hatch_cache.contains_key(&d.handle))
+                }).collect();
+                hatch_building = pending.len();
+                // Budget by GENERATED-PRIMITIVE count, not hatch count — one
+                // dense pattern hatch can be 10k+ lines, so a plain count cap
+                // could still spike a frame. Always builds at least one so a
+                // single huge hatch still makes progress.
+                let mut work = 0usize;
+                for i in pending {
+                    if work >= HATCH_GEN_WORK_BUDGET { break; }
+                    let handle = self.doc.dobjects[i].handle;
+                    let entry = self.build_hatch_cache_entry(i);
+                    work += entry.segs.len() + entry.circs.len()
+                          + entry.fills.len() + entry.holes.len();
+                    self.hatch_cache.insert(handle, entry);
+                    hatch_building -= 1;
+                }
+                // Keep painting until the cache is fully built.
+                if hatch_building > 0 { ctx.request_repaint(); }
+            }
+
             let candidate_iter: Box<dyn Iterator<Item = usize>> =
                 Box::new(candidates.into_iter());
 
@@ -25084,6 +25401,10 @@ impl eframe::App for CadApp {
             let mut skipped = 0usize;
             let mut gpu_circles_count = 0usize;
             let mut gpu_line_count = 0usize;
+            let mut gpu_fill_count = 0usize;
+            // Set true when the CPU path hit CPU_DRAW_BUDGET and stopped
+            // early — drives the "switch to GPU/APX" safety banner.
+            let mut cpu_capped = false;
 
             // === APX (draft display) render branch ===
             // In APX mode every visible dobject becomes a single dot at its
@@ -25159,7 +25480,7 @@ impl eframe::App for CadApp {
                                     let gl = gl_painter.gl();
                                     let mut r = renderer.lock().unwrap();
                                     r.ensure_init(gl);
-                                    r.render(gl, &dots, &[], &view);
+                                    r.render(gl, &[], &dots, &[], &[], &view);
                                 },
                             ),
                         ),
@@ -25170,6 +25491,12 @@ impl eframe::App for CadApp {
             } else { match self.render_mode {
                 RenderMode::Cpu => {
                     for i in candidate_iter {
+                        // Safety budget: stop before the frame time explodes.
+                        // Everything drawn so far still shows; the rest is
+                        // deferred with a banner telling the user to switch to
+                        // GPU/APX. Keeps the app responsive on heavy drawings
+                        // instead of freezing until the OS force-closes it.
+                        if drawn >= CPU_DRAW_BUDGET { cpu_capped = true; break; }
                         let e = &self.doc.dobjects[i];
                         // Layer-level visibility gate — hidden/frozen layers
                         // skip render entirely. Per-Dobject visibility is
@@ -25188,7 +25515,7 @@ impl eframe::App for CadApp {
                         // render functions that stub Hatch as a no-op.
                         // Dispatch directly to render_hatch_fill here so
                         // none of that matters.
-                        if let Geom::Hatch(h) = &e.geom {
+                        if let Geom::Hatch(_) = &e.geom {
                             let color = if self.selected == Some(i)
                                 || self.selection.contains(&i)
                             {
@@ -25201,7 +25528,34 @@ impl eframe::App for CadApp {
                                     &self.doc.layers, &self.doc.truecolors);
                                 egui::Color32::from_rgb(r, g, b)
                             };
-                            self.render_hatch_fill(&painter, rect, h, color);
+                            // Cached geometry (built once per doc change). Pattern
+                            // → line/circle strokes; solid → a triangle mesh
+                            // (even loops = color, odd = bg over-draw for holes).
+                            if let Some(entry) = self.hatch_cache.get(&e.handle) {
+                                let stroke = egui::Stroke::new(0.9, color);
+                                for (a, b) in &entry.segs {
+                                    painter.line_segment(
+                                        [self.w2s(*a, rect), self.w2s(*b, rect)], stroke);
+                                }
+                                for (c, r) in &entry.circs {
+                                    let rpx = (*r as f32) * self.scale;
+                                    if rpx >= 0.5 {
+                                        painter.circle_stroke(self.w2s(*c, rect), rpx, stroke);
+                                    }
+                                }
+                                if !entry.fills.is_empty() || !entry.holes.is_empty() {
+                                    let bg = egui::Color32::from_rgb(18, 22, 28);
+                                    let mut mesh = egui::Mesh::default();
+                                    let mut push_tri = |tri: &[Vec2; 3], col: egui::Color32| {
+                                        let base = mesh.vertices.len() as u32;
+                                        for v in tri { mesh.colored_vertex(self.w2s(*v, rect), col); }
+                                        mesh.add_triangle(base, base + 1, base + 2);
+                                    };
+                                    for tri in &entry.fills { push_tri(tri, color); }
+                                    for tri in &entry.holes { push_tri(tri, bg); }
+                                    painter.add(egui::Shape::mesh(mesh));
+                                }
+                            }
                             drawn += 1;
                             continue;
                         }
@@ -25329,21 +25683,25 @@ impl eframe::App for CadApp {
                     }
                 }
                 RenderMode::Gpu => {
-                    // GPU path (Stage 1 pure-GPU): stroke geometry (Line, Arc,
-                    // Ellipse, EllipseArc, straight thin Polyline, Spline, Point)
-                    // → instanced LINE pipeline; Circle → instanced CIRCLE
-                    // pipeline. Curves are tessellated to segments on the CPU
-                    // (screen-adaptive), then batched into ONE PaintCallback.
-                    // Types not yet ported (Wall, Hatch, Text, Dimension,
-                    // BlockRef, curved/wide Polyline) FALL BACK to the egui
-                    // painter, so GPU mode is always correct.
+                    // GPU path. Pipelines: CIRCLE (instanced ring SDF), ARC
+                    // (instanced analytic ring-with-angular-clamp SDF), LINE
+                    // (instanced SDF), FILL (triangle soup). Mapping:
+                    //   Line / Point / Spline / straight-thin Polyline → LINE
+                    //   Ellipse / EllipseArc                → LINE (CPU-tessellated)
+                    //   Circle → CIRCLE ·  Arc → ARC (analytic, no tessellation)
+                    //   pattern Hatch → LINE + CIRCLE ·  solid Hatch → FILL
+                    //   Wall → FILL (poché) + LINE (faces/insulation/centerline)
+                    // Still on the egui painter (already GPU-drawn by egui):
+                    //   Text, Dimension, BlockRef, curved/wide Polyline.
                     //
                     // Coords are camera-relative: (world + world_offset) as f32,
                     // f64 add first, so f32 stays precise far from the origin.
                     // Color resolution matches the CPU branch (selection=yellow,
                     // snap source=cyan, else the dobject's resolved style color).
                     let mut circles: Vec<CircleInstance> = Vec::new();
+                    let mut arcs:    Vec<ArcInstance>    = Vec::new();
                     let mut lines:   Vec<LineInstance>   = Vec::new();
+                    let mut fills:   Vec<FillVertex>     = Vec::new();
                     let ox = self.world_offset.x as f64;
                     let oy = self.world_offset.y as f64;
                     // Default hairline half-width in WORLD units (~1.6px stroke);
@@ -25407,19 +25765,21 @@ impl eframe::App for CadApp {
                                     ox, oy, half_w, packed);
                             }
                             Geom::Arc(a) => {
-                                let n = (((a.radius as f32) * sc) * 0.5)
-                                    .clamp(8.0, 256.0) as usize;
-                                let mut prev = Vec2::new(
-                                    a.center.x + a.radius * a.start_angle.cos(),
-                                    a.center.y + a.radius * a.start_angle.sin());
-                                for k in 1..=n {
-                                    let t = a.start_angle
-                                        + (k as f64 / n as f64) * a.sweep_angle;
-                                    let p = Vec2::new(a.center.x + a.radius * t.cos(),
-                                                      a.center.y + a.radius * t.sin());
-                                    gpu_push_seg(&mut lines, prev, p, ox, oy, half_w, packed);
-                                    prev = p;
-                                }
+                                // Analytic arc SDF — no CPU tessellation.
+                                // Canonicalise to CCW positive sweep so the
+                                // shader's angular test is a single compare.
+                                let (mut a0, mut sw) = (a.start_angle, a.sweep_angle);
+                                if sw < 0.0 { a0 += sw; sw = -sw; }
+                                let tau = std::f64::consts::TAU;
+                                if sw > tau { sw = tau; }
+                                arcs.push(ArcInstance {
+                                    x: (a.center.x + ox) as f32,
+                                    y: (a.center.y + oy) as f32,
+                                    r: a.radius as f32,
+                                    a0: a0 as f32,
+                                    sweep: sw as f32,
+                                    color: packed,
+                                });
                             }
                             Geom::Ellipse(el) => {
                                 let n = (((el.major.len() as f32) * sc) * 0.7)
@@ -25463,10 +25823,110 @@ impl eframe::App for CadApp {
                                     gpu_push_seg(&mut lines, a, b, ox, oy, half_w, packed);
                                 }
                             }
+                            Geom::Wall(w) => {
+                                // Full wall on GPU: poché fill → triangle soup,
+                                // faces / insulation / centerline → line pipeline.
+                                // Mirrors draw_dobject_thick's Wall arm; the
+                                // dashed centerline is drawn SOLID here until the
+                                // linetype-on-GPU phase lands.
+                                let wstyle = self.doc.wall_styles.get(w.style);
+                                let face_col = match wstyle {
+                                    Some(s) if s.face_color != 0 => {
+                                        let (r, g, b) = aci_palette(s.face_color.min(255) as u8);
+                                        egui::Color32::from_rgb(r, g, b)
+                                    }
+                                    _ => color,
+                                };
+                                let face_packed = pack_rgba(face_col);
+                                let fill_aci = wstyle.map(|s| s.fill_color).unwrap_or(0);
+                                let (left_faces, right_faces) = wall_face_world_pts(self, w);
+                                // Poché — only an un-broken single strip (matches CPU).
+                                if fill_aci != 0
+                                    && left_faces.len() == 1 && right_faces.len() == 1
+                                    && left_faces[0].len() >= 2
+                                    && left_faces[0].len() == right_faces[0].len()
+                                {
+                                    let (lp, rp) = (&left_faces[0], &right_faces[0]);
+                                    let (fr, fg, fb) = aci_palette(fill_aci.min(255) as u8);
+                                    let fc = pack_rgba(
+                                        egui::Color32::from_rgba_unmultiplied(fr, fg, fb, 80));
+                                    let mut push = |v: Vec2| fills.push(FillVertex {
+                                        x: (v.x + ox) as f32, y: (v.y + oy) as f32, color: fc });
+                                    for i in 0..lp.len() - 1 {
+                                        // Quad (lp[i], rp[i], lp[i+1], rp[i+1]) → 2 tris.
+                                        push(lp[i]);   push(rp[i]);   push(lp[i + 1]);
+                                        push(rp[i]);   push(rp[i + 1]); push(lp[i + 1]);
+                                    }
+                                }
+                                // Faces — every piece as connected segments.
+                                for piece in left_faces.iter().chain(right_faces.iter()) {
+                                    for s in piece.windows(2) {
+                                        gpu_push_seg(&mut lines, s[0], s[1],
+                                            ox, oy, half_w, face_packed);
+                                    }
+                                }
+                                // Batt-insulation sine wave.
+                                if wstyle.map(|s| s.insulation).unwrap_or(false) {
+                                    let wave = wall_insulation_wave(w);
+                                    for s in wave.windows(2) {
+                                        gpu_push_seg(&mut lines, s[0], s[1],
+                                            ox, oy, half_w, face_packed);
+                                    }
+                                }
+                                // Centerline (solid on GPU for now).
+                                if self.env.WlCnL {
+                                    let n_face = left_faces.iter().chain(right_faces.iter())
+                                        .map(|p| p.len()).max().unwrap_or(2);
+                                    let clp = pack_rgba(egui::Color32::from_rgba_unmultiplied(
+                                        color.r(), color.g(), color.b(), 110));
+                                    let cl = w.centerline_polyline(n_face.max(3) - 1);
+                                    for s in cl.windows(2) {
+                                        gpu_push_seg(&mut lines, s[0], s[1], ox, oy, half_w, clp);
+                                    }
+                                }
+                            }
                             // Not yet ported → CPU painter (always correct).
                             _ => {
-                                if let Geom::Hatch(h) = &e.geom {
-                                    self.render_hatch_fill(&painter, rect, h, color);
+                                if let Geom::Hatch(_) = &e.geom {
+                                    // Read pre-built (cached) geometry. Pattern
+                                    // → line/circle pipelines; solid → fill
+                                    // triangles (even loops = `packed`, odd
+                                    // loops = bg over-draw for even-odd holes).
+                                    if let Some(entry) = self.hatch_cache.get(&e.handle) {
+                                        for (a, b) in &entry.segs {
+                                            gpu_push_seg(&mut lines, *a, *b,
+                                                ox, oy, half_w, packed);
+                                        }
+                                        for (centre, r_world) in &entry.circs {
+                                            if (*r_world as f32) * sc < 0.5 { continue; }
+                                            circles.push(CircleInstance {
+                                                x: (centre.x + ox) as f32,
+                                                y: (centre.y + oy) as f32,
+                                                r: *r_world as f32,
+                                                color: packed,
+                                            });
+                                        }
+                                        if !entry.fills.is_empty() || !entry.holes.is_empty() {
+                                            let bgp = pack_rgba(
+                                                egui::Color32::from_rgb(18, 22, 28));
+                                            for tri in &entry.fills {
+                                                for v in tri {
+                                                    fills.push(FillVertex {
+                                                        x: (v.x + ox) as f32,
+                                                        y: (v.y + oy) as f32,
+                                                        color: packed });
+                                                }
+                                            }
+                                            for tri in &entry.holes {
+                                                for v in tri {
+                                                    fills.push(FillVertex {
+                                                        x: (v.x + ox) as f32,
+                                                        y: (v.y + oy) as f32,
+                                                        color: bgp });
+                                                }
+                                            }
+                                        }
+                                    }
                                 } else {
                                     draw_dobject(&painter, rect, self, &e.geom, color);
                                 }
@@ -25474,9 +25934,11 @@ impl eframe::App for CadApp {
                         }
                         drawn += 1;
                     }
-                    gpu_circles_count = circles.len();
+                    gpu_circles_count = circles.len() + arcs.len();
                     gpu_line_count = lines.len();
-                    if !circles.is_empty() || !lines.is_empty() {
+                    gpu_fill_count = fills.len() / 3;
+                    if !circles.is_empty() || !arcs.is_empty()
+                        || !lines.is_empty() || !fills.is_empty() {
                         // Camera-relative: offset folded into the instances, so
                         // the view matrix uses offset 0.
                         let view = view_matrix(
@@ -25492,7 +25954,7 @@ impl eframe::App for CadApp {
                                         let gl = gl_painter.gl();
                                         let mut r = renderer.lock().unwrap();
                                         r.ensure_init(gl);
-                                        r.render(gl, &circles, &lines, &view);
+                                        r.render(gl, &fills, &circles, &arcs, &lines, &view);
                                     },
                                 ),
                             ),
@@ -25593,8 +26055,8 @@ impl eframe::App for CadApp {
                 RenderMode::Apx => format!("APX ({} dots instanced)", gpu_circles_count),
                 RenderMode::Cpu => format!("CPU"),
                 RenderMode::Gpu => format!(
-                    "GPU ({} circles + {} line-seg instanced)",
-                    gpu_circles_count, gpu_line_count),
+                    "GPU ({} circ/arc + {} line-seg + {} fill-tri instanced)",
+                    gpu_circles_count, gpu_line_count, gpu_fill_count),
             };
             painter.text(
                 rect.right_top() + egui::vec2(-8.0, 8.0),
@@ -25605,6 +26067,39 @@ impl eframe::App for CadApp {
                 egui::FontId::monospace(11.0),
                 egui::Color32::from_rgb(200, 220, 240),
             );
+            // ---- Left-corner perf NOTICE (advisory only — NO forced switch).
+            // A small pill in the TOP-LEFT. The render mode is never yanked;
+            // this just tells the user what's happening and what they can do.
+            // Priority: still building hatch cache → APX-overwhelmed → CPU
+            // capped → low FPS.
+            let notice: Option<(String, egui::Color32)> =
+                if hatch_building > 0 {
+                    Some((format!("⏳ building hatch cache… {} left", hatch_building),
+                          egui::Color32::from_rgb(120, 240, 255)))
+                } else if self.render_mode == RenderMode::Apx && self.fps_smooth < 15.0 {
+                    Some((format!("⚠ {:.0} FPS — too heavy even for APX; reduce dobjects",
+                                  self.fps_smooth),
+                          egui::Color32::from_rgb(255, 90, 90)))
+                } else if cpu_capped {
+                    Some((format!("⚠ CPU showing {}/{} — press GPU or APX for all",
+                                  CPU_DRAW_BUDGET, in_viewport),
+                          egui::Color32::from_rgb(255, 200, 80)))
+                } else if self.render_mode != RenderMode::Apx && self.fps_smooth < 15.0 {
+                    Some((format!("⚠ {:.0} FPS — press APX for speed", self.fps_smooth),
+                          egui::Color32::from_rgb(255, 200, 80)))
+                } else {
+                    None
+                };
+            if let Some((msg, col)) = notice {
+                let font = egui::FontId::monospace(12.0);
+                let ink  = egui::Color32::from_rgb(20, 20, 24);
+                let pos  = rect.left_top() + egui::vec2(8.0, 8.0);
+                let galley = painter.layout_no_wrap(msg.clone(), font.clone(), ink);
+                let pad = egui::vec2(8.0, 5.0);
+                let bg = egui::Rect::from_min_size(pos, galley.size() + pad * 2.0);
+                painter.rect_filled(bg, 4.0, col);
+                painter.text(pos + pad, egui::Align2::LEFT_TOP, msg, font, ink);
+            }
             // Snapshot for the Screen Stats panel — covers both CPU
             // and GPU render paths (they share `drawn`/`skipped`).
             self.last_render_stats = RenderStats {
@@ -27987,11 +28482,15 @@ fn wall_insulation_wave(w: &cad_kernel::Wall) -> Vec<Vec2> {
 /// straight wall is normally one piece per side, but an X-crossing splits a
 /// face into several disjoint segments (the opening at the junction). Curved
 /// walls return one sampled polyline per side.
-fn wall_face_screen_pts(
-    app:  &CadApp,
-    rect: egui::Rect,
-    w:    &cad_kernel::Wall,
-) -> (Vec<Vec<egui::Pos2>>, Vec<Vec<egui::Pos2>>) {
+/// WORLD-space wall faces — left + right, each a LIST of pieces (a junction
+/// crossing splits a face into separate pieces). Shared by the CPU/egui
+/// path (`wall_face_screen_pts` maps these to screen) and the GPU path
+/// (which needs world coords for camera-relative instances), so the two can
+/// never disagree on wall geometry.
+fn wall_face_world_pts(
+    app: &CadApp,
+    w:   &cad_kernel::Wall,
+) -> (Vec<Vec<Vec2>>, Vec<Vec<Vec2>>) {
     if w.is_curved() {
         let n = match cad_kernel::bulge_arc(w.start, w.end, w.bulge) {
             Some((_c, r, _a0, sweep)) => {
@@ -28001,10 +28500,7 @@ fn wall_face_screen_pts(
             None => 28,
         };
         match w.face_polylines(n) {
-            Some((l, r)) => (
-                vec![l.iter().map(|p| app.w2s(*p, rect)).collect()],
-                vec![r.iter().map(|p| app.w2s(*p, rect)).collect()],
-            ),
+            Some((l, r)) => (vec![l], vec![r]),
             None => (Vec::new(), Vec::new()),
         }
     } else {
@@ -28012,20 +28508,32 @@ fn wall_face_screen_pts(
             .filter_map(|d| if let Geom::Wall(x) = &d.geom {
                 Some(x.clone()) } else { None })
             .collect();
-        let to_screen = |segs: Vec<(Vec2, Vec2)>| -> Vec<Vec<egui::Pos2>> {
-            segs.iter().map(|(a, b)| vec![app.w2s(*a, rect), app.w2s(*b, rect)]).collect()
-        };
         match cad_wall::solve_face_segments(w, &walls) {
-            Some((ls, rs)) => (to_screen(ls), to_screen(rs)),
+            Some((ls, rs)) => (
+                ls.iter().map(|(a, b)| vec![*a, *b]).collect(),
+                rs.iter().map(|(a, b)| vec![*a, *b]).collect(),
+            ),
             None => match (w.left_line(), w.right_line()) {
-                (Some(l), Some(r)) => (
-                    vec![vec![app.w2s(l.a, rect), app.w2s(l.b, rect)]],
-                    vec![vec![app.w2s(r.a, rect), app.w2s(r.b, rect)]],
-                ),
+                (Some(l), Some(r)) =>
+                    (vec![vec![l.a, l.b]], vec![vec![r.a, r.b]]),
                 _ => (Vec::new(), Vec::new()),
             },
         }
     }
+}
+
+fn wall_face_screen_pts(
+    app:  &CadApp,
+    rect: egui::Rect,
+    w:    &cad_kernel::Wall,
+) -> (Vec<Vec<egui::Pos2>>, Vec<Vec<egui::Pos2>>) {
+    let (lw, rw) = wall_face_world_pts(app, w);
+    let map = |pieces: Vec<Vec<Vec2>>| -> Vec<Vec<egui::Pos2>> {
+        pieces.into_iter()
+            .map(|piece| piece.iter().map(|p| app.w2s(*p, rect)).collect())
+            .collect()
+    };
+    (map(lw), map(rw))
 }
 
 /// Same as `draw_dobject` with a parameterised stroke width. Used for the

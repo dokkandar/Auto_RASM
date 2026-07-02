@@ -30,6 +30,21 @@ pub struct CircleInstance {
     pub color: u32,    // packed RGBA, byte order R high … A low
 }
 
+/// Analytic arc — a circle ring clamped to an angular sweep, evaluated in
+/// the fragment shader (no CPU tessellation, pixel-perfect at any zoom).
+/// `sweep` MUST be normalised to (0, TAU] CCW (the CPU folds a negative
+/// sweep into `a0`), so the shader's angular test is a single compare.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ArcInstance {
+    pub x:     f32,
+    pub y:     f32,
+    pub r:     f32,
+    pub a0:    f32,    // start angle (radians, world)
+    pub sweep: f32,    // sweep (radians, 0..TAU, CCW)
+    pub color: u32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct LineInstance {
@@ -39,6 +54,19 @@ pub struct LineInstance {
     pub by:     f32,
     pub half_w: f32,   // world-space HALF stroke width (screen-min applied CPU-side)
     pub color:  u32,
+}
+
+/// One vertex of a filled triangle. Fills are NOT instanced — the CPU emits
+/// a plain triangle soup (3 `FillVertex` per triangle) into one buffer and
+/// the pipeline draws it with a single non-instanced `glDrawArrays`. Used
+/// for solid hatch fills, wall poché, and (later) wide-polyline width strips
+/// — anything that's an area rather than a stroke.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FillVertex {
+    pub x:     f32,
+    pub y:     f32,
+    pub color: u32,    // packed RGBA (alpha honoured — poché is translucent)
 }
 
 /// One shader program + its instance buffer + VAO (attributes wired).
@@ -51,7 +79,9 @@ struct GpuPipeline {
 
 pub struct GpuShapeRenderer {
     circle:   Option<GpuPipeline>,
+    arc:      Option<GpuPipeline>,
     line:     Option<GpuPipeline>,
+    fill:     Option<GpuPipeline>,
     quad_vbo: Option<glow::Buffer>,
 }
 
@@ -62,7 +92,7 @@ unsafe impl Sync for GpuShapeRenderer {}
 
 impl Default for GpuShapeRenderer {
     fn default() -> Self {
-        Self { circle: None, line: None, quad_vbo: None }
+        Self { circle: None, arc: None, line: None, fill: None, quad_vbo: None }
     }
 }
 
@@ -102,6 +132,62 @@ const CIRCLE_FS: &str = r#"
         float half_w    = thickness * 0.5;
         if (d > 1.0 + half_w + aa) discard;
         if (d < 1.0 - half_w - aa) discard;
+        float dist = abs(d - 1.0);
+        float a    = 1.0 - smoothstep(half_w - aa, half_w + aa, dist);
+        if (a < 0.005) discard;
+        frag = vec4(v_color.rgb, v_color.a * a);
+    }
+"#;
+
+// Arc: same unit-quad-sized-to-radius as the circle, but the fragment also
+// clamps to the angular sweep so only the arc (not the full ring) survives.
+// Butt ends (hard angular cut) — matches CAD arc caps.
+const ARC_VS: &str = r#"
+    #version 330 core
+    layout(location=0) in vec2  a_quad;
+    layout(location=1) in vec3  a_arc;      // x, y, r
+    layout(location=2) in vec2  a_ang;      // a0, sweep (CCW, 0..TAU)
+    layout(location=3) in uint  a_color;
+    uniform mat4 u_view;
+    out vec2       v_local;
+    flat out float v_a0;
+    flat out float v_sweep;
+    flat out vec4  v_color;
+    void main() {
+        v_local = a_quad;
+        vec2 world = a_arc.xy + a_quad * a_arc.z;
+        gl_Position = u_view * vec4(world, 0.0, 1.0);
+        v_a0 = a_ang.x;
+        v_sweep = a_ang.y;
+        v_color = vec4(
+            float((a_color >> 24) & 0xFFu) / 255.0,
+            float((a_color >> 16) & 0xFFu) / 255.0,
+            float((a_color >>  8) & 0xFFu) / 255.0,
+            float( a_color        & 0xFFu) / 255.0
+        );
+    }
+"#;
+
+const ARC_FS: &str = r#"
+    #version 330 core
+    in vec2       v_local;
+    flat in float v_a0;
+    flat in float v_sweep;
+    flat in vec4  v_color;
+    out vec4 frag;
+    void main() {
+        float d  = length(v_local);
+        float aa = fwidth(d);
+        float thickness = max(1.0 * aa, 0.0012);
+        float half_w    = thickness * 0.5;
+        if (d > 1.0 + half_w + aa) discard;
+        if (d < 1.0 - half_w - aa) discard;
+        // Angular clamp (skip when it's effectively a full circle).
+        if (v_sweep < 6.2831853) {
+            float ang = atan(v_local.y, v_local.x);
+            float rel = mod(ang - v_a0, 6.28318530718);
+            if (rel > v_sweep) discard;
+        }
         float dist = abs(d - 1.0);
         float a    = 1.0 - smoothstep(half_w - aa, half_w + aa, dist);
         if (a < 0.005) discard;
@@ -171,6 +257,33 @@ const LINE_FS: &str = r#"
     }
 "#;
 
+// Fill: a plain triangle soup (no unit quad, not instanced). The vertex
+// carries its own world position; the fragment is a flat solid color with
+// alpha (so translucent poché works). Drawn UNDER the stroke pipelines.
+const FILL_VS: &str = r#"
+    #version 330 core
+    layout(location=0) in vec2 a_pos;
+    layout(location=1) in uint a_color;
+    uniform mat4 u_view;
+    flat out vec4 v_color;
+    void main() {
+        gl_Position = u_view * vec4(a_pos, 0.0, 1.0);
+        v_color = vec4(
+            float((a_color >> 24) & 0xFFu) / 255.0,
+            float((a_color >> 16) & 0xFFu) / 255.0,
+            float((a_color >>  8) & 0xFFu) / 255.0,
+            float( a_color        & 0xFFu) / 255.0
+        );
+    }
+"#;
+
+const FILL_FS: &str = r#"
+    #version 330 core
+    flat in vec4 v_color;
+    out vec4 frag;
+    void main() { frag = v_color; }
+"#;
+
 impl GpuShapeRenderer {
     /// Compile programs + create buffers, idempotently.
     pub fn ensure_init(&mut self, gl: &glow::Context) {
@@ -186,7 +299,9 @@ impl GpuShapeRenderer {
             self.quad_vbo = Some(qvbo);
 
             self.circle = Some(Self::build_circle(gl, qvbo));
+            self.arc    = Some(Self::build_arc(gl, qvbo));
             self.line   = Some(Self::build_line(gl, qvbo));
+            self.fill   = Some(Self::build_fill(gl));
 
             gl.bind_buffer(glow::ARRAY_BUFFER, None);
             gl.bind_vertex_array(None);
@@ -237,6 +352,29 @@ impl GpuShapeRenderer {
         GpuPipeline { program, vao, instance_vbo: ivbo, u_view }
     }
 
+    unsafe fn build_arc(gl: &glow::Context, quad_vbo: glow::Buffer) -> GpuPipeline {
+        let program = Self::compile(gl, ARC_VS, ARC_FS);
+        let u_view = gl.get_uniform_location(program, "u_view");
+        let ivbo = gl.create_buffer().unwrap();
+        let vao = gl.create_vertex_array().unwrap();
+        gl.bind_vertex_array(Some(vao));
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(quad_vbo));
+        gl.enable_vertex_attrib_array(0);
+        gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 0, 0);
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(ivbo));
+        let stride = size_of::<ArcInstance>() as i32;   // 24
+        gl.enable_vertex_attrib_array(1);               // x,y,r
+        gl.vertex_attrib_pointer_f32(1, 3, glow::FLOAT, false, stride, 0);
+        gl.vertex_attrib_divisor(1, 1);
+        gl.enable_vertex_attrib_array(2);               // a0, sweep
+        gl.vertex_attrib_pointer_f32(2, 2, glow::FLOAT, false, stride, 12);
+        gl.vertex_attrib_divisor(2, 1);
+        gl.enable_vertex_attrib_array(3);               // color
+        gl.vertex_attrib_pointer_i32(3, 1, glow::UNSIGNED_INT, stride, 20);
+        gl.vertex_attrib_divisor(3, 1);
+        GpuPipeline { program, vao, instance_vbo: ivbo, u_view }
+    }
+
     unsafe fn build_line(gl: &glow::Context, quad_vbo: glow::Buffer) -> GpuPipeline {
         let program = Self::compile(gl, LINE_VS, LINE_FS);
         let u_view = gl.get_uniform_location(program, "u_view");
@@ -260,11 +398,30 @@ impl GpuShapeRenderer {
         GpuPipeline { program, vao, instance_vbo: ivbo, u_view }
     }
 
+    // Triangle-soup fill pipeline: per-VERTEX position + color, NO instancing,
+    // NO shared quad. `instance_vbo` is reused as the vertex buffer.
+    unsafe fn build_fill(gl: &glow::Context) -> GpuPipeline {
+        let program = Self::compile(gl, FILL_VS, FILL_FS);
+        let u_view = gl.get_uniform_location(program, "u_view");
+        let vbo = gl.create_buffer().unwrap();
+        let vao = gl.create_vertex_array().unwrap();
+        gl.bind_vertex_array(Some(vao));
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        let stride = size_of::<FillVertex>() as i32;   // 12
+        gl.enable_vertex_attrib_array(0);              // pos
+        gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, stride, 0);
+        gl.enable_vertex_attrib_array(1);              // color
+        gl.vertex_attrib_pointer_i32(1, 1, glow::UNSIGNED_INT, stride, 8);
+        GpuPipeline { program, vao, instance_vbo: vbo, u_view }
+    }
+
     /// Upload both instance buffers and draw (one call per non-empty pipeline).
     pub fn render(
         &mut self,
         gl: &glow::Context,
+        fills: &[FillVertex],
         circles: &[CircleInstance],
+        arcs: &[ArcInstance],
         lines: &[LineInstance],
         view: &[f32; 16],
     ) {
@@ -272,9 +429,36 @@ impl GpuShapeRenderer {
             gl.enable(glow::BLEND);
             gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
         }
+        // Fills first so strokes (faces, outlines) land ON TOP of areas.
+        Self::draw_fill(gl, &self.fill, bytes(fills), fills.len(), view);
         Self::draw(gl, &self.circle, bytes(circles), circles.len(), view);
+        Self::draw(gl, &self.arc,    bytes(arcs),    arcs.len(),    view);
         Self::draw(gl, &self.line,   bytes(lines),   lines.len(),   view);
         unsafe { gl.use_program(None); }
+    }
+
+    /// Draw the triangle-soup fill buffer (non-instanced). `vert_count` is
+    /// the number of VERTICES (3 per triangle).
+    fn draw_fill(
+        gl: &glow::Context,
+        pipe: &Option<GpuPipeline>,
+        data: &[u8],
+        vert_count: usize,
+        view: &[f32; 16],
+    ) {
+        if vert_count == 0 { return; }
+        let p = match pipe { Some(p) => p, None => return };
+        unsafe {
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(p.instance_vbo));
+            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, data, glow::DYNAMIC_DRAW);
+            gl.use_program(Some(p.program));
+            if let Some(loc) = &p.u_view {
+                gl.uniform_matrix_4_f32_slice(Some(loc), false, view);
+            }
+            gl.bind_vertex_array(Some(p.vao));
+            gl.draw_arrays(glow::TRIANGLES, 0, vert_count as i32);
+            gl.bind_vertex_array(None);
+        }
     }
 
     fn draw(
