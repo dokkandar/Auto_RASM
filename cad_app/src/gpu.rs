@@ -45,6 +45,21 @@ pub struct ArcInstance {
     pub color: u32,
 }
 
+/// Analytic (full) ellipse — a rotated ellipse ring evaluated in the fragment
+/// shader via a gradient-approximated distance (exact at the thin stroke, the
+/// only place it matters). `a`/`b` are the semi-major/minor lengths, `rot` the
+/// major-axis angle. No CPU tessellation. (Elliptical ARCS stay tessellated.)
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct EllipseInstance {
+    pub x:     f32,
+    pub y:     f32,
+    pub a:     f32,    // semi-major
+    pub b:     f32,    // semi-minor
+    pub rot:   f32,    // major-axis angle (radians)
+    pub color: u32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct LineInstance {
@@ -80,6 +95,7 @@ struct GpuPipeline {
 pub struct GpuShapeRenderer {
     circle:   Option<GpuPipeline>,
     arc:      Option<GpuPipeline>,
+    ellipse:  Option<GpuPipeline>,
     line:     Option<GpuPipeline>,
     fill:     Option<GpuPipeline>,
     quad_vbo: Option<glow::Buffer>,
@@ -92,7 +108,7 @@ unsafe impl Sync for GpuShapeRenderer {}
 
 impl Default for GpuShapeRenderer {
     fn default() -> Self {
-        Self { circle: None, arc: None, line: None, fill: None, quad_vbo: None }
+        Self { circle: None, arc: None, ellipse: None, line: None, fill: None, quad_vbo: None }
     }
 }
 
@@ -192,6 +208,64 @@ const ARC_FS: &str = r#"
         float a    = 1.0 - smoothstep(half_w - aa, half_w + aa, dist);
         if (a < 0.005) discard;
         frag = vec4(v_color.rgb, v_color.a * a);
+    }
+"#;
+
+// Ellipse: quad sized to the SEMI-MAJOR (covers the rotated ellipse, which
+// fits in a circle of radius a). The fragment rotates into the ellipse frame,
+// forms the implicit f = (x/a)²+(y/b)²−1, and divides by |∇f| for a first-
+// order distance — accurate at the thin ring (where f≈0). Butt-free ring.
+const ELLIPSE_VS: &str = r#"
+    #version 330 core
+    layout(location=0) in vec2  a_quad;
+    layout(location=1) in vec4  a_el;       // cx, cy, a, b
+    layout(location=2) in float a_rot;
+    layout(location=3) in uint  a_color;
+    uniform mat4 u_view;
+    out vec2       v_local;
+    flat out float v_a;
+    flat out float v_b;
+    flat out float v_rot;
+    flat out vec4  v_color;
+    void main() {
+        v_local = a_quad;
+        vec2 world = a_el.xy + a_quad * a_el.z;   // a_el.z = semi-major
+        gl_Position = u_view * vec4(world, 0.0, 1.0);
+        v_a = a_el.z; v_b = a_el.w; v_rot = a_rot;
+        v_color = vec4(
+            float((a_color >> 24) & 0xFFu) / 255.0,
+            float((a_color >> 16) & 0xFFu) / 255.0,
+            float((a_color >>  8) & 0xFFu) / 255.0,
+            float( a_color        & 0xFFu) / 255.0
+        );
+    }
+"#;
+
+const ELLIPSE_FS: &str = r#"
+    #version 330 core
+    in vec2       v_local;
+    flat in float v_a;
+    flat in float v_b;
+    flat in float v_rot;
+    flat in vec4  v_color;
+    out vec4 frag;
+    void main() {
+        vec2 rel = v_local * v_a;                 // world offset from centre
+        float c = cos(-v_rot), s = sin(-v_rot);
+        vec2 loc = vec2(c * rel.x - s * rel.y, s * rel.x + c * rel.y);
+        float a = max(v_a, 1e-6), b = max(v_b, 1e-6);
+        float f  = (loc.x * loc.x) / (a * a) + (loc.y * loc.y) / (b * b) - 1.0;
+        float gx = loc.x / (a * a);
+        float gy = loc.y / (b * b);
+        float gmag = 2.0 * sqrt(gx * gx + gy * gy) + 1e-9;
+        float dist = f / gmag;                     // approx signed world distance
+        float ad = abs(dist);
+        float aa = fwidth(dist);
+        float hw = max(0.8 * aa, 0.0006);
+        if (ad > hw + aa) discard;
+        float alpha = 1.0 - smoothstep(hw - aa, hw + aa, ad);
+        if (alpha < 0.005) discard;
+        frag = vec4(v_color.rgb, v_color.a * alpha);
     }
 "#;
 
@@ -298,10 +372,11 @@ impl GpuShapeRenderer {
             gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(&quad), glow::STATIC_DRAW);
             self.quad_vbo = Some(qvbo);
 
-            self.circle = Some(Self::build_circle(gl, qvbo));
-            self.arc    = Some(Self::build_arc(gl, qvbo));
-            self.line   = Some(Self::build_line(gl, qvbo));
-            self.fill   = Some(Self::build_fill(gl));
+            self.circle  = Some(Self::build_circle(gl, qvbo));
+            self.arc     = Some(Self::build_arc(gl, qvbo));
+            self.ellipse = Some(Self::build_ellipse(gl, qvbo));
+            self.line    = Some(Self::build_line(gl, qvbo));
+            self.fill    = Some(Self::build_fill(gl));
 
             gl.bind_buffer(glow::ARRAY_BUFFER, None);
             gl.bind_vertex_array(None);
@@ -375,6 +450,29 @@ impl GpuShapeRenderer {
         GpuPipeline { program, vao, instance_vbo: ivbo, u_view }
     }
 
+    unsafe fn build_ellipse(gl: &glow::Context, quad_vbo: glow::Buffer) -> GpuPipeline {
+        let program = Self::compile(gl, ELLIPSE_VS, ELLIPSE_FS);
+        let u_view = gl.get_uniform_location(program, "u_view");
+        let ivbo = gl.create_buffer().unwrap();
+        let vao = gl.create_vertex_array().unwrap();
+        gl.bind_vertex_array(Some(vao));
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(quad_vbo));
+        gl.enable_vertex_attrib_array(0);
+        gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 0, 0);
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(ivbo));
+        let stride = size_of::<EllipseInstance>() as i32;   // 24
+        gl.enable_vertex_attrib_array(1);                   // cx,cy,a,b
+        gl.vertex_attrib_pointer_f32(1, 4, glow::FLOAT, false, stride, 0);
+        gl.vertex_attrib_divisor(1, 1);
+        gl.enable_vertex_attrib_array(2);                   // rot
+        gl.vertex_attrib_pointer_f32(2, 1, glow::FLOAT, false, stride, 16);
+        gl.vertex_attrib_divisor(2, 1);
+        gl.enable_vertex_attrib_array(3);                   // color
+        gl.vertex_attrib_pointer_i32(3, 1, glow::UNSIGNED_INT, stride, 20);
+        gl.vertex_attrib_divisor(3, 1);
+        GpuPipeline { program, vao, instance_vbo: ivbo, u_view }
+    }
+
     unsafe fn build_line(gl: &glow::Context, quad_vbo: glow::Buffer) -> GpuPipeline {
         let program = Self::compile(gl, LINE_VS, LINE_FS);
         let u_view = gl.get_uniform_location(program, "u_view");
@@ -422,6 +520,7 @@ impl GpuShapeRenderer {
         fills: &[FillVertex],
         circles: &[CircleInstance],
         arcs: &[ArcInstance],
+        ellipses: &[EllipseInstance],
         lines: &[LineInstance],
         view: &[f32; 16],
     ) {
@@ -431,9 +530,10 @@ impl GpuShapeRenderer {
         }
         // Fills first so strokes (faces, outlines) land ON TOP of areas.
         Self::draw_fill(gl, &self.fill, bytes(fills), fills.len(), view);
-        Self::draw(gl, &self.circle, bytes(circles), circles.len(), view);
-        Self::draw(gl, &self.arc,    bytes(arcs),    arcs.len(),    view);
-        Self::draw(gl, &self.line,   bytes(lines),   lines.len(),   view);
+        Self::draw(gl, &self.circle,  bytes(circles),  circles.len(),  view);
+        Self::draw(gl, &self.arc,     bytes(arcs),     arcs.len(),     view);
+        Self::draw(gl, &self.ellipse, bytes(ellipses), ellipses.len(), view);
+        Self::draw(gl, &self.line,    bytes(lines),    lines.len(),    view);
         unsafe { gl.use_program(None); }
     }
 

@@ -12,7 +12,7 @@ use std::thread;
 
 use cad_kernel::*;
 
-use crate::gpu::{view_matrix, CircleInstance, ArcInstance, LineInstance, FillVertex, GpuShapeRenderer};
+use crate::gpu::{view_matrix, CircleInstance, ArcInstance, EllipseInstance, LineInstance, FillVertex, GpuShapeRenderer};
 use crate::settings::UserEnv;
 
 // PEDIT (polyline edit) methods live in `src/app/pedit.rs`. Child module of
@@ -9130,6 +9130,30 @@ impl CadApp {
         self.render_mode = m;
         self.gpu_dirty = true;
         self.history.push(format!("  render mode → {:?}", m));
+    }
+
+    /// If the dobject is a STROKED geom with a non-continuous linetype
+    /// (its own, else ByLayer), return the WORLD-unit dash pattern (already
+    /// multiplied by the per-dobject linetype scale) so the GPU path can walk
+    /// dashes. `None` = solid (continuous, or a non-stroked geom). Mirrors the
+    /// resolution in `paint_dobject_with_style`.
+    fn effective_dash_pattern(&self, e: &DObject) -> Option<Vec<f32>> {
+        use cad_kernel::LinetypeTable;
+        if !matches!(e.geom,
+            Geom::Line(_) | Geom::Polyline(_) | Geom::Circle(_) | Geom::Arc(_)
+            | Geom::Ellipse(_) | Geom::EllipseArc(_) | Geom::Spline(_)) {
+            return None;
+        }
+        let lt_id = if e.style.linetype == LinetypeTable::CONTINUOUS {
+            self.doc.layers.get(e.style.layer)
+                .map(|l| l.linetype).unwrap_or(LinetypeTable::CONTINUOUS)
+        } else {
+            e.style.linetype
+        };
+        let lt = self.doc.linetypes.get(lt_id)?;
+        if lt.is_continuous() { return None; }
+        let lt_scale = if e.style.linetype_scale > 1e-6 { e.style.linetype_scale } else { 1.0 };
+        Some(lt.pattern.iter().map(|p| *p * lt_scale).collect())
     }
 
     /// Generate the (expensive) COLOUR-LESS render geometry for the hatch at
@@ -19362,6 +19386,48 @@ struct HatchCacheEntry {
     holes: Vec<[Vec2; 3]>,
 }
 
+/// Walk a WORLD-space polyline emitting dash segments per a WORLD-unit
+/// pattern (even index = dash, odd = gap). The GPU equivalent of
+/// `paint_pattern_polyline`; `rem` carries across vertices so dashes flow
+/// through corners. Zero-length dash elements (dots) emit a tiny segment
+/// (the line shader renders it as a ~1px dot). All-zero patterns no-op.
+fn dash_world_segments(pl: &[Vec2], pat: &[f32], out: &mut Vec<(Vec2, Vec2)>) {
+    let m = pat.len();
+    if pl.len() < 2 || m == 0 { return; }
+    let total: f64 = pat.iter().map(|p| (*p as f64).max(0.0)).sum();
+    if total < 1e-9 { return; }
+    let mut pi = 0usize;
+    let mut rem = (pat[0] as f64).max(0.0);
+    for seg in pl.windows(2) {
+        let (a, b) = (seg[0], seg[1]);
+        let d = b - a;
+        let seglen = d.len();
+        if seglen < 1e-12 { continue; }
+        let dir = d / seglen;
+        let mut pos = 0.0_f64;
+        while pos < seglen - 1e-12 {
+            // Skip exhausted elements; a zero-length pen-down element = a dot.
+            let mut guard = 0;
+            while rem <= 1e-12 && guard < 2 * m {
+                if pi % 2 == 0 {
+                    let p = a + dir * pos;
+                    out.push((p, p));
+                }
+                pi = (pi + 1) % m;
+                rem = (pat[pi] as f64).max(0.0);
+                guard += 1;
+            }
+            if rem <= 1e-12 { break; }   // all-zero safety
+            let step = rem.min(seglen - pos);
+            if pi % 2 == 0 {
+                out.push((a + dir * pos, a + dir * (pos + step)));
+            }
+            pos += step;
+            rem -= step;
+        }
+    }
+}
+
 /// Pack an egui color into the u32 RGBA layout the GPU shaders unpack
 /// (R high byte … A low byte). Alpha is preserved (translucent poché).
 fn pack_rgba(c: egui::Color32) -> u32 {
@@ -25480,7 +25546,7 @@ impl eframe::App for CadApp {
                                     let gl = gl_painter.gl();
                                     let mut r = renderer.lock().unwrap();
                                     r.ensure_init(gl);
-                                    r.render(gl, &[], &dots, &[], &[], &view);
+                                    r.render(gl, &[], &dots, &[], &[], &[], &view);
                                 },
                             ),
                         ),
@@ -25683,12 +25749,12 @@ impl eframe::App for CadApp {
                     }
                 }
                 RenderMode::Gpu => {
-                    // GPU path. Pipelines: CIRCLE (instanced ring SDF), ARC
-                    // (instanced analytic ring-with-angular-clamp SDF), LINE
-                    // (instanced SDF), FILL (triangle soup). Mapping:
+                    // GPU path. Pipelines: CIRCLE / ARC / ELLIPSE (analytic ring
+                    // SDFs), LINE (instanced SDF), FILL (triangle soup). Mapping:
                     //   Line / Point / Spline / straight-thin Polyline → LINE
-                    //   Ellipse / EllipseArc                → LINE (CPU-tessellated)
-                    //   Circle → CIRCLE ·  Arc → ARC (analytic, no tessellation)
+                    //   Circle → CIRCLE ·  Arc → ARC ·  Ellipse → ELLIPSE (all
+                    //     analytic, no CPU tessellation) ·  EllipseArc → LINE
+                    //   NON-continuous linetype (any stroked geom) → dashed LINE
                     //   pattern Hatch → LINE + CIRCLE ·  solid Hatch → FILL
                     //   Wall → FILL (poché) + LINE (faces/insulation/centerline)
                     // Still on the egui painter (already GPU-drawn by egui):
@@ -25698,10 +25764,11 @@ impl eframe::App for CadApp {
                     // f64 add first, so f32 stays precise far from the origin.
                     // Color resolution matches the CPU branch (selection=yellow,
                     // snap source=cyan, else the dobject's resolved style color).
-                    let mut circles: Vec<CircleInstance> = Vec::new();
-                    let mut arcs:    Vec<ArcInstance>    = Vec::new();
-                    let mut lines:   Vec<LineInstance>   = Vec::new();
-                    let mut fills:   Vec<FillVertex>     = Vec::new();
+                    let mut circles:  Vec<CircleInstance>  = Vec::new();
+                    let mut arcs:     Vec<ArcInstance>     = Vec::new();
+                    let mut ellipses: Vec<EllipseInstance> = Vec::new();
+                    let mut lines:    Vec<LineInstance>    = Vec::new();
+                    let mut fills:    Vec<FillVertex>      = Vec::new();
                     let ox = self.world_offset.x as f64;
                     let oy = self.world_offset.y as f64;
                     // Default hairline half-width in WORLD units (~1.6px stroke);
@@ -25741,6 +25808,22 @@ impl eframe::App for CadApp {
                             | ((color.b() as u32) <<  8)
                             |  (color.a() as u32);
                         let sc = self.scale.max(1e-6);
+                        // Non-continuous linetype → emit DASHES (world polylines
+                        // → dash walk → LINE pipeline), matching the CPU
+                        // paint_dobject_with_style path. Covers every stroked
+                        // geom (incl. arc/circle/ellipse via tessellation), so a
+                        // dashed line no longer shows solid in GPU mode.
+                        if let Some(pat) = self.effective_dash_pattern(e) {
+                            let mut dashes: Vec<(Vec2, Vec2)> = Vec::new();
+                            for pl in self.preview_world_polylines(&e.geom) {
+                                dash_world_segments(&pl, &pat, &mut dashes);
+                            }
+                            for (a, b) in dashes {
+                                gpu_push_seg(&mut lines, a, b, ox, oy, half_w, packed);
+                            }
+                            drawn += 1;
+                            continue;
+                        }
                         match &e.geom {
                             Geom::Circle(c) => {
                                 circles.push(CircleInstance {
@@ -25782,14 +25865,16 @@ impl eframe::App for CadApp {
                                 });
                             }
                             Geom::Ellipse(el) => {
-                                let n = (((el.major.len() as f32) * sc) * 0.7)
-                                    .clamp(16.0, 512.0) as usize;
-                                let mut prev = el.point_at(0.0);
-                                for k in 1..=n {
-                                    let p = el.point_at(k as f64 / n as f64 * std::f64::consts::TAU);
-                                    gpu_push_seg(&mut lines, prev, p, ox, oy, half_w, packed);
-                                    prev = p;
-                                }
+                                // Analytic ellipse SDF — no CPU tessellation.
+                                let a = el.major.len();
+                                ellipses.push(EllipseInstance {
+                                    x: (el.center.x + ox) as f32,
+                                    y: (el.center.y + oy) as f32,
+                                    a: a as f32,
+                                    b: (a * el.ratio) as f32,
+                                    rot: el.major.y.atan2(el.major.x) as f32,
+                                    color: packed,
+                                });
                             }
                             Geom::EllipseArc(ea) => {
                                 let n = (((ea.ellipse.major.len() as f32) * sc) * 0.7)
@@ -25934,10 +26019,10 @@ impl eframe::App for CadApp {
                         }
                         drawn += 1;
                     }
-                    gpu_circles_count = circles.len() + arcs.len();
+                    gpu_circles_count = circles.len() + arcs.len() + ellipses.len();
                     gpu_line_count = lines.len();
                     gpu_fill_count = fills.len() / 3;
-                    if !circles.is_empty() || !arcs.is_empty()
+                    if !circles.is_empty() || !arcs.is_empty() || !ellipses.is_empty()
                         || !lines.is_empty() || !fills.is_empty() {
                         // Camera-relative: offset folded into the instances, so
                         // the view matrix uses offset 0.
@@ -25954,7 +26039,7 @@ impl eframe::App for CadApp {
                                         let gl = gl_painter.gl();
                                         let mut r = renderer.lock().unwrap();
                                         r.ensure_init(gl);
-                                        r.render(gl, &fills, &circles, &arcs, &lines, &view);
+                                        r.render(gl, &fills, &circles, &arcs, &ellipses, &lines, &view);
                                     },
                                 ),
                             ),
