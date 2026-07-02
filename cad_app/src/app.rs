@@ -25083,6 +25083,7 @@ impl eframe::App for CadApp {
             let mut drawn   = 0usize;
             let mut skipped = 0usize;
             let mut gpu_circles_count = 0usize;
+            let mut gpu_line_count = 0usize;
 
             // === APX (draft display) render branch ===
             // In APX mode every visible dobject becomes a single dot at its
@@ -25474,6 +25475,7 @@ impl eframe::App for CadApp {
                         drawn += 1;
                     }
                     gpu_circles_count = circles.len();
+                    gpu_line_count = lines.len();
                     if !circles.is_empty() || !lines.is_empty() {
                         // Camera-relative: offset folded into the instances, so
                         // the view matrix uses offset 0.
@@ -25590,7 +25592,9 @@ impl eframe::App for CadApp {
             let mode_str = match self.render_mode {
                 RenderMode::Apx => format!("APX ({} dots instanced)", gpu_circles_count),
                 RenderMode::Cpu => format!("CPU"),
-                RenderMode::Gpu => format!("GPU ({} circles instanced)", gpu_circles_count),
+                RenderMode::Gpu => format!(
+                    "GPU ({} circles + {} line-seg instanced)",
+                    gpu_circles_count, gpu_line_count),
             };
             painter.text(
                 rect.right_top() + egui::vec2(-8.0, 8.0),
