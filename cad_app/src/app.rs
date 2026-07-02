@@ -912,15 +912,6 @@ pub struct CadApp {
     /// per-cull skip counters. Surfaced in the "Screen Stats" floating
     /// window so the user can verify the renderer's view of the doc.
     last_render_stats: RenderStats,
-    /// APX (approximate / draft display) mode currently active. While
-    /// true, every visible dobject renders as a single dot at its
-    /// gravity point (per `env.LodAnc`) instead of full geometry —
-    /// one instanced GPU draw call for the entire scene, FPS recovers
-    /// from single-digit to 60+ on million-dobject drawings. Toggled
-    /// by the [APX] badge in the status bar. The underlying data is
-    /// unchanged; only the visual is approximate. Selection hit-
-    /// testing still uses the real geometry.
-    lod_active: bool,
     /// Whether the "Screen Stats" window is currently visible. Toggle
     /// via Tools menu.
     screen_stats_open: bool,
@@ -2641,6 +2632,9 @@ pub enum ExtendState {
 pub enum RenderMode {
     Cpu,
     Gpu,
+    /// APX draft: every dobject drawn as a single dot — one instanced GPU
+    /// draw call for the whole scene (fastest; approximate visual).
+    Apx,
 }
 
 /// Which screen edge (if any) a floating Window is docked against.
@@ -2776,7 +2770,6 @@ impl Default for CadApp {
             empty_enter_count_in_select: 0,
             grip_drag: None,
             last_render_stats:   RenderStats::default(),
-            lod_active:          false,
             screen_stats_open:   false,
             screen_stats_was_open: false,
             hatch_worker:        None,
@@ -9531,6 +9524,7 @@ impl CadApp {
                     ui.label(match self.render_mode {
                         RenderMode::Cpu => "CPU",
                         RenderMode::Gpu => "GPU",
+                        RenderMode::Apx => "APX",
                     });
                     ui.end_row();
 
@@ -22555,49 +22549,25 @@ impl eframe::App for CadApp {
             let resp = win.show(ctx, |ui| {
                     ui.label(egui::RichText::new("Render mode")
                         .monospace().strong());
+                    // Three MUTUALLY-EXCLUSIVE render modes (radio = pick one):
+                    //   CPU — all shapes via egui painter (full fidelity).
+                    //   GPU — geometry on our OpenGL pipelines (circles instanced
+                    //         today; more primitives migrating — CPU fallback for
+                    //         any type not yet ported to a GPU pipeline).
+                    //   APX — every dobject a single dot, one instanced draw call
+                    //         (fastest; approximate). Selection/snap use real geom.
                     ui.horizontal(|ui| {
                         ui.radio_value(&mut self.render_mode,
                             RenderMode::Cpu, "CPU (egui painter)");
                     });
                     ui.horizontal(|ui| {
                         ui.radio_value(&mut self.render_mode,
-                            RenderMode::Gpu, "GPU (instanced circles + CPU lines/arcs)");
+                            RenderMode::Gpu, "GPU (OpenGL pipelines)");
                     });
-                    ui.separator();
-                    // ---- APX (draft display) toggle ------------------
-                    // Sits alongside the CPU/GPU choice because it's
-                    // the same axis of trade-off: fidelity vs speed.
-                    // When ON, every visible dobject collapses to a
-                    // single dot at its bbox center — one instanced
-                    // GPU draw call for the whole scene, FPS recovers
-                    // from single-digit to 60+ on million-dobject
-                    // drawings. Toggle off when you need to see real
-                    // geometry. Click + drag, snap, pick, move, copy
-                    // still work — only the visual is approximate.
-                    ui.label(egui::RichText::new("APX (draft display)")
-                        .monospace().strong());
-                    let mut apx = self.lod_active;
-                    let apx_label = if apx {
-                        "● APX ON  — geometry shown as dots"
-                    } else {
-                        "○ APX OFF — full geometry"
-                    };
-                    if ui.add(egui::Button::new(
-                        egui::RichText::new(apx_label).monospace()
-                    ).fill(if apx {
-                        egui::Color32::from_rgb(80, 50, 20)
-                    } else {
-                        egui::Color32::from_rgb(40, 45, 55)
-                    })).clicked() {
-                        apx = !apx;
-                    }
-                    if apx != self.lod_active {
-                        self.lod_active = apx;
-                        self.history.push(format!(
-                            "  APX → {} (manual)",
-                            if self.lod_active { "ON (geometry shown as dots)" }
-                            else { "OFF (full geometry)" }));
-                    }
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut self.render_mode,
+                            RenderMode::Apx, "APX (draft — all dots)");
+                    });
                     ui.separator();
                     ui.monospace(format!("FPS         {:>6.1}", fps));
                     ui.monospace(format!("dobjects    {:>6}", dobject_count));
@@ -22990,28 +22960,28 @@ impl eframe::App for CadApp {
                             ).sense(egui::Sense::click()));
                             resp.on_hover_text(tip).clicked()
                         };
-                        let gpu_on = self.render_mode == RenderMode::Gpu;
-                        if perf_badge(ui, "GPU", gpu_on,
-                            "Renderer: GPU (instanced circles) vs CPU (egui painter). \
-                             GPU is much faster for circle-heavy scenes; other primitives \
-                             still go through CPU regardless.")
+                        // Single 3-way render-mode badge — click cycles
+                        // CPU → GPU → APX → CPU (mutually exclusive).
+                        let (mode_lbl, mode_hot) = match self.render_mode {
+                            RenderMode::Cpu => ("CPU", false),
+                            RenderMode::Gpu => ("GPU", true),
+                            RenderMode::Apx => ("APX", true),
+                        };
+                        if perf_badge(ui, mode_lbl, mode_hot,
+                            "Render mode (click to cycle CPU → GPU → APX). \
+                             CPU = egui painter (full fidelity). GPU = our OpenGL \
+                             pipelines (CPU fallback for not-yet-ported types). \
+                             APX = every dobject a dot, one draw call (fastest, \
+                             approximate). Selection / snap always use real geometry.")
                         {
-                            self.render_mode = if gpu_on { RenderMode::Cpu } else { RenderMode::Gpu };
+                            self.render_mode = match self.render_mode {
+                                RenderMode::Cpu => RenderMode::Gpu,
+                                RenderMode::Gpu => RenderMode::Apx,
+                                RenderMode::Apx => RenderMode::Cpu,
+                            };
                             self.gpu_dirty = true;
                             self.history.push(format!(
                                 "  render mode → {:?} (manual)", self.render_mode));
-                        }
-                        if perf_badge(ui, "APX", self.lod_active,
-                            "Approximate display: every visible dobject becomes a single \
-                             dot at its bbox center. One GPU draw call for the whole scene — \
-                             FPS recovers from single-digit to 60+ on million-dobject drawings. \
-                             Selection / snap / hit-testing still use the real geometry.")
-                        {
-                            self.lod_active = !self.lod_active;
-                            self.history.push(format!(
-                                "  APX → {} (manual)",
-                                if self.lod_active { "ON (geometry shown as dots)" }
-                                else { "OFF (full geometry)" }));
                         }
                         ui.separator();
                         // EdgMod toggle
@@ -25104,16 +25074,13 @@ impl eframe::App for CadApp {
             let mut gpu_circles_count = 0usize;
 
             // === APX (draft display) render branch ===
-            // When `lod_active`, every visible dobject becomes a single
-            // dot at its gravity point. Dots are pushed into the GPU
-            // instanced-circle pipeline as tiny world-radius circles —
-            // one draw call for the entire scene, FPS recovers from
-            // single-digit to 60+. The full-geometry render_mode match
-            // below is skipped entirely while APX is active.
-            //
-            // Hit-testing, snap, and selection still use the underlying
-            // bbox / geometry — only the visual is approximate.
-            if self.lod_active {
+            // In APX mode every visible dobject becomes a single dot at its
+            // gravity point, pushed into the GPU instanced-circle pipeline as a
+            // tiny world-radius circle — one draw call for the entire scene, FPS
+            // recovers from single-digit to 60+. The full-geometry render_mode
+            // arms are skipped in APX. Hit-testing, snap, and selection still
+            // use the underlying geometry — only the visual is approximate.
+            if self.render_mode == RenderMode::Apx {
                 let mut dots: Vec<CircleInstance> = Vec::new();
                 // Screen-target dot radius → world radius for this frame.
                 // 1.5 px is small enough not to clutter at typical zooms
@@ -25448,6 +25415,7 @@ impl eframe::App for CadApp {
                     }
                     self.gpu_dirty = false;
                 }
+                RenderMode::Apx => {}   // handled by the APX branch above (keeps the match exhaustive)
             } } // close `match self.render_mode` and outer `else` from APX branch
             // Grip handles on the selected dobject (drawn on top of the
             // geometry, under the snap marker / rubber band).
@@ -25535,13 +25503,10 @@ impl eframe::App for CadApp {
             // HUD: FPS + drawn/skipped/total + index status + render mode.
             let idx_state = if self.index.is_some() && !self.index_dirty { "idx ✓" }
                             else { "idx stale" };
-            let mode_str = if self.lod_active {
-                format!("APX ({} dots instanced)", gpu_circles_count)
-            } else {
-                match self.render_mode {
-                    RenderMode::Cpu => format!("CPU"),
-                    RenderMode::Gpu => format!("GPU ({} circles instanced)", gpu_circles_count),
-                }
+            let mode_str = match self.render_mode {
+                RenderMode::Apx => format!("APX ({} dots instanced)", gpu_circles_count),
+                RenderMode::Cpu => format!("CPU"),
+                RenderMode::Gpu => format!("GPU ({} circles instanced)", gpu_circles_count),
             };
             painter.text(
                 rect.right_top() + egui::vec2(-8.0, 8.0),
