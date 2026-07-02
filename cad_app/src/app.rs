@@ -12,7 +12,7 @@ use std::thread;
 
 use cad_kernel::*;
 
-use crate::gpu::{view_matrix, CircleInstance, GpuCircleRenderer};
+use crate::gpu::{view_matrix, CircleInstance, LineInstance, GpuShapeRenderer};
 use crate::settings::UserEnv;
 
 // PEDIT (polyline edit) methods live in `src/app/pedit.rs`. Child module of
@@ -576,6 +576,17 @@ fn ttr_foot(g: &Geom, c: Vec2) -> Vec2 {
 /// Tessellate a geom into world-space preview polylines (approximate; for the
 /// file browser thumbnail). Resolves `BlockRef` via `blocks`; non-curve geoms
 /// fall back to their bbox rectangle.
+/// Push one world-space segment into the GPU line batch, converting to
+/// camera-relative f32 coords (f64 add first for precision far from origin).
+fn gpu_push_seg(lines: &mut Vec<LineInstance>, a: Vec2, b: Vec2,
+                ox: f64, oy: f64, half_w: f32, color: u32) {
+    lines.push(LineInstance {
+        ax: (a.x + ox) as f32, ay: (a.y + oy) as f32,
+        bx: (b.x + ox) as f32, by: (b.y + oy) as f32,
+        half_w, color,
+    });
+}
+
 fn preview_polys(g: &Geom, blocks: &cad_kernel::BlockTable, out: &mut Vec<Vec<Vec2>>) {
     use std::f64::consts::TAU;
     let n = 40usize;
@@ -1276,7 +1287,7 @@ pub struct CadApp {
     // GPU renderer + render-mode switch (debug window)
     render_mode:  RenderMode,
     debug_open:   bool,
-    gpu_renderer: StdArc<Mutex<GpuCircleRenderer>>,
+    gpu_renderer: StdArc<Mutex<GpuShapeRenderer>>,
     gpu_dirty:    bool,
 
     // ---- Layer panel (Slice B) ----
@@ -2880,7 +2891,7 @@ impl Default for CadApp {
             index_label: String::new(),
             render_mode:  RenderMode::Cpu,
             debug_open:   false,
-            gpu_renderer: StdArc::new(Mutex::new(GpuCircleRenderer::default())),
+            gpu_renderer: StdArc::new(Mutex::new(GpuShapeRenderer::default())),
             gpu_dirty:    true,
             layer_panel_open:   true,
             layer_rename:       None,
@@ -25123,8 +25134,8 @@ impl eframe::App for CadApp {
                         | ((color.b() as u32) <<  8)
                         |  (color.a() as u32);
                     dots.push(CircleInstance {
-                        x: anchor.x as f32,
-                        y: anchor.y as f32,
+                        x: (anchor.x + self.world_offset.x as f64) as f32,
+                        y: (anchor.y + self.world_offset.y as f64) as f32,
                         r: dot_world_r,
                         color: packed,
                     });
@@ -25132,10 +25143,11 @@ impl eframe::App for CadApp {
                 }
                 gpu_circles_count = dots.len();
                 if !dots.is_empty() {
+                    // Camera-relative: world_offset is folded into the instance
+                    // coords above, so the view matrix uses offset 0.
                     let view = view_matrix(
                         rect.width(), rect.height(),
-                        self.scale,
-                        self.world_offset.x, self.world_offset.y,
+                        self.scale, 0.0, 0.0,
                     );
                     let renderer = self.gpu_renderer.clone();
                     let cb = egui::PaintCallback {
@@ -25146,7 +25158,7 @@ impl eframe::App for CadApp {
                                     let gl = gl_painter.gl();
                                     let mut r = renderer.lock().unwrap();
                                     r.ensure_init(gl);
-                                    r.upload_and_render(gl, &dots, &view);
+                                    r.render(gl, &dots, &[], &view);
                                 },
                             ),
                         ),
@@ -25316,33 +25328,41 @@ impl eframe::App for CadApp {
                     }
                 }
                 RenderMode::Gpu => {
-                    // GPU path: build instance buffer for circles only this slice.
-                    // Non-circle dobjects still go through CPU (mixed rendering)
-                    // so lines/arcs are visible. Future slices add their own
-                    // instance kinds.
+                    // GPU path (Stage 1 pure-GPU): stroke geometry (Line, Arc,
+                    // Ellipse, EllipseArc, straight thin Polyline, Spline, Point)
+                    // → instanced LINE pipeline; Circle → instanced CIRCLE
+                    // pipeline. Curves are tessellated to segments on the CPU
+                    // (screen-adaptive), then batched into ONE PaintCallback.
+                    // Types not yet ported (Wall, Hatch, Text, Dimension,
+                    // BlockRef, curved/wide Polyline) FALL BACK to the egui
+                    // painter, so GPU mode is always correct.
                     //
-                    // Color resolution must MATCH the CPU branch: each
-                    // dobject's own style.color (resolved through
-                    // ByLayer / ByBlock / Aci / TrueColorRef) wins
-                    // unless the dobject is selected (yellow) or the
-                    // current snap source (cyan). The earlier GPU code
-                    // hardcoded three flat colors and ignored every
-                    // per-dobject color — fixed below.
+                    // Coords are camera-relative: (world + world_offset) as f32,
+                    // f64 add first, so f32 stays precise far from the origin.
+                    // Color resolution matches the CPU branch (selection=yellow,
+                    // snap source=cyan, else the dobject's resolved style color).
                     let mut circles: Vec<CircleInstance> = Vec::new();
+                    let mut lines:   Vec<LineInstance>   = Vec::new();
+                    let ox = self.world_offset.x as f64;
+                    let oy = self.world_offset.y as f64;
+                    // Default hairline half-width in WORLD units (~1.6px stroke);
+                    // the shader also enforces a screen minimum.
+                    let half_w = 0.8_f32 / self.scale.max(1e-6);
                     let snap_col = egui::Color32::from_rgb(120, 240, 255);
                     let sel_col  = egui::Color32::from_rgb(255, 200, 80);
                     for i in candidate_iter {
                         let e = &self.doc.dobjects[i];
-                        // BlockRef: resolve the real extent (kernel bbox is
-                        // just the insertion point), else a block whose
-                        // insertion point scrolls off-screen vanishes even
-                        // when its body is still in view.
+                        if !e.style.visible || !self.doc.layers.renders(e.style.layer) {
+                            skipped += 1;
+                            continue;
+                        }
                         let (emin, emax) = match &e.geom {
                             Geom::BlockRef(br) => self.resolved_blockref_bbox(br),
                             _ => e.bbox(),
                         };
                         if emax.x < v_min.x || emin.x > v_max.x
                         || emax.y < v_min.y || emin.y > v_max.y {
+                            skipped += 1;
                             continue;
                         }
                         let in_selection = self.selection.contains(&i);
@@ -25356,46 +25376,110 @@ impl eframe::App for CadApp {
                                 &self.doc.layers, &self.doc.truecolors);
                             egui::Color32::from_rgb(r, g, b)
                         };
+                        let packed: u32 =
+                              ((color.r() as u32) << 24)
+                            | ((color.g() as u32) << 16)
+                            | ((color.b() as u32) <<  8)
+                            |  (color.a() as u32);
+                        let sc = self.scale.max(1e-6);
                         match &e.geom {
                             Geom::Circle(c) => {
-                                // Pack ARGB → 0xRRGGBBAA u32 for the
-                                // instance buffer (vertex attrib uses
-                                // unpack4x8unorm in shader = LE RGBA).
-                                let packed: u32 =
-                                      ((color.r() as u32) << 24)
-                                    | ((color.g() as u32) << 16)
-                                    | ((color.b() as u32) <<  8)
-                                    |  (color.a() as u32);
                                 circles.push(CircleInstance {
-                                    x: c.center.x as f32,
-                                    y: c.center.y as f32,
+                                    x: (c.center.x + ox) as f32,
+                                    y: (c.center.y + oy) as f32,
                                     r: c.radius as f32,
                                     color: packed,
                                 });
-                                drawn += 1;
                             }
+                            Geom::Line(l) => {
+                                gpu_push_seg(&mut lines, l.a, l.b, ox, oy, half_w, packed);
+                            }
+                            Geom::Point(pt) => {
+                                let s = 4.0 / sc as f64;
+                                gpu_push_seg(&mut lines,
+                                    Vec2::new(pt.location.x - s, pt.location.y),
+                                    Vec2::new(pt.location.x + s, pt.location.y),
+                                    ox, oy, half_w, packed);
+                                gpu_push_seg(&mut lines,
+                                    Vec2::new(pt.location.x, pt.location.y - s),
+                                    Vec2::new(pt.location.x, pt.location.y + s),
+                                    ox, oy, half_w, packed);
+                            }
+                            Geom::Arc(a) => {
+                                let n = (((a.radius as f32) * sc) * 0.5)
+                                    .clamp(8.0, 256.0) as usize;
+                                let mut prev = Vec2::new(
+                                    a.center.x + a.radius * a.start_angle.cos(),
+                                    a.center.y + a.radius * a.start_angle.sin());
+                                for k in 1..=n {
+                                    let t = a.start_angle
+                                        + (k as f64 / n as f64) * a.sweep_angle;
+                                    let p = Vec2::new(a.center.x + a.radius * t.cos(),
+                                                      a.center.y + a.radius * t.sin());
+                                    gpu_push_seg(&mut lines, prev, p, ox, oy, half_w, packed);
+                                    prev = p;
+                                }
+                            }
+                            Geom::Ellipse(el) => {
+                                let n = (((el.major.len() as f32) * sc) * 0.7)
+                                    .clamp(16.0, 512.0) as usize;
+                                let mut prev = el.point_at(0.0);
+                                for k in 1..=n {
+                                    let p = el.point_at(k as f64 / n as f64 * std::f64::consts::TAU);
+                                    gpu_push_seg(&mut lines, prev, p, ox, oy, half_w, packed);
+                                    prev = p;
+                                }
+                            }
+                            Geom::EllipseArc(ea) => {
+                                let n = (((ea.ellipse.major.len() as f32) * sc) * 0.7)
+                                    .clamp(12.0, 512.0) as usize;
+                                let mut prev = ea.ellipse.point_at(ea.start_param);
+                                for k in 1..=n {
+                                    let p = ea.ellipse.point_at(
+                                        ea.start_param + (k as f64 / n as f64) * ea.sweep_param);
+                                    gpu_push_seg(&mut lines, prev, p, ox, oy, half_w, packed);
+                                    prev = p;
+                                }
+                            }
+                            Geom::Spline(s) => {
+                                let pts = s.tessellate(64);
+                                for w in pts.windows(2) {
+                                    gpu_push_seg(&mut lines, w[0], w[1], ox, oy, half_w, packed);
+                                }
+                            }
+                            Geom::Polyline(p)
+                                if p.widths.is_empty()
+                                && p.vertices.iter().all(|v| v.bulge.abs() < 1e-9) =>
+                            {
+                                // Straight, thin polyline (incl. rectangles).
+                                for w in p.vertices.windows(2) {
+                                    gpu_push_seg(&mut lines, w[0].pos, w[1].pos,
+                                        ox, oy, half_w, packed);
+                                }
+                                if p.closed && p.vertices.len() >= 2 {
+                                    let a = p.vertices[p.vertices.len() - 1].pos;
+                                    let b = p.vertices[0].pos;
+                                    gpu_push_seg(&mut lines, a, b, ox, oy, half_w, packed);
+                                }
+                            }
+                            // Not yet ported → CPU painter (always correct).
                             _ => {
-                                // Hatch needs Document access to
-                                // resolve boundary handles — short-
-                                // circuit before draw_dobject which is
-                                // a no-op for Hatch.
                                 if let Geom::Hatch(h) = &e.geom {
                                     self.render_hatch_fill(&painter, rect, h, color);
                                 } else {
                                     draw_dobject(&painter, rect, self, &e.geom, color);
                                 }
-                                drawn += 1;
                             }
                         }
+                        drawn += 1;
                     }
                     gpu_circles_count = circles.len();
-                    if !circles.is_empty() {
-                        // Build the world→clip matrix for our PaintCallback
-                        // covering the canvas rect.
+                    if !circles.is_empty() || !lines.is_empty() {
+                        // Camera-relative: offset folded into the instances, so
+                        // the view matrix uses offset 0.
                         let view = view_matrix(
                             rect.width(), rect.height(),
-                            self.scale,
-                            self.world_offset.x, self.world_offset.y,
+                            self.scale, 0.0, 0.0,
                         );
                         let renderer = self.gpu_renderer.clone();
                         let cb = egui::PaintCallback {
@@ -25406,7 +25490,7 @@ impl eframe::App for CadApp {
                                         let gl = gl_painter.gl();
                                         let mut r = renderer.lock().unwrap();
                                         r.ensure_init(gl);
-                                        r.upload_and_render(gl, &circles, &view);
+                                        r.render(gl, &circles, &lines, &view);
                                     },
                                 ),
                             ),
