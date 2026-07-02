@@ -116,9 +116,13 @@ Per canvas click while `Tool::Polyline` (`app.rs:~23380`):
    direction override; push the point to `pending`.
 
 **Finish conditions:** empty **Enter** (not in a width sub-flow) → finish as
-**open**; `c` (or `c` then Enter, or auto-close) → **closed**; **Esc** → cancel
-(clears `pending`). Picks fire on PRESS (PLINE is in `in_click_only_phase`), so a
-small drag is still a vertex, never a window.
+**open**; `c` (or `c` then Enter, or auto-close) → **closed**. **Esc removes only
+the LAST placed vertex** (one segment per press), never the whole run — once no
+vertices remain it exits the tool. **Placed vertices are never discarded:**
+ending the command by any other means (switching tools, running another command)
+COMMITS the run as a finished open dobject via `commit_active_draw()` (≥2 verts
+for a polyline, ≥3 controls for a spline). Picks fire on PRESS (PLINE is in
+`in_click_only_phase`), so a small drag is still a vertex, never a window.
 
 ---
 
